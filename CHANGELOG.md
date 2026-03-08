@@ -73,3 +73,14 @@ The following approaches were tested and rejected during the v10.1/v10.2 develop
 ### Updated
 - `docs/ROADMAP.md` — Reflects all tested/rejected techniques
 - `README.md` — Added experimental tests summary section
+
+## 2025-03-08 — Multi-Platform App Architecture
+
+### Added
+- `docs/MULTIPLATFORM_APP.md` — Complete architecture document for WASM + Tauri apps
+  - Shared frontend design (HTML/CSS/JS)
+  - WASM build with Emscripten (Phase 1)
+  - Tauri desktop app with Rust FFI (Phase 2)
+  - User-configurable parameters: strategy, block size, LZMA dict, level
+  - Folder support (archive or individual mode)
+  - Development roadmap (~10-12 days estimated)

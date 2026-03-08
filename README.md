@@ -131,6 +131,24 @@ See [docs/BASE64_TESTS.md](docs/BASE64_TESTS.md) for full analysis.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for detailed analysis.
 
+## 🖥️ Multi-Platform App (Planned)
+
+HyperPack will be available as:
+
+| Platform | Technology | Status |
+|----------|------------|--------|
+| 🌐 **Web App** | WASM (Emscripten) — runs in browser, zero install | Planned |
+| 🖥️ **Desktop** | Tauri (Rust + C FFI) — Win/Mac/Linux, ~5 MB | Planned |
+
+Both versions share the same UI with:
+- 📁 Drag & drop for files and folders
+- ⚙️ Strategy selection (Auto/BWT/LZMA/LZ77/LZP/Delta/Audio)
+- 📏 Block size and LZMA dictionary configuration
+- 📊 Real-time progress bar
+- 📁 Folder mode: archive or individual file compression
+
+See [docs/MULTIPLATFORM_APP.md](docs/MULTIPLATFORM_APP.md) for full architecture and roadmap.
+
 ## 🧪 Experimental Tests
 
 13 optimization techniques were tested empirically. Only 3 provided improvements
