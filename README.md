@@ -108,3 +108,27 @@ See [CHANGELOG.md](CHANGELOG.md) for the complete optimization history.
 ## 📄 License
 
 See source file for license information.
+
+## 📋 Base64 Compression
+
+HyperPack handles Base64-encoded data surprisingly well. On text data, Base64 actually
+compresses **better** than the binary original thanks to the reduced alphabet (64 chars)
+that BWT exploits more efficiently.
+
+| File | Binary → HP | Base64 → HP | Overhead |
+|------|-------------|-------------|----------|
+| xml (5.1 MB) | 441 KB (12.12×) | 433 KB (16.67×) | **−2%** 🟢 |
+| dickens (9.7 MB) | 2,524 KB (4.04×) | 2,505 KB (5.50×) | **−1%** 🟢 |
+
+See [docs/BASE64_TESTS.md](docs/BASE64_TESTS.md) for full analysis.
+
+## 🗺️ Roadmap
+
+| Priority | Improvement | Expected Gain |
+|----------|------------|---------------|
+| ⭐⭐⭐ | E8/E9 filter for x86 executables | +5–15% on binaries |
+| ⭐⭐ | Parallel block compression (`-j4`) | 3–4× speed |
+| ⭐⭐ | Columnar detection for structured data | +10–20% on tables |
+| ⭐ | ANS entropy coder (replace Range Coder) | 2× decompression speed |
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) for detailed analysis.
