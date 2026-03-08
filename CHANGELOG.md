@@ -60,3 +60,16 @@ The following approaches were tested and rejected during the v10.1/v10.2 develop
 | XML preprocessing | Skipped | BWT already achieves 12.29x |
 | libdivsufsort | +0% on Silesia | Only helps on 80 MB+ text, adds dependency |
 | Smaller BWT blocks | -11% ratio | BWT needs large blocks for long-range patterns |
+
+## 2025-03-08 — Experimental Tests Documentation
+
+### Added
+- `docs/EXPERIMENTAL_TESTS.md` — Complete results of 13 optimization experiments
+  - E8/E9 x86 filter: −1.5% to −19% (harmful)
+  - Transpose transform: −54% to −58% (catastrophic)
+  - Bit-plane transform: −65% to −75% (devastating)
+  - 5 techniques found redundant with existing pipeline
+
+### Updated
+- `docs/ROADMAP.md` — Reflects all tested/rejected techniques
+- `README.md` — Added experimental tests summary section

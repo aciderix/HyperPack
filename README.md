@@ -124,11 +124,28 @@ See [docs/BASE64_TESTS.md](docs/BASE64_TESTS.md) for full analysis.
 
 ## 🗺️ Roadmap
 
-| Priority | Improvement | Expected Gain |
-|----------|------------|---------------|
-| ⭐⭐⭐ | E8/E9 filter for x86 executables | +5–15% on binaries |
-| ⭐⭐ | Parallel block compression (`-j4`) | 3–4× speed |
-| ⭐⭐ | Columnar detection for structured data | +10–20% on tables |
-| ⭐ | ANS entropy coder (replace Range Coder) | 2× decompression speed |
+| Priority | Improvement | Expected Gain | Status |
+|----------|------------|---------------|--------|
+| ⭐⭐ | Parallel block compression (`-j4`) | 3–4× speed | Planned |
+| ⭐ | ANS entropy coder (replace Range Coder) | 2× decompression speed | Planned |
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for detailed analysis.
+
+## 🧪 Experimental Tests
+
+13 optimization techniques were tested empirically. Only 3 provided improvements
+(LZMA 64MB, MTF-2, Smart Heuristic — all already in v10.2).
+The other 10 were harmful, redundant, or neutral.
+
+Highlights of failed techniques:
+
+| Technique | Predicted | Actual |
+|-----------|-----------|--------|
+| E8/E9 x86 filter | +5–15% | **−1.5% to −19%** |
+| Transpose transform | +3–7% | **−54% to −58%** |
+| Bit-plane transform | +10–20% | **−65% to −75%** |
+
+**Key lesson:** BWT + LZMA is already so powerful that most preprocessing transforms
+*destroy* the patterns these algorithms exploit rather than enhancing them.
+
+See [docs/EXPERIMENTAL_TESTS.md](docs/EXPERIMENTAL_TESTS.md) for all 13 test results.
