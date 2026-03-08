@@ -1,0 +1,15 @@
+# Compiled binary
+hyperpack
+*.o
+*.a
+
+# Compressed files
+*.hp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
