@@ -3303,7 +3303,46 @@ static int lzma_mf_find_all(LzmaMF *mf, int pos, uint32_t *reps,
         }
     }
 
-    /* Hash chain search — collect matches of increasing length */
+    /* Hash2 search — exact 2-byte match (single lookup, no chain) */
+    if (max_len >= 2 && pos >= 1) {
+        uint32_t h2 = lzma_mf_hash2(data + pos);
+        int ref2 = mf->head2[h2];
+        if (ref2 >= 0 && (pos - ref2) <= mf->window_size &&
+            data[ref2] == data[pos] && data[ref2 + 1] == data[pos + 1]) {
+            int len = 2;
+            while (len < max_len && data[ref2 + len] == data[pos + len]) len++;
+            if (len >= LZMA_MIN_MATCH && len > best_len) {
+                best_len = len;
+                if (np < max_pairs) {
+                    pairs[np].dist = (uint32_t)(pos - ref2 - 1);
+                    pairs[np].len = len;
+                    np++;
+                }
+            }
+        }
+    }
+
+    /* Hash3 search — 3-byte match (single lookup) */
+    if (max_len >= 3 && pos >= 2) {
+        uint32_t h3 = lzma_mf_hash3(data + pos);
+        int ref3 = mf->head3[h3];
+        if (ref3 >= 0 && (pos - ref3) <= mf->window_size &&
+            data[ref3] == data[pos] && data[ref3 + 1] == data[pos + 1] &&
+            data[ref3 + 2] == data[pos + 2]) {
+            int len = 3;
+            while (len < max_len && data[ref3 + len] == data[pos + len]) len++;
+            if (len >= LZMA_MIN_MATCH && len > best_len) {
+                best_len = len;
+                if (np < max_pairs) {
+                    pairs[np].dist = (uint32_t)(pos - ref3 - 1);
+                    pairs[np].len = len;
+                    np++;
+                }
+            }
+        }
+    }
+
+    /* Hash4 chain search — collect matches of increasing length */
     if (pos + 3 < size) {
         uint32_t h = lzma_mf_hash4(data + pos);
         int chain_pos = mf->head[h];
@@ -3335,8 +3374,15 @@ static int lzma_mf_find_all(LzmaMF *mf, int pos, uint32_t *reps,
 
 /* Update hash chain for position pos */
 static void lzma_mf_update(LzmaMF *mf, int pos) {
+    const uint8_t *p = mf->data + pos;
+    if (pos + 1 < mf->size) {
+        mf->head2[lzma_mf_hash2(p)] = pos;
+    }
+    if (pos + 2 < mf->size) {
+        mf->head3[lzma_mf_hash3(p)] = pos;
+    }
     if (pos + 3 < mf->size) {
-        uint32_t h = lzma_mf_hash4(mf->data + pos);
+        uint32_t h = lzma_mf_hash4(p);
         mf->chain[pos % mf->window_size] = mf->head[h];
         mf->head[h] = pos;
     }
