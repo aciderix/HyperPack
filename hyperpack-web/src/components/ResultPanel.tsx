@@ -61,7 +61,12 @@ export function ResultPanel({ result, mode, onDownload, onReset }: ResultPanelPr
     <div className="p-6 bg-hp-card border border-hp-border rounded-xl space-y-6 animate-fade-in">
       <div className="flex items-center gap-3 text-hp-success">
         <CheckCircle2 className="w-6 h-6" />
-        <h3 className="text-lg font-medium">{isCompress ? 'Compression' : 'Decompression'} complete!</h3>
+        <h3 className="text-lg font-medium">
+          {isCompress ? 'Compression' : 'Decompression'} complete!
+          {isCompress && result.fileCount && result.fileCount > 1 && (
+            <span className="text-sm font-normal text-hp-muted ml-2">({result.fileCount} files → HPK6)</span>
+          )}
+        </h3>
       </div>
       
       <div className="flex items-center justify-center gap-6 py-4 bg-hp-bg rounded-lg border border-hp-border">
@@ -91,6 +96,29 @@ export function ResultPanel({ result, mode, onDownload, onReset }: ResultPanelPr
         </div>
       </div>
       
+      {/* Archive info (HPK6) */}
+      {isCompress && result.fileCount && result.fileCount > 1 && (
+        <div className="flex items-center gap-4 text-sm text-hp-muted bg-hp-bg rounded-lg border border-hp-border p-3">
+          <div className="flex items-center gap-1.5">
+            <span className="text-hp-accent font-bold">{result.fileCount}</span> files archived (HPK6)
+          </div>
+          {result.dedupCount !== undefined && result.dedupCount > 0 && (
+            <>
+              <span className="w-1 h-1 rounded-full bg-hp-border"></span>
+              <div className="flex items-center gap-1.5">
+                <span className="text-hp-accent font-bold">{result.dedupCount}</span> dedup blocks
+              </div>
+            </>
+          )}
+          {result.dedupSaved !== undefined && result.dedupSaved > 0 && (
+            <>
+              <span className="w-1 h-1 rounded-full bg-hp-border"></span>
+              <div>Dedup saved: <span className="text-hp-accent font-bold">{formatSize(result.dedupSaved)}</span></div>
+            </>
+          )}
+        </div>
+      )}
+
       {isCompress && result.blocks.length > 0 && (
         <div className="space-y-2">
           <div className="text-sm font-medium text-hp-text">Strategy breakdown:</div>

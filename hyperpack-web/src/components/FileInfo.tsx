@@ -1,7 +1,8 @@
-import { File, X } from 'lucide-react';
+import { File as FileIcon, Archive, X } from 'lucide-react';
+import { FileEntry } from '../workers/bridge';
 
 interface FileInfoProps {
-  file: globalThis.File;
+  files: FileEntry[];
   onClear: () => void;
 }
 
@@ -13,26 +14,52 @@ function formatSize(bytes: number) {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
-export function FileInfo({ file, onClear }: FileInfoProps) {
-  const isHp = file.name.endsWith('.hpk');
-  const typeStr = isHp ? 'HyperPack Archive' : (file.type || 'Binary');
+export function FileInfo({ files, onClear }: FileInfoProps) {
+  const totalSize = files.reduce((sum, f) => sum + f.size, 0);
+  const isMultiple = files.length > 1;
+  const isHpk = files.length === 1 && files[0].name.endsWith('.hpk');
+  const modeLabel = isHpk ? 'HyperPack Archive' : isMultiple ? 'HPK6 Archive' : 'HPK5 Single';
+
+  const MAX_SHOWN = 3;
+  const shownFiles = files.slice(0, MAX_SHOWN);
+  const remaining = files.length - MAX_SHOWN;
 
   return (
     <div className="flex items-center justify-between p-4 bg-hp-card border border-hp-border rounded-xl">
       <div className="flex items-center gap-4 overflow-hidden">
         <div className="p-3 bg-hp-bg rounded-lg shrink-0">
-          <File className="w-6 h-6 text-hp-accent" />
+          {isMultiple ? (
+            <Archive className="w-6 h-6 text-hp-accent" />
+          ) : (
+            <FileIcon className="w-6 h-6 text-hp-accent" />
+          )}
         </div>
         <div className="min-w-0">
-          <h4 className="text-hp-text font-medium truncate">{file.name}</h4>
+          {isMultiple ? (
+            <>
+              <h4 className="text-hp-text font-medium truncate">
+                {files.length} files
+              </h4>
+              <div className="text-xs text-hp-muted mt-0.5 space-y-0.5">
+                {shownFiles.map((f, i) => (
+                  <div key={i} className="truncate">{f.name} ({formatSize(f.size)})</div>
+                ))}
+                {remaining > 0 && (
+                  <div className="text-hp-accent">... and {remaining} more</div>
+                )}
+              </div>
+            </>
+          ) : (
+            <h4 className="text-hp-text font-medium truncate">{files[0].name}</h4>
+          )}
           <div className="flex items-center gap-3 text-sm text-hp-muted mt-0.5">
-            <span>Size: {formatSize(file.size)}</span>
+            <span>Size: {formatSize(totalSize)}</span>
             <span className="w-1 h-1 rounded-full bg-hp-border"></span>
-            <span className="truncate">Type: {typeStr}</span>
+            <span className="truncate">{modeLabel}</span>
           </div>
         </div>
       </div>
-      <button 
+      <button
         onClick={onClear}
         className="p-2 text-hp-muted hover:text-hp-error hover:bg-hp-error/10 rounded-lg transition-colors shrink-0 ml-4"
         title="Clear file"

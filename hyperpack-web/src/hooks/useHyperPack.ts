@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { CompressParams, WorkerRequest, WorkerResponse } from '../workers/bridge';
+import { CompressParams, FileEntry, WorkerResponse } from '../workers/bridge';
 
 export type HyperPackStatus = 'idle' | 'processing' | 'complete' | 'error';
 
@@ -11,6 +11,7 @@ export type HyperPackProgress = {
   speed: number;
   eta: number;
   currentRatio?: number;
+  detail?: string;
 };
 
 export type HyperPackResult = {
@@ -21,6 +22,18 @@ export type HyperPackResult = {
   blocks: Array<{ strategy: string; inputSize: number; outputSize: number }>;
   outputBuffer: ArrayBuffer;
   outputFileName: string;
+  fileCount?: number;
+  dedupCount?: number;
+  dedupSaved?: number;
+};
+
+export type ListEntry = {
+  type: string;
+  path: string;
+  size: number;
+  crc: string;
+  blocks: number;
+  isDedup: boolean;
 };
 
 function createWorker(): Worker {
@@ -32,42 +45,65 @@ export function useHyperPack() {
   const [progress, setProgress] = useState<HyperPackProgress | null>(null);
   const [result, setResult] = useState<HyperPackResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [listEntries, setListEntries] = useState<ListEntry[] | null>(null);
   
   const workerRef = useRef<Worker | null>(null);
-  const currentJobIdRef = useRef<string | null>(null);
+  const startTimeRef = useRef<number>(0);
+  const initResolveRef = useRef<(() => void) | null>(null);
 
   const setupWorkerHandlers = useCallback((worker: Worker) => {
     worker.onmessage = (e: MessageEvent<WorkerResponse>) => {
       const msg = e.data;
-      if (msg.id !== currentJobIdRef.current) return;
+
+      if (msg.type === 'ready') {
+        initResolveRef.current?.();
+        return;
+      }
 
       if (msg.type === 'progress') {
-        const speed = msg.elapsedMs > 0 ? (msg.bytesProcessed / msg.elapsedMs) * 1000 : 0;
-        const estimatedTotal = msg.percent > 0 ? (msg.bytesProcessed / msg.percent) * 100 : 0;
-        const remainingBytes = estimatedTotal - msg.bytesProcessed;
-        const eta = speed > 0 ? remainingBytes / speed : 0;
+        const elapsedMs = Date.now() - startTimeRef.current;
+        const percent = msg.percent || 0;
+        // Estimate speed/ETA from percent and elapsed time
+        const speed = elapsedMs > 0 && percent > 0 ? (percent / elapsedMs) * 1000 : 0;
+        const eta = speed > 0 ? (100 - percent) / speed : 0;
 
-        setProgress({
-          percent: msg.percent,
-          currentBlock: msg.currentBlock,
-          totalBlocks: msg.totalBlocks,
-          strategy: msg.strategy,
+        setProgress((prev) => ({
+          percent,
+          currentBlock: prev?.currentBlock ?? 0,
+          totalBlocks: prev?.totalBlocks ?? 1,
+          strategy: msg.detail || prev?.strategy || '',
           speed,
           eta,
-          currentRatio: msg.currentRatio,
-        });
-      } else if (msg.type === 'complete') {
+          detail: msg.detail,
+        }));
+      } else if (msg.type === 'done') {
         setStatus('complete');
         setProgress(null);
+
+        // Build blocks array from strategies map
+        const blocks: Array<{ strategy: string; inputSize: number; outputSize: number }> = [];
+        if (msg.strategies) {
+          for (const [strategy, count] of Object.entries(msg.strategies)) {
+            for (let i = 0; i < (count as number); i++) {
+              blocks.push({ strategy, inputSize: 0, outputSize: 0 });
+            }
+          }
+        }
+
         setResult({
-          inputSize: msg.stats.inputSize,
-          outputSize: msg.stats.outputSize,
-          ratio: msg.stats.ratio,
-          totalMs: msg.stats.totalMs,
-          blocks: msg.stats.blocks,
-          outputBuffer: msg.outputBuffer,
-          outputFileName: msg.outputFileName,
+          inputSize: msg.originalSize,
+          outputSize: msg.compressedSize,
+          ratio: msg.ratio,
+          totalMs: msg.elapsed * 1000,
+          blocks,
+          outputBuffer: msg.data,
+          outputFileName: msg.name,
+          fileCount: msg.fileCount,
+          dedupCount: msg.dedupCount,
+          dedupSaved: msg.dedupSaved,
         });
+      } else if (msg.type === 'list-result') {
+        setListEntries(msg.entries);
       } else if (msg.type === 'error') {
         setStatus('error');
         setError(msg.message);
@@ -82,6 +118,18 @@ export function useHyperPack() {
     };
   }, []);
 
+  const ensureWorkerReady = useCallback(async () => {
+    if (!workerRef.current) {
+      workerRef.current = createWorker();
+      setupWorkerHandlers(workerRef.current);
+    }
+    // Send init and wait for ready
+    return new Promise<void>((resolve) => {
+      initResolveRef.current = resolve;
+      workerRef.current!.postMessage({ type: 'init' });
+    });
+  }, [setupWorkerHandlers]);
+
   useEffect(() => {
     workerRef.current = createWorker();
     setupWorkerHandlers(workerRef.current);
@@ -91,57 +139,71 @@ export function useHyperPack() {
     };
   }, [setupWorkerHandlers]);
 
-  const compress = useCallback(async (file: File, params: CompressParams) => {
+  const compress = useCallback(async (files: FileEntry[], params: CompressParams) => {
     setStatus('processing');
     setError(null);
     setProgress({ percent: 0, currentBlock: 0, totalBlocks: 1, strategy: 'Initializing WASM...', speed: 0, eta: 0 });
     setResult(null);
-    
-    const id = Math.random().toString(36).substring(7);
-    currentJobIdRef.current = id;
-    
-    const fileBuffer = await file.arrayBuffer();
-    
-    const req: WorkerRequest = {
+
+    startTimeRef.current = Date.now();
+
+    await ensureWorkerReady();
+
+    // Determine output name
+    let outputName: string;
+    if (params.archiveMode || files.length > 1) {
+      outputName = 'archive.hpk';
+    } else if (files.length === 1) {
+      outputName = files[0].name + '.hpk';
+    } else {
+      outputName = 'output.hpk';
+    }
+
+    workerRef.current?.postMessage({
       type: 'compress',
-      id,
-      fileBuffer,
-      fileName: file.name,
+      files,
       params,
-    };
-    
-    workerRef.current?.postMessage(req, [fileBuffer]);
-  }, []);
+      outputName,
+    });
+  }, [ensureWorkerReady]);
 
   const decompress = useCallback(async (file: File) => {
     setStatus('processing');
     setError(null);
     setProgress({ percent: 0, currentBlock: 0, totalBlocks: 1, strategy: 'Initializing WASM...', speed: 0, eta: 0 });
     setResult(null);
-    
-    const id = Math.random().toString(36).substring(7);
-    currentJobIdRef.current = id;
-    
+
+    startTimeRef.current = Date.now();
+
+    await ensureWorkerReady();
+
     const fileBuffer = await file.arrayBuffer();
-    
-    const req: WorkerRequest = {
+    workerRef.current?.postMessage({
       type: 'decompress',
-      id,
-      fileBuffer,
-      fileName: file.name,
-    };
-    
-    workerRef.current?.postMessage(req, [fileBuffer]);
-  }, []);
+      file: fileBuffer,
+      name: file.name,
+    });
+  }, [ensureWorkerReady]);
+
+  const listArchive = useCallback(async (file: File) => {
+    setListEntries(null);
+
+    await ensureWorkerReady();
+
+    const fileBuffer = await file.arrayBuffer();
+    workerRef.current?.postMessage({
+      type: 'list',
+      file: fileBuffer,
+    });
+  }, [ensureWorkerReady]);
 
   const cancel = useCallback(() => {
-    if (currentJobIdRef.current && workerRef.current) {
+    if (workerRef.current) {
       // Terminate the blocked worker and create a fresh one
       workerRef.current.terminate();
       workerRef.current = createWorker();
       setupWorkerHandlers(workerRef.current);
       
-      currentJobIdRef.current = null;
       setStatus('idle');
       setProgress(null);
     }
@@ -152,7 +214,7 @@ export function useHyperPack() {
     setProgress(null);
     setResult(null);
     setError(null);
-    currentJobIdRef.current = null;
+    setListEntries(null);
   }, []);
 
   const download = useCallback(() => {
@@ -169,5 +231,5 @@ export function useHyperPack() {
     }
   }, [result]);
 
-  return { status, progress, result, error, compress, decompress, cancel, reset, download };
+  return { status, progress, result, error, listEntries, compress, decompress, listArchive, cancel, reset, download };
 }

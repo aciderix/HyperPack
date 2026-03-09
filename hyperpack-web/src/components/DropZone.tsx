@@ -1,13 +1,62 @@
 import { useCallback, useState, useRef } from 'react';
-import { UploadCloud } from 'lucide-react';
+import { UploadCloud, FolderOpen } from 'lucide-react';
+import { FileEntry } from '../workers/bridge';
 
 interface DropZoneProps {
-  onFileSelect: (file: File) => void;
+  onFiles: (files: FileEntry[]) => void;
 }
 
-export function DropZone({ onFileSelect }: DropZoneProps) {
+/** Recursively read a FileSystemDirectoryEntry */
+function readEntryRecursive(entry: FileSystemEntry, basePath: string): Promise<FileEntry[]> {
+  return new Promise((resolve) => {
+    if (entry.isFile) {
+      (entry as FileSystemFileEntry).file((file) => {
+        file.arrayBuffer().then((data) => {
+          const relativePath = basePath ? basePath + '/' + file.name : file.name;
+          resolve([{ name: relativePath, data, size: file.size }]);
+        });
+      });
+    } else if (entry.isDirectory) {
+      const reader = (entry as FileSystemDirectoryEntry).createReader();
+      const allEntries: FileSystemEntry[] = [];
+
+      const readBatch = () => {
+        reader.readEntries((entries) => {
+          if (entries.length === 0) {
+            const dirPath = basePath ? basePath + '/' + entry.name : entry.name;
+            Promise.all(allEntries.map((e) => readEntryRecursive(e, dirPath))).then((results) => {
+              resolve(results.flat());
+            });
+          } else {
+            allEntries.push(...entries);
+            readBatch(); // Keep reading until no more entries
+          }
+        });
+      };
+      readBatch();
+    } else {
+      resolve([]);
+    }
+  });
+}
+
+/** Convert a FileList (from input) to FileEntry[], preserving webkitRelativePath */
+async function fileListToEntries(fileList: FileList): Promise<FileEntry[]> {
+  const entries: FileEntry[] = [];
+  for (let i = 0; i < fileList.length; i++) {
+    const file = fileList[i];
+    const data = await file.arrayBuffer();
+    // webkitRelativePath is "folderName/sub/file.txt" — use it if available
+    const name = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
+    entries.push({ name, data, size: file.size });
+  }
+  return entries;
+}
+
+export function DropZone({ onFiles }: DropZoneProps) {
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -19,19 +68,60 @@ export function DropZone({ onFileSelect }: DropZoneProps) {
     setIsDragging(false);
   }, []);
 
-  const handleDrop = useCallback((e: React.DragEvent) => {
+  const handleDrop = useCallback(async (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragging(false);
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      onFileSelect(e.dataTransfer.files[0]);
-    }
-  }, [onFileSelect]);
 
-  const handleFileInput = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files.length > 0) {
-      onFileSelect(e.target.files[0]);
+    const items = e.dataTransfer.items;
+    if (items && items.length > 0) {
+      // Try to use webkitGetAsEntry for directory support
+      const entryPromises: Promise<FileEntry[]>[] = [];
+      let hasEntries = false;
+
+      for (let i = 0; i < items.length; i++) {
+        const entry = items[i].webkitGetAsEntry?.();
+        if (entry) {
+          hasEntries = true;
+          entryPromises.push(readEntryRecursive(entry, ''));
+        }
+      }
+
+      if (hasEntries) {
+        const results = await Promise.all(entryPromises);
+        const allFiles = results.flat();
+        if (allFiles.length > 0) {
+          onFiles(allFiles);
+          return;
+        }
+      }
     }
-  }, [onFileSelect]);
+
+    // Fallback: use dataTransfer.files
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      const entries = await fileListToEntries(e.dataTransfer.files);
+      if (entries.length > 0) {
+        onFiles(entries);
+      }
+    }
+  }, [onFiles]);
+
+  const handleFileInput = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      const entries = await fileListToEntries(e.target.files);
+      if (entries.length > 0) {
+        onFiles(entries);
+      }
+    }
+  }, [onFiles]);
+
+  const handleFolderInput = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      const entries = await fileListToEntries(e.target.files);
+      if (entries.length > 0) {
+        onFiles(entries);
+      }
+    }
+  }, [onFiles]);
 
   return (
     <div
@@ -42,19 +132,41 @@ export function DropZone({ onFileSelect }: DropZoneProps) {
       onDrop={handleDrop}
       onClick={() => fileInputRef.current?.click()}
     >
-      <input 
-        type="file" 
-        className="hidden" 
-        ref={fileInputRef} 
+      <input
+        type="file"
+        className="hidden"
+        ref={fileInputRef}
         onChange={handleFileInput}
+        multiple
+      />
+      <input
+        type="file"
+        className="hidden"
+        ref={folderInputRef}
+        onChange={handleFolderInput}
+        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+        {...{ webkitdirectory: '', directory: '' } as Record<string, string>}
+        multiple
       />
       <UploadCloud className={`w-12 h-12 mb-4 transition-colors duration-300 ${isDragging ? 'text-hp-accent' : 'text-hp-muted'}`} />
-      <h3 className="text-lg font-medium text-hp-text mb-1">Drop file here</h3>
-      <p className="text-hp-muted mb-6">or click to browse</p>
-      
+      <h3 className="text-lg font-medium text-hp-text mb-1">Drop files or folder here</h3>
+      <p className="text-hp-muted mb-4">or click to browse files</p>
+
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          folderInputRef.current?.click();
+        }}
+        className="flex items-center gap-2 px-4 py-2 mb-4 text-sm font-medium text-hp-accent bg-hp-accent/10 hover:bg-hp-accent/20 border border-hp-accent/30 rounded-lg transition-colors"
+      >
+        <FolderOpen className="w-4 h-4" />
+        Select Folder (HPK6 Archive)
+      </button>
+
       <div className="text-xs text-hp-muted/70 text-center space-y-1">
-        <p>Supports any file type</p>
-        <p>Max recommended: 512 MB</p>
+        <p>Single file → HPK5 &nbsp;|&nbsp; Multiple files / folder → HPK6 Archive</p>
+        <p>Max recommended: 512 MB total</p>
       </div>
     </div>
   );

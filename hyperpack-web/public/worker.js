@@ -1,318 +1,401 @@
-/**
- * HyperPack WASM Web Worker
- *
- * Loads the Emscripten-compiled WASM module and bridges
- * postMessage requests to the real compression engine.
- *
- * Progress is reported by parsing the C engine's stderr output.
- */
-
+/* HyperPack Web Worker — WASM bridge (HPK5 + HPK6) */
 let Module = null;
-let currentJobId = null;
-let startTime = 0;
-let totalBlocks = 1;
-let completedBlocks = [];
-let currentBlockNum = 0;
 
-/**
- * Parse stderr lines from the C engine for progress reporting.
- */
-function handleStderr(text) {
-  if (!currentJobId) return;
-
-  // Parse header: "[HP5] Compressing ... (X MB, N blocks of M MB)"
-  const headerMatch = text.match(/\[HP5\] Compressing .+ \([\d.]+ MB, (\d+) blocks? of/);
-  if (headerMatch) {
-    totalBlocks = parseInt(headerMatch[1]);
-    return;
-  }
-
-  // Parse decompression header
-  const decHeaderMatch = text.match(/\[HP5\] Decompressing \([\d.]+ MB, (\d+) blocks?\)/);
-  if (decHeaderMatch) {
-    totalBlocks = parseInt(decHeaderMatch[1]);
-    return;
-  }
-
-  // Parse block completion: "  Block X/Y: IN -> OUT (Rx) [STRAT]"
-  const blockMatch = text.match(/Block (\d+)\/(\d+): (\d+) -> (\d+) \(([\d.]+)x\) \[(.+)\]/);
-  if (blockMatch) {
-    const [, current, total, inSize, outSize, ratio, strategy] = blockMatch;
-    currentBlockNum = parseInt(current);
-    totalBlocks = parseInt(total);
-    const bytesIn = parseInt(inSize);
-    const bytesOut = parseInt(outSize);
-
-    completedBlocks.push({ strategy, inputSize: bytesIn, outputSize: bytesOut });
-
-    const percent = Math.min(99, Math.floor((currentBlockNum / totalBlocks) * 100));
-    const totalBytesProcessed = completedBlocks.reduce((sum, b) => sum + b.inputSize, 0);
-
-    self.postMessage({
-      type: 'progress',
-      id: currentJobId,
-      percent,
-      currentBlock: currentBlockNum,
-      totalBlocks,
-      strategy,
-      bytesProcessed: totalBytesProcessed,
-      elapsedMs: Date.now() - startTime,
-      currentRatio: parseFloat(ratio),
-    });
-    return;
-  }
-
-  // Parse decompression block: "  Block X/Y: IN -> OUT [STRAT] CRC OK"
-  const decBlockMatch = text.match(/Block (\d+)\/(\d+): (\d+) -> (\d+) \[(.+)\] CRC OK/);
-  if (decBlockMatch) {
-    const [, current, total, inSize, outSize, strategy] = decBlockMatch;
-    currentBlockNum = parseInt(current);
-    totalBlocks = parseInt(total);
-    const bytesIn = parseInt(inSize);
-    const bytesOut = parseInt(outSize);
-
-    completedBlocks.push({ strategy, inputSize: bytesIn, outputSize: bytesOut });
-
-    const percent = Math.min(99, Math.floor((currentBlockNum / totalBlocks) * 100));
-    const totalBytesProcessed = completedBlocks.reduce((sum, b) => sum + b.inputSize, 0);
-
-    self.postMessage({
-      type: 'progress',
-      id: currentJobId,
-      percent,
-      currentBlock: currentBlockNum,
-      totalBlocks,
-      strategy,
-      bytesProcessed: totalBytesProcessed,
-      elapsedMs: Date.now() - startTime,
-    });
-    return;
-  }
-
-  // Parse DUP block: "  Block X/Y: DUP of Z"
-  const dupMatch = text.match(/Block (\d+)\/(\d+): DUP of (\d+)/);
-  if (dupMatch) {
-    const [, current, total] = dupMatch;
-    currentBlockNum = parseInt(current);
-    totalBlocks = parseInt(total);
-
-    completedBlocks.push({ strategy: 'DUP', inputSize: 0, outputSize: 0 });
-
-    const percent = Math.min(99, Math.floor((currentBlockNum / totalBlocks) * 100));
-
-    self.postMessage({
-      type: 'progress',
-      id: currentJobId,
-      percent,
-      currentBlock: currentBlockNum,
-      totalBlocks,
-      strategy: 'DUP',
-      bytesProcessed: 0,
-      elapsedMs: Date.now() - startTime,
-    });
-    return;
-  }
-
-  // Parse strategy testing progress (within a block)
-  // These show which strategy is being tested
-  const stratTestMatch = text.match(/\[(\w[\w+]*)\]/);
-  if (stratTestMatch && currentBlockNum < totalBlocks) {
-    const strategy = stratTestMatch[1];
-    // Send a progress update showing current strategy being tested
-    self.postMessage({
-      type: 'progress',
-      id: currentJobId,
-      percent: Math.min(99, Math.floor((Math.max(0, currentBlockNum) / totalBlocks) * 100)),
-      currentBlock: currentBlockNum + 1,
-      totalBlocks,
-      strategy: 'Testing ' + strategy + '...',
-      bytesProcessed: completedBlocks.reduce((sum, b) => sum + b.inputSize, 0),
-      elapsedMs: Date.now() - startTime,
-    });
-  }
-}
-
-/**
- * Initialize the WASM module.
- */
-async function initModule() {
-  try {
-    importScripts('hyperpack.js');
-  } catch (e) {
-    throw new Error(
-      'WASM module not found. Run build-wasm.sh to compile the HyperPack engine. ' +
-      '(Looking for hyperpack.js + hyperpack.wasm in public/)'
-    );
-  }
-
-  Module = await createHyperPack({
-    print: () => {},       // ignore stdout
-    printErr: (text) => {  // capture stderr for progress
-      handleStderr(text);
-    },
-  });
-}
-
-/**
- * Reset state for a new job.
- */
-function resetJobState(id) {
-  currentJobId = id;
-  startTime = Date.now();
-  totalBlocks = 1;
-  completedBlocks = [];
-  currentBlockNum = 0;
-}
-
-/**
- * Handle incoming messages from the main thread.
- */
-self.onmessage = async (e) => {
+self.onmessage = async function (e) {
   const msg = e.data;
 
-  // Cancel: main thread should terminate this worker for immediate cancel
-  if (msg.type === 'cancel') {
-    currentJobId = null;
+  if (msg.type === 'init') {
+    try {
+      importScripts('hyperpack.js');
+      Module = await createHyperPackModule({
+        print: (text) => { /* stdout — ignore */ },
+        printErr: (text) => { parseProgress(text); }
+      });
+      self.postMessage({ type: 'ready' });
+    } catch (err) {
+      self.postMessage({ type: 'error', message: 'Failed to load WASM: ' + err.message });
+    }
     return;
   }
 
-  try {
-    if (!Module) {
-      await initModule();
-    }
+  if (!Module) {
+    self.postMessage({ type: 'error', message: 'WASM not initialized' });
+    return;
+  }
 
-    if (msg.type === 'compress') {
-      resetJobState(msg.id);
+  if (msg.type === 'compress') {
+    try {
+      const { files, params, outputName } = msg;
+      const outName = outputName || 'output.hpk';
 
-      // Send initial progress
-      self.postMessage({
-        type: 'progress',
-        id: msg.id,
-        percent: 0,
-        currentBlock: 0,
-        totalBlocks: 1,
-        strategy: 'Loading file...',
-        bytesProcessed: 0,
-        elapsedMs: 0,
-      });
-
-      // Write input file to MEMFS
-      const inputData = new Uint8Array(msg.fileBuffer);
-      Module.FS.writeFile('/input', inputData);
-
-      // Run compression
-      const blockMB = msg.params.blockSizeMB || 8;
-      const result = Module._hp_compress(blockMB);
-
-      if (currentJobId !== msg.id) return; // cancelled
-
-      if (result === 0) {
-        // Read output
-        const outputData = Module.FS.readFile('/output.hpk');
-        const outputBuffer = outputData.buffer.slice(
-          outputData.byteOffset,
-          outputData.byteOffset + outputData.byteLength
-        );
-
-        const inputSize = inputData.length;
-        const outputSize = outputData.length;
-
-        self.postMessage({
-          type: 'complete',
-          id: msg.id,
-          outputBuffer,
-          outputFileName: msg.fileName + '.hpk',
-          stats: {
-            inputSize,
-            outputSize,
-            ratio: outputSize > 0 ? inputSize / outputSize : 1,
-            totalMs: Date.now() - startTime,
-            blocks: completedBlocks.filter(b => b.strategy !== 'DUP'),
-          },
-        }, [outputBuffer]);
+      if (params.archiveMode && files.length > 0) {
+        /* HPK6 archive mode */
+        compressArchive(files, params, outName);
+      } else if (files.length === 1) {
+        /* HPK5 single file mode */
+        compressSingle(files[0], params, outName);
       } else {
-        self.postMessage({
-          type: 'error',
-          id: msg.id,
-          message: 'Compression failed (engine returned code ' + result + ')',
-        });
+        self.postMessage({ type: 'error', message: 'No files provided' });
       }
-
-      // Cleanup MEMFS
-      try { Module.FS.unlink('/input'); } catch (_) {}
-      try { Module.FS.unlink('/output.hpk'); } catch (_) {}
-
-    } else if (msg.type === 'decompress') {
-      resetJobState(msg.id);
-
-      self.postMessage({
-        type: 'progress',
-        id: msg.id,
-        percent: 0,
-        currentBlock: 0,
-        totalBlocks: 1,
-        strategy: 'Reading header...',
-        bytesProcessed: 0,
-        elapsedMs: 0,
-      });
-
-      // Write input file to MEMFS
-      const inputData = new Uint8Array(msg.fileBuffer);
-      Module.FS.writeFile('/input.hpk', inputData);
-
-      // Run decompression
-      const result = Module._hp_decompress();
-
-      if (currentJobId !== msg.id) return; // cancelled
-
-      if (result === 0) {
-        const outputData = Module.FS.readFile('/output');
-        const outputBuffer = outputData.buffer.slice(
-          outputData.byteOffset,
-          outputData.byteOffset + outputData.byteLength
-        );
-
-        const inputSize = inputData.length;
-        const outputSize = outputData.length;
-
-        // Remove .hpk extension for output filename
-        let outputFileName = msg.fileName;
-        if (outputFileName.endsWith('.hpk')) {
-          outputFileName = outputFileName.slice(0, -4);
-        } else {
-          outputFileName = 'decompressed_' + outputFileName;
-        }
-
-        self.postMessage({
-          type: 'complete',
-          id: msg.id,
-          outputBuffer,
-          outputFileName,
-          stats: {
-            inputSize,
-            outputSize,
-            ratio: inputSize > 0 ? outputSize / inputSize : 1,
-            totalMs: Date.now() - startTime,
-            blocks: completedBlocks,
-          },
-        }, [outputBuffer]);
-      } else {
-        self.postMessage({
-          type: 'error',
-          id: msg.id,
-          message: 'Decompression failed — file may be corrupted or not a valid .hpk file (code ' + result + ')',
-        });
-      }
-
-      // Cleanup MEMFS
-      try { Module.FS.unlink('/input.hpk'); } catch (_) {}
-      try { Module.FS.unlink('/output'); } catch (_) {}
+    } catch (err) {
+      self.postMessage({ type: 'error', message: 'Compress error: ' + err.message });
     }
-  } catch (err) {
-    self.postMessage({
-      type: 'error',
-      id: msg.id,
-      message: err.message || 'Unknown worker error',
-    });
+    return;
+  }
+
+  if (msg.type === 'decompress') {
+    try {
+      decompressFile(msg.file, msg.name);
+    } catch (err) {
+      self.postMessage({ type: 'error', message: 'Decompress error: ' + err.message });
+    }
+    return;
+  }
+
+  if (msg.type === 'list') {
+    try {
+      listArchive(msg.file);
+    } catch (err) {
+      self.postMessage({ type: 'error', message: 'List error: ' + err.message });
+    }
+    return;
   }
 };
+
+/* ===== HPK5 single file compress ===== */
+function compressSingle(file, params, outName) {
+  const inPath = '/input_file';
+  const outPath = '/output.hpk';
+  cleanupMemfs([inPath, outPath]);
+
+  const data = new Uint8Array(file.data);
+  Module.FS.writeFile(inPath, data);
+
+  const start = performance.now();
+  const ret = Module._hp_compress(
+    Module.allocateUTF8(inPath),
+    Module.allocateUTF8(outPath),
+    params.blockSizeMB || 8
+  );
+
+  if (ret !== 0) {
+    self.postMessage({ type: 'error', message: 'Compression failed (code ' + ret + ')' });
+    return;
+  }
+
+  const compressed = Module.FS.readFile(outPath);
+  const elapsed = (performance.now() - start) / 1000;
+
+  self.postMessage({
+    type: 'done',
+    data: compressed.buffer,
+    name: outName,
+    originalSize: data.length,
+    compressedSize: compressed.length,
+    ratio: data.length / compressed.length,
+    elapsed: elapsed,
+    strategies: lastStrategies,
+    fileCount: 1,
+    dedupCount: 0,
+    dedupSaved: 0
+  });
+
+  cleanupMemfs([inPath, outPath]);
+}
+
+/* ===== HPK6 archive compress ===== */
+function compressArchive(files, params, outName) {
+  const dirName = '/archive_input';
+  const outPath = '/output.hpk';
+  cleanupMemfs([outPath]);
+
+  // Remove old input dir
+  try { Module.FS.rmdir(dirName); } catch (e) {}
+  removeRecursive(dirName);
+
+  // Write all files to MEMFS directory structure
+  let totalSize = 0;
+  const dirs = new Set();
+  dirs.add(dirName);
+
+  for (const file of files) {
+    const fullPath = dirName + '/' + file.name;
+    // Ensure parent directories exist
+    const parts = fullPath.split('/');
+    for (let i = 2; i < parts.length; i++) {
+      const dir = parts.slice(0, i).join('/');
+      if (!dirs.has(dir)) {
+        try { Module.FS.mkdir(dir); } catch (e) {}
+        dirs.add(dir);
+      }
+    }
+    const data = new Uint8Array(file.data);
+    Module.FS.writeFile(fullPath, data);
+    totalSize += data.length;
+  }
+
+  const start = performance.now();
+  const dirPtr = Module.allocateUTF8(dirName);
+  const outPtr = Module.allocateUTF8(outPath);
+  const ret = Module._hp_archive_compress(dirPtr, outPtr, params.blockSizeMB || 8);
+
+  if (ret !== 0) {
+    self.postMessage({ type: 'error', message: 'Archive compression failed (code ' + ret + ')' });
+    return;
+  }
+
+  const compressed = Module.FS.readFile(outPath);
+  const elapsed = (performance.now() - start) / 1000;
+
+  self.postMessage({
+    type: 'done',
+    data: compressed.buffer,
+    name: outName,
+    originalSize: totalSize,
+    compressedSize: compressed.length,
+    ratio: totalSize / compressed.length,
+    elapsed: elapsed,
+    strategies: lastStrategies,
+    fileCount: files.length,
+    dedupCount: lastDedupCount,
+    dedupSaved: lastDedupSaved
+  });
+
+  removeRecursive(dirName);
+  cleanupMemfs([outPath]);
+}
+
+/* ===== Decompress (auto-detect HPK5/HPK6) ===== */
+function decompressFile(fileBuffer, fileName) {
+  const inPath = '/input.hpk';
+  const outPath = '/output_file';
+  const outDir = '/output_dir';
+  cleanupMemfs([inPath, outPath]);
+  removeRecursive(outDir);
+
+  const data = new Uint8Array(fileBuffer);
+  Module.FS.writeFile(inPath, data);
+
+  // Detect format
+  const fmtPtr = Module.allocateUTF8(inPath);
+  const fmt = Module._hp_detect_format(fmtPtr);
+
+  const start = performance.now();
+
+  if (fmt === 6) {
+    // HPK6 archive
+    try { Module.FS.mkdir(outDir); } catch (e) {}
+    const outDirPtr = Module.allocateUTF8(outDir);
+    const nullPtr = 0; // NULL for extract_pattern = extract all
+    const ret = Module._hp_archive_decompress(
+      Module.allocateUTF8(inPath), outDirPtr, nullPtr
+    );
+
+    if (ret !== 0) {
+      self.postMessage({ type: 'error', message: 'Archive decompression failed' });
+      return;
+    }
+
+    // Collect all extracted files
+    const extractedFiles = collectFiles(outDir, '');
+    const totalSize = extractedFiles.reduce((sum, f) => sum + f.size, 0);
+    const elapsed = (performance.now() - start) / 1000;
+
+    // Create a zip of extracted files for download
+    // For simplicity, if single file in archive, return it directly
+    // Otherwise, build a tar-like concatenation or return info
+    if (extractedFiles.length === 1) {
+      self.postMessage({
+        type: 'done',
+        data: extractedFiles[0].data.buffer,
+        name: extractedFiles[0].name,
+        originalSize: data.length,
+        compressedSize: totalSize,
+        ratio: 1,
+        elapsed: elapsed,
+        fileCount: extractedFiles.length
+      });
+    } else {
+      // Return first file and metadata about all files
+      // The UI will handle multi-file display
+      self.postMessage({
+        type: 'done',
+        data: extractedFiles[0].data.buffer,
+        name: fileName.replace('.hpk', ''),
+        originalSize: data.length,
+        compressedSize: totalSize,
+        ratio: 1,
+        elapsed: elapsed,
+        fileCount: extractedFiles.length,
+        extractedFiles: extractedFiles.map(f => ({ name: f.name, size: f.size }))
+      });
+    }
+
+    removeRecursive(outDir);
+  } else {
+    // HPK5 single file
+    const ret = Module._hp_decompress(
+      Module.allocateUTF8(inPath),
+      Module.allocateUTF8(outPath)
+    );
+
+    if (ret !== 0) {
+      self.postMessage({ type: 'error', message: 'Decompression failed' });
+      return;
+    }
+
+    const output = Module.FS.readFile(outPath);
+    const elapsed = (performance.now() - start) / 1000;
+
+    const outName = fileName.replace(/\.hpk$/i, '');
+    self.postMessage({
+      type: 'done',
+      data: output.buffer,
+      name: outName,
+      originalSize: data.length,
+      compressedSize: output.length,
+      ratio: 1,
+      elapsed: elapsed,
+      fileCount: 1
+    });
+
+    cleanupMemfs([outPath]);
+  }
+
+  cleanupMemfs([inPath]);
+}
+
+/* ===== List archive contents ===== */
+function listArchive(fileBuffer) {
+  const inPath = '/input.hpk';
+  cleanupMemfs([inPath]);
+
+  const data = new Uint8Array(fileBuffer);
+  Module.FS.writeFile(inPath, data);
+
+  listEntries = [];
+  const ret = Module._hp_archive_list(Module.allocateUTF8(inPath));
+
+  if (ret !== 0) {
+    self.postMessage({ type: 'error', message: 'List failed' });
+    return;
+  }
+
+  self.postMessage({ type: 'list-result', entries: listEntries });
+  cleanupMemfs([inPath]);
+}
+
+/* ===== MEMFS helpers ===== */
+function cleanupMemfs(paths) {
+  for (const p of paths) {
+    try { Module.FS.unlink(p); } catch (e) {}
+  }
+}
+
+function removeRecursive(path) {
+  try {
+    const stat = Module.FS.stat(path);
+    if (Module.FS.isDir(stat.mode)) {
+      const entries = Module.FS.readdir(path).filter(e => e !== '.' && e !== '..');
+      for (const entry of entries) {
+        removeRecursive(path + '/' + entry);
+      }
+      Module.FS.rmdir(path);
+    } else {
+      Module.FS.unlink(path);
+    }
+  } catch (e) {}
+}
+
+function collectFiles(basePath, rel) {
+  const files = [];
+  try {
+    const entries = Module.FS.readdir(basePath).filter(e => e !== '.' && e !== '..');
+    for (const entry of entries) {
+      const fullPath = basePath + '/' + entry;
+      const relPath = rel ? rel + '/' + entry : entry;
+      const stat = Module.FS.stat(fullPath);
+      if (Module.FS.isDir(stat.mode)) {
+        files.push(...collectFiles(fullPath, relPath));
+      } else {
+        const data = Module.FS.readFile(fullPath);
+        files.push({ name: relPath, data: data, size: data.length });
+      }
+    }
+  } catch (e) {}
+  return files;
+}
+
+/* ===== Progress parsing from stderr ===== */
+let lastStrategies = {};
+let lastDedupCount = 0;
+let lastDedupSaved = 0;
+let listEntries = [];
+
+function parseProgress(text) {
+  // Strategy tracking
+  const stratMatch = text.match(/\[([A-Za-z0-9+_]+)\]$/);
+  if (stratMatch) {
+    const name = stratMatch[1];
+    lastStrategies[name] = (lastStrategies[name] || 0) + 1;
+  }
+
+  // Block progress
+  const blockMatch = text.match(/Block (\d+).*?(\d+)\/(\d+)/);
+  if (blockMatch) {
+    const current = parseInt(blockMatch[1]);
+    const total = parseInt(blockMatch[3]);
+    if (total > 0) {
+      self.postMessage({
+        type: 'progress',
+        percent: Math.round((current / total) * 100),
+        detail: text.trim()
+      });
+    }
+  }
+
+  // Dedup tracking
+  if (text.includes('[DEDUP]')) {
+    lastDedupCount++;
+  }
+  if (text.match(/Dedup saved: (\d+)/)) {
+    lastDedupSaved = parseInt(text.match(/Dedup saved: (\d+)/)[1]);
+  }
+
+  // List parsing
+  const listMatch = text.match(/^(FILE|DIR|DEDUP)\s+(\S+)\s+(\d+)\s+([0-9A-Fa-f]+)\s+(.+)$/);
+  if (listMatch) {
+    listEntries.push({
+      type: listMatch[1],
+      size: parseSize(listMatch[2]),
+      blocks: parseInt(listMatch[3]),
+      crc: listMatch[4],
+      path: listMatch[5],
+      isDedup: listMatch[1] === 'DEDUP'
+    });
+  }
+
+  // Done message for HPK6
+  const doneMatch = text.match(/\[HPK6\] Done:.*?\((\d+\.?\d*)x\)/);
+  if (doneMatch) {
+    self.postMessage({ type: 'progress', percent: 100, detail: text.trim() });
+  }
+
+  // HPK5 done
+  const done5Match = text.match(/\[HP5\] Done:.*?\((\d+\.?\d*)x\)/);
+  if (done5Match) {
+    self.postMessage({ type: 'progress', percent: 100, detail: text.trim() });
+  }
+}
+
+function parseSize(str) {
+  const match = str.match(/([\d.]+)(B|KB|MB|GB)?/);
+  if (!match) return 0;
+  const val = parseFloat(match[1]);
+  switch (match[2]) {
+    case 'GB': return val * 1073741824;
+    case 'MB': return val * 1048576;
+    case 'KB': return val * 1024;
+    default: return val;
+  }
+}

@@ -15,6 +15,10 @@
 #include <stdint.h>
 #include <time.h>
 #include <math.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <dirent.h>
+#include <errno.h>
 #ifndef HYPERPACK_WASM
 #include <pthread.h>
 #else
@@ -34,6 +38,7 @@ static inline int pthread_join_stub(pthread_t t, void **r) { (void)t;(void)r; re
 #define RC_BOT        (1u << 16)
 #define MAX_TOTAL     16383
 #define MAGIC         0x48504B35u /* "HPK5" */
+#define MAGIC6        0x48504B36u /* "HPK6" archive */
 #define VERSION       10
 
 /* LZP configuration */
@@ -69,6 +74,21 @@ static const char *strat_names[] = {
     "LZMA",
     "BCJ+LZMA"
 };
+
+/* ===== HPK6 Archive Structures ===== */
+typedef struct {
+    uint8_t  type;        /* 0=file, 1=directory */
+    char    *path;        /* relative path (UTF-8, / separated) */
+    uint64_t size;        /* original file size */
+    uint32_t perms;       /* Unix permissions */
+    int64_t  mtime;       /* modification time */
+    uint32_t crc;         /* CRC32 of file content */
+    uint32_t first_block; /* first block index */
+    uint32_t nblocks;     /* number of blocks */
+    uint8_t  is_dedup;    /* 1 if duplicate of another file */
+    uint32_t dedup_ref;   /* index of original file */
+    char    *fullpath;    /* full filesystem path (not stored in archive) */
+} HPK6Entry;
 
 /* ===== Inline buffer helpers ===== */
 static inline void put_u32be(uint8_t *p, int v) {
@@ -5033,25 +5053,613 @@ static int file_decompress(const char *inpath, const char *outpath) {
     return 0;
 }
 
+/* ===== HPK6 Archive Functions ===== */
+
+static void write16(FILE *f, uint16_t v) {
+    uint8_t b[2] = { (uint8_t)(v>>8), (uint8_t)v };
+    fwrite(b, 1, 2, f);
+}
+static uint16_t read16(FILE *f) {
+    uint8_t b[2]; fread(b, 1, 2, f);
+    return ((uint16_t)b[0]<<8)|b[1];
+}
+
+static uint32_t file_crc32(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    if (!crc_ready) crc_init();
+    uint32_t c = 0xFFFFFFFFu;
+    uint8_t buf[1 << 20]; /* 1MB */
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        for (size_t i = 0; i < n; i++)
+            c = (c >> 8) ^ crc_tab[(c ^ buf[i]) & 0xFF];
+    }
+    fclose(f);
+    return c ^ 0xFFFFFFFFu;
+}
+
+static int scan_path(const char *base, const char *rel,
+                     HPK6Entry **entries, int *count, int *cap) {
+    char fullpath[4096];
+    if (rel[0])
+        snprintf(fullpath, sizeof(fullpath), "%s/%s", base, rel);
+    else
+        snprintf(fullpath, sizeof(fullpath), "%s", base);
+
+    struct stat st;
+    if (stat(fullpath, &st) != 0) {
+        fprintf(stderr, "Cannot stat '%s': %s\n", fullpath, strerror(errno));
+        return -1;
+    }
+
+    if (*count >= *cap) {
+        *cap = (*cap < 64) ? 64 : (*cap * 2);
+        *entries = (HPK6Entry*)realloc(*entries, (size_t)*cap * sizeof(HPK6Entry));
+    }
+
+    HPK6Entry *e = &(*entries)[*count];
+    memset(e, 0, sizeof(HPK6Entry));
+    e->path = strdup(rel[0] ? rel : "");
+    e->fullpath = strdup(fullpath);
+    e->perms = (uint32_t)(st.st_mode & 07777);
+    e->mtime = (int64_t)st.st_mtime;
+
+    if (S_ISDIR(st.st_mode)) {
+        e->type = 1;
+        e->size = 0;
+        e->first_block = 0xFFFFFFFF;
+        (*count)++;
+
+        DIR *d = opendir(fullpath);
+        if (!d) { fprintf(stderr, "Cannot open dir '%s'\n", fullpath); return -1; }
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (de->d_name[0] == '.' && (de->d_name[1] == 0 ||
+                (de->d_name[1] == '.' && de->d_name[2] == 0))) continue;
+            char child_rel[4096];
+            if (rel[0])
+                snprintf(child_rel, sizeof(child_rel), "%s/%s", rel, de->d_name);
+            else
+                snprintf(child_rel, sizeof(child_rel), "%s", de->d_name);
+            if (scan_path(base, child_rel, entries, count, cap) != 0) {
+                closedir(d);
+                return -1;
+            }
+        }
+        closedir(d);
+    } else if (S_ISREG(st.st_mode)) {
+        e->type = 0;
+        e->size = (uint64_t)st.st_size;
+        (*count)++;
+    }
+    return 0;
+}
+
+static void detect_file_duplicates(HPK6Entry *entries, int count) {
+    for (int i = 0; i < count; i++) {
+        if (entries[i].type != 0 || entries[i].is_dedup) continue;
+        if (entries[i].size == 0) continue;
+        for (int j = i + 1; j < count; j++) {
+            if (entries[j].type != 0 || entries[j].is_dedup) continue;
+            if (entries[j].size == entries[i].size && entries[j].crc == entries[i].crc) {
+                entries[j].is_dedup = 1;
+                entries[j].dedup_ref = (uint32_t)i;
+                entries[j].first_block = 0xFFFFFFFF;
+                entries[j].nblocks = 0;
+                fprintf(stderr, "  [DEDUP] '%s' == '%s'\n", entries[j].path, entries[i].path);
+            }
+        }
+    }
+}
+
+static void write_catalog(FILE *f, HPK6Entry *entries, int count) {
+    for (int i = 0; i < count; i++) {
+        HPK6Entry *e = &entries[i];
+        fputc(e->type, f);
+        uint16_t pathlen = (uint16_t)strlen(e->path);
+        write16(f, pathlen);
+        fwrite(e->path, 1, pathlen, f);
+        write64(f, e->size);
+        write32(f, e->perms);
+        write64(f, (uint64_t)e->mtime);
+        write32(f, e->crc);
+        write32(f, e->first_block);
+        write32(f, e->nblocks);
+        fputc(e->is_dedup, f);
+        write32(f, e->dedup_ref);
+    }
+}
+
+static HPK6Entry *read_catalog(FILE *f, int count) {
+    HPK6Entry *entries = (HPK6Entry*)calloc(count, sizeof(HPK6Entry));
+    for (int i = 0; i < count; i++) {
+        HPK6Entry *e = &entries[i];
+        e->type = (uint8_t)fgetc(f);
+        uint16_t pathlen = read16(f);
+        e->path = (char*)malloc(pathlen + 1);
+        fread(e->path, 1, pathlen, f);
+        e->path[pathlen] = '\0';
+        e->size = read64(f);
+        e->perms = read32(f);
+        e->mtime = (int64_t)read64(f);
+        e->crc = read32(f);
+        e->first_block = read32(f);
+        e->nblocks = read32(f);
+        e->is_dedup = (uint8_t)fgetc(f);
+        e->dedup_ref = read32(f);
+    }
+    return entries;
+}
+
+static void mkdirs(const char *path) {
+    char tmp[4096];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            mkdir(tmp, 0755);
+            *p = '/';
+        }
+    }
+    mkdir(tmp, 0755);
+}
+
+static int archive_compress(int npaths, const char **paths, const char *outpath,
+                            int block_size, int nthreads) {
+    (void)nthreads;
+    clock_t start = clock();
+
+    /* Phase 1: Scan all input paths */
+    HPK6Entry *entries = NULL;
+    int entry_count = 0, entry_cap = 0;
+
+    for (int p = 0; p < npaths; p++) {
+        struct stat st;
+        if (stat(paths[p], &st) != 0) {
+            fprintf(stderr, "Cannot access '%s': %s\n", paths[p], strerror(errno));
+            return 1;
+        }
+
+        if (S_ISDIR(st.st_mode)) {
+            char *base = strdup(paths[p]);
+            int len = (int)strlen(base);
+            while (len > 1 && base[len-1] == '/') base[--len] = '\0';
+
+            const char *bname = strrchr(base, '/');
+            bname = bname ? bname + 1 : base;
+
+            int root_idx = entry_count;
+            scan_path(base, "", &entries, &entry_count, &entry_cap);
+            if (root_idx < entry_count) {
+                free(entries[root_idx].path);
+                entries[root_idx].path = strdup(bname);
+            }
+            for (int i = root_idx + 1; i < entry_count; i++) {
+                char newpath[4096];
+                snprintf(newpath, sizeof(newpath), "%s/%s", bname, entries[i].path);
+                free(entries[i].path);
+                entries[i].path = strdup(newpath);
+            }
+            free(base);
+        } else {
+            if (entry_count >= entry_cap) {
+                entry_cap = (entry_cap < 64) ? 64 : (entry_cap * 2);
+                entries = (HPK6Entry*)realloc(entries, (size_t)entry_cap * sizeof(HPK6Entry));
+            }
+            HPK6Entry *e = &entries[entry_count];
+            memset(e, 0, sizeof(HPK6Entry));
+
+            const char *bname = strrchr(paths[p], '/');
+            bname = bname ? bname + 1 : paths[p];
+            e->path = strdup(bname);
+            e->fullpath = strdup(paths[p]);
+            e->type = 0;
+            e->size = (uint64_t)st.st_size;
+            e->perms = (uint32_t)(st.st_mode & 07777);
+            e->mtime = (int64_t)st.st_mtime;
+            entry_count++;
+        }
+    }
+
+    fprintf(stderr, "[HPK6] Scanned %d entries\n", entry_count);
+
+    /* Phase 2: Compute CRC32 for all files + detect dedup */
+    uint64_t total_size = 0;
+    int file_count = 0;
+    for (int i = 0; i < entry_count; i++) {
+        if (entries[i].type == 0) {
+            entries[i].crc = file_crc32(entries[i].fullpath);
+            total_size += entries[i].size;
+            file_count++;
+        }
+    }
+    detect_file_duplicates(entries, entry_count);
+
+    /* Count unique files and compute total blocks */
+    uint32_t total_blocks = 0;
+    uint32_t block_idx = 0;
+    for (int i = 0; i < entry_count; i++) {
+        if (entries[i].type != 0 || entries[i].is_dedup) continue;
+        uint32_t nblocks = (uint32_t)((entries[i].size + block_size - 1) / block_size);
+        if (entries[i].size == 0) nblocks = 0;
+        entries[i].first_block = block_idx;
+        entries[i].nblocks = nblocks;
+        block_idx += nblocks;
+        total_blocks += nblocks;
+    }
+    for (int i = 0; i < entry_count; i++) {
+        if (entries[i].is_dedup) {
+            entries[i].first_block = entries[entries[i].dedup_ref].first_block;
+            entries[i].nblocks = entries[entries[i].dedup_ref].nblocks;
+        }
+    }
+
+    fprintf(stderr, "[HPK6] %d files, %d dirs, %.2f MB total, %d blocks\n",
+            file_count, entry_count - file_count,
+            total_size / 1048576.0, total_blocks);
+
+    /* Phase 3: Write header + catalog */
+    FILE *fout = fopen(outpath, "wb");
+    if (!fout) { fprintf(stderr, "Cannot create '%s'\n", outpath); return 1; }
+
+    write32(fout, MAGIC6);
+    fputc(VERSION, fout);
+    write32(fout, (uint32_t)block_size);
+    write32(fout, (uint32_t)entry_count);
+    write32(fout, total_blocks);
+    write64(fout, total_size);
+
+    write_catalog(fout, entries, entry_count);
+
+    /* Phase 4: Compress blocks for each unique file */
+    BWTWorkspace *bwt_ws = bwt_ws_create(block_size);
+    CompressWorkspace *cws = cws_create(block_size);
+    uint8_t *inbuf = (uint8_t*)malloc(block_size);
+    uint8_t *outbuf = (uint8_t*)malloc(block_size + block_size/4 + 4096);
+
+    uint64_t *block_offsets = (uint64_t*)calloc(total_blocks ? total_blocks : 1, sizeof(uint64_t));
+    uint64_t *block_hashes = (uint64_t*)calloc(total_blocks ? total_blocks : 1, sizeof(uint64_t));
+    int64_t total_compressed = 0;
+    uint32_t global_block = 0;
+
+    for (int i = 0; i < entry_count; i++) {
+        if (entries[i].type != 0 || entries[i].is_dedup || entries[i].size == 0) continue;
+
+        FILE *fin = fopen(entries[i].fullpath, "rb");
+        if (!fin) {
+            fprintf(stderr, "Cannot open '%s'\n", entries[i].fullpath);
+            bwt_ws_free(bwt_ws); cws_free(cws);
+            free(inbuf); free(outbuf); free(block_offsets); free(block_hashes);
+            fclose(fout);
+            return 1;
+        }
+
+        uint64_t remaining = entries[i].size;
+        uint32_t file_block = 0;
+
+        while (remaining > 0) {
+            int bsz = (remaining > (uint64_t)block_size) ? block_size : (int)remaining;
+            fread(inbuf, 1, bsz, fin);
+            remaining -= bsz;
+
+            block_offsets[global_block] = (uint64_t)ftell(fout);
+
+            uint64_t hash = fnv1a(inbuf, bsz);
+            block_hashes[global_block] = hash;
+            int dup_ref = -1;
+            for (uint32_t pp = 0; pp < global_block; pp++) {
+                if (block_hashes[pp] == hash) { dup_ref = (int)pp; break; }
+            }
+
+            if (dup_ref >= 0) {
+                fputc(1, fout);
+                write32(fout, (uint32_t)dup_ref);
+                total_compressed += 5;
+                fprintf(stderr, "  Block %d [%s:%d/%d]: DUP of block %d\n",
+                        global_block+1, entries[i].path, file_block+1, entries[i].nblocks, dup_ref+1);
+            } else {
+                int strat;
+                int csz = compress_block(inbuf, bsz, outbuf, &strat, bwt_ws, cws);
+                uint32_t blk_crc = crc32(inbuf, bsz);
+
+                fputc(0, fout);
+                fputc(strat, fout);
+                write32(fout, (uint32_t)csz);
+                write32(fout, (uint32_t)bsz);
+                write32(fout, blk_crc);
+                fwrite(outbuf, 1, csz, fout);
+                total_compressed += 14 + csz;
+
+                double ratio = (double)bsz / csz;
+                fprintf(stderr, "  Block %d [%s:%d/%d]: %d -> %d (%.2fx) [%s]\n",
+                        global_block+1, entries[i].path, file_block+1, entries[i].nblocks,
+                        bsz, csz, ratio, strat_names[strat]);
+            }
+
+            global_block++;
+            file_block++;
+        }
+        fclose(fin);
+    }
+
+    /* Phase 5: Write block index table */
+    uint64_t index_offset = (uint64_t)ftell(fout);
+    for (uint32_t b = 0; b < total_blocks; b++) {
+        write64(fout, block_offsets[b]);
+    }
+    write64(fout, index_offset);
+    write32(fout, MAGIC6);
+
+    int64_t file_total = ftell(fout);
+    double elapsed = (double)(clock() - start) / CLOCKS_PER_SEC;
+    fprintf(stderr, "[HPK6] Done: %lld -> %lld bytes (%.2fx) in %.1fs\n",
+            (long long)total_size, (long long)file_total,
+            total_size > 0 ? (double)total_size / file_total : 1.0, elapsed);
+
+    /* Cleanup */
+    fclose(fout);
+    bwt_ws_free(bwt_ws);
+    cws_free(cws);
+    free(inbuf); free(outbuf);
+    free(block_offsets); free(block_hashes);
+    for (int i = 0; i < entry_count; i++) {
+        free(entries[i].path);
+        free(entries[i].fullpath);
+    }
+    free(entries);
+    return 0;
+}
+
+static int archive_decompress(const char *inpath, const char *outdir,
+                              const char *extract_name) {
+    FILE *fin = fopen(inpath, "rb");
+    if (!fin) { fprintf(stderr, "Cannot open '%s'\n", inpath); return 1; }
+
+    uint32_t magic = read32(fin);
+    if (magic != MAGIC6) {
+        fprintf(stderr, "Not an HPK6 archive (magic: %08X)\n", magic);
+        fclose(fin); return 1;
+    }
+    int ver = fgetc(fin);
+    if (ver < 5 || ver > VERSION) {
+        fprintf(stderr, "Unsupported version %d\n", ver);
+        fclose(fin); return 1;
+    }
+    uint32_t block_size = read32(fin);
+    uint32_t nentries = read32(fin);
+    uint32_t total_blocks = read32(fin);
+    uint64_t total_size = read64(fin);
+
+    fprintf(stderr, "[HPK6] Archive: %d entries, %d blocks, %.2f MB\n",
+            nentries, total_blocks, total_size / 1048576.0);
+
+    HPK6Entry *cat_entries = read_catalog(fin, (int)nentries);
+
+    long block_data_start = ftell(fin);
+
+    fseek(fin, -12, SEEK_END);
+    uint64_t index_offset = read64(fin);
+    uint32_t footer_magic = read32(fin);
+    if (footer_magic != MAGIC6) {
+        fprintf(stderr, "Warning: footer magic mismatch\n");
+    }
+
+    uint64_t *block_offsets = NULL;
+    if (total_blocks > 0) {
+        block_offsets = (uint64_t*)malloc(total_blocks * sizeof(uint64_t));
+        fseek(fin, (long)index_offset, SEEK_SET);
+        for (uint32_t b = 0; b < total_blocks; b++) {
+            block_offsets[b] = read64(fin);
+        }
+    }
+
+    mkdirs(outdir);
+
+    uint8_t *dec_outbuf = (uint8_t*)malloc(block_size);
+    uint8_t *cbuf = (uint8_t*)malloc(block_size + block_size/4 + 4096);
+
+    uint8_t **block_cache = (uint8_t**)calloc(total_blocks ? total_blocks : 1, sizeof(uint8_t*));
+    int *block_sizes = (int*)calloc(total_blocks ? total_blocks : 1, sizeof(int));
+
+    clock_t dec_start = clock();
+
+    /* Decompress all blocks sequentially (needed for dedup references) */
+    fseek(fin, block_data_start, SEEK_SET);
+    for (uint32_t b = 0; b < total_blocks; b++) {
+        if (block_offsets) fseek(fin, (long)block_offsets[b], SEEK_SET);
+
+        int flags = fgetc(fin);
+        if (flags & 1) {
+            uint32_t ref = read32(fin);
+            if (ref < total_blocks && block_cache[ref]) {
+                block_cache[b] = (uint8_t*)malloc(block_sizes[ref]);
+                memcpy(block_cache[b], block_cache[ref], block_sizes[ref]);
+                block_sizes[b] = block_sizes[ref];
+            }
+        } else {
+            int strat = fgetc(fin);
+            int csz = (int)read32(fin);
+            int orig_b = (int)read32(fin);
+            uint32_t expected_crc = read32(fin);
+            fread(cbuf, 1, csz, fin);
+
+            decompress_block(cbuf, csz, strat, orig_b, dec_outbuf);
+
+            uint32_t actual_crc = crc32(dec_outbuf, orig_b);
+            if (actual_crc != expected_crc) {
+                fprintf(stderr, "  Block %d: CRC MISMATCH! Expected %08X got %08X\n",
+                        b+1, expected_crc, actual_crc);
+            }
+
+            block_cache[b] = (uint8_t*)malloc(orig_b);
+            memcpy(block_cache[b], dec_outbuf, orig_b);
+            block_sizes[b] = orig_b;
+        }
+    }
+
+    /* Write files from decompressed blocks */
+    int files_extracted = 0;
+    for (uint32_t i = 0; i < nentries; i++) {
+        char filepath[4096];
+        snprintf(filepath, sizeof(filepath), "%s/%s", outdir, cat_entries[i].path);
+
+        if (cat_entries[i].type == 1) {
+            if (extract_name == NULL) mkdirs(filepath);
+            continue;
+        }
+
+        if (extract_name != NULL) {
+            if (strcmp(cat_entries[i].path, extract_name) != 0 &&
+                strstr(cat_entries[i].path, extract_name) == NULL) continue;
+        }
+
+        char *last_slash = strrchr(filepath, '/');
+        if (last_slash) {
+            char parent[4096];
+            int plen = (int)(last_slash - filepath);
+            memcpy(parent, filepath, plen);
+            parent[plen] = '\0';
+            mkdirs(parent);
+        }
+
+        uint32_t fb = cat_entries[i].first_block;
+        uint32_t nb = cat_entries[i].nblocks;
+
+        if (cat_entries[i].size == 0) {
+            FILE *fout = fopen(filepath, "wb");
+            if (fout) fclose(fout);
+            fprintf(stderr, "  Extracted: %s (empty)\n", cat_entries[i].path);
+            files_extracted++;
+            continue;
+        }
+
+        FILE *fout = fopen(filepath, "wb");
+        if (!fout) {
+            fprintf(stderr, "Cannot create '%s'\n", filepath);
+            continue;
+        }
+
+        for (uint32_t b = 0; b < nb; b++) {
+            uint32_t bi = fb + b;
+            if (bi < total_blocks && block_cache[bi]) {
+                fwrite(block_cache[bi], 1, block_sizes[bi], fout);
+            }
+        }
+        fclose(fout);
+
+        uint32_t actual_crc = file_crc32(filepath);
+        if (actual_crc != cat_entries[i].crc) {
+            fprintf(stderr, "  WARNING: File CRC mismatch for '%s'! Expected %08X got %08X\n",
+                    cat_entries[i].path, cat_entries[i].crc, actual_crc);
+        }
+
+#ifndef _WIN32
+        chmod(filepath, cat_entries[i].perms);
+#endif
+
+        fprintf(stderr, "  Extracted: %s (%lld bytes)\n", cat_entries[i].path, (long long)cat_entries[i].size);
+        files_extracted++;
+    }
+
+    double dec_elapsed = (double)(clock() - dec_start) / CLOCKS_PER_SEC;
+    fprintf(stderr, "[HPK6] Extracted %d files in %.1fs\n", files_extracted, dec_elapsed);
+
+    /* Cleanup */
+    fclose(fin);
+    for (uint32_t b = 0; b < total_blocks; b++) free(block_cache[b]);
+    free(block_cache); free(block_sizes);
+    free(dec_outbuf); free(cbuf);
+    free(block_offsets);
+    for (uint32_t i = 0; i < nentries; i++) free(cat_entries[i].path);
+    free(cat_entries);
+    return 0;
+}
+
+static int archive_list(const char *inpath) {
+    FILE *fin = fopen(inpath, "rb");
+    if (!fin) { fprintf(stderr, "Cannot open '%s'\n", inpath); return 1; }
+
+    uint32_t magic = read32(fin);
+    if (magic != MAGIC6) {
+        fprintf(stderr, "Not an HPK6 archive\n");
+        fclose(fin); return 1;
+    }
+    int ver = fgetc(fin);
+    uint32_t block_size = read32(fin);
+    uint32_t nentries = read32(fin);
+    uint32_t total_blocks = read32(fin);
+    uint64_t total_size = read64(fin);
+
+    HPK6Entry *lst_entries = read_catalog(fin, (int)nentries);
+    fclose(fin);
+
+    fprintf(stderr, "HyperPack HPK6 Archive (v%d, block size: %d MB)\n", ver, block_size >> 20);
+    fprintf(stderr, "%-8s %-8s %-6s %-8s %s\n", "Type", "Size", "Blocks", "CRC32", "Path");
+    fprintf(stderr, "-------- -------- ------ -------- ----\n");
+
+    uint64_t unique_size = 0;
+    int file_cnt = 0, dir_cnt = 0, dedup_cnt = 0;
+
+    for (uint32_t i = 0; i < nentries; i++) {
+        const char *type_str;
+        if (lst_entries[i].type == 1) {
+            type_str = "DIR";
+            dir_cnt++;
+        } else if (lst_entries[i].is_dedup) {
+            type_str = "DEDUP";
+            dedup_cnt++;
+        } else {
+            type_str = "FILE";
+            unique_size += lst_entries[i].size;
+        }
+        file_cnt += (lst_entries[i].type == 0);
+
+        char size_str[32];
+        if (lst_entries[i].size >= (1 << 20))
+            snprintf(size_str, sizeof(size_str), "%.1fMB", lst_entries[i].size / 1048576.0);
+        else if (lst_entries[i].size >= 1024)
+            snprintf(size_str, sizeof(size_str), "%.1fKB", lst_entries[i].size / 1024.0);
+        else
+            snprintf(size_str, sizeof(size_str), "%lluB", (unsigned long long)lst_entries[i].size);
+
+        fprintf(stderr, "%-8s %-8s %-6d %08X %s\n",
+                type_str, size_str, lst_entries[i].nblocks, lst_entries[i].crc, lst_entries[i].path);
+    }
+
+    fprintf(stderr, "\nTotal: %d files, %d dirs, %d blocks\n", file_cnt, dir_cnt, total_blocks);
+    fprintf(stderr, "Original: %.2f MB | Unique: %.2f MB | Dedup saved: %d files\n",
+            total_size / 1048576.0, unique_size / 1048576.0, dedup_cnt);
+
+    for (uint32_t i = 0; i < nentries; i++) free(lst_entries[i].path);
+    free(lst_entries);
+    return 0;
+}
+
 /* ===== Main ===== */
 #ifndef HYPERPACK_WASM
 int main(int argc, char **argv) {
-    if (argc < 4) {
+    if (argc < 3) {
         fprintf(stderr,
             "HyperPack Quantum v11 — Ultra-High Compression Engine\n"
             "Usage:\n"
-            "  %s c [-b SIZE_MB] [-j THREADS] input output.hpk   Compress\n"
-            "  %s d input.hpk output                               Decompress\n",
-            argv[0], argv[0]);
+            "  %s c [-b SIZE_MB] [-j THREADS] input output.hpk     Compress single file (HPK5)\n"
+            "  %s a [-b SIZE_MB] input... output.hpk                Archive compress (HPK6)\n"
+            "  %s d input.hpk [output]                              Decompress (auto-detect)\n"
+            "  %s l input.hpk                                       List archive contents\n"
+            "  %s x input.hpk output_dir [-e pattern]               Extract from archive\n",
+            argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 1;
     }
 
-    if (argv[1][0] == 'c') {
+    if (argv[1][0] == 'c' && argv[1][1] == '\0') {
+        /* Single file compress — HPK5 (backward compatible) */
+        if (argc < 4) {
+            fprintf(stderr, "Usage: %s c [-b SIZE_MB] [-j THREADS] input output.hpk\n", argv[0]);
+            return 1;
+        }
         int block_mb = DEFAULT_BS >> 20;
         int nthreads = 1;
-        const char *inpath = NULL, *outpath = NULL;
-        
-        /* Parse options: -b SIZE_MB, -j THREADS */
         int i = 2;
         while (i < argc - 2) {
             if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
@@ -5066,16 +5674,85 @@ int main(int argc, char **argv) {
                 i++;
             } else break;
         }
-        inpath = argv[i]; outpath = argv[i+1];
-        
         if (nthreads > 1) {
             fprintf(stderr, "[HP5] Using %d parallel threads\n", nthreads);
         }
-        return file_compress(inpath, outpath, block_mb << 20, nthreads);
-    } else if (argv[1][0] == 'd') {
-        return file_decompress(argv[2], argv[3]);
+        return file_compress(argv[i], argv[i+1], block_mb << 20, nthreads);
+
+    } else if (argv[1][0] == 'a' && argv[1][1] == '\0') {
+        /* Archive compress — HPK6 */
+        if (argc < 4) {
+            fprintf(stderr, "Usage: %s a [-b SIZE_MB] input... output.hpk\n", argv[0]);
+            return 1;
+        }
+        int block_mb = DEFAULT_BS >> 20;
+        int i = 2;
+        while (i < argc - 1) {
+            if (strcmp(argv[i], "-b") == 0 && i + 1 < argc - 1) {
+                block_mb = atoi(argv[++i]);
+                if (block_mb < 1) block_mb = 1;
+                if (block_mb > 128) block_mb = 128;
+                i++;
+            } else break;
+        }
+        int ninputs = argc - i - 1;
+        if (ninputs < 1) {
+            fprintf(stderr, "No input files specified\n");
+            return 1;
+        }
+        const char **inputs = (const char**)&argv[i];
+        const char *outpath = argv[argc - 1];
+        return archive_compress(ninputs, inputs, outpath, block_mb << 20, 1);
+
+    } else if (argv[1][0] == 'd' && argv[1][1] == '\0') {
+        /* Decompress — auto-detect HPK5 or HPK6 */
+        if (argc < 3) {
+            fprintf(stderr, "Usage: %s d input.hpk [output]\n", argv[0]);
+            return 1;
+        }
+        FILE *fin = fopen(argv[2], "rb");
+        if (!fin) { fprintf(stderr, "Cannot open '%s'\n", argv[2]); return 1; }
+        uint32_t magic = read32(fin);
+        fclose(fin);
+
+        if (magic == MAGIC6) {
+            const char *outdir = (argc > 3) ? argv[3] : ".";
+            return archive_decompress(argv[2], outdir, NULL);
+        } else if (magic == MAGIC) {
+            if (argc < 4) {
+                fprintf(stderr, "Usage: %s d input.hpk output\n", argv[0]);
+                return 1;
+            }
+            return file_decompress(argv[2], argv[3]);
+        } else {
+            fprintf(stderr, "Unknown file format (magic: %08X)\n", magic);
+            return 1;
+        }
+
+    } else if (argv[1][0] == 'l' && argv[1][1] == '\0') {
+        /* List archive contents */
+        if (argc < 3) {
+            fprintf(stderr, "Usage: %s l input.hpk\n", argv[0]);
+            return 1;
+        }
+        return archive_list(argv[2]);
+
+    } else if (argv[1][0] == 'x' && argv[1][1] == '\0') {
+        /* Extract from archive with optional pattern */
+        if (argc < 4) {
+            fprintf(stderr, "Usage: %s x input.hpk output_dir [-e pattern]\n", argv[0]);
+            return 1;
+        }
+        const char *extract_pattern = NULL;
+        for (int i = 4; i < argc; i++) {
+            if (strcmp(argv[i], "-e") == 0 && i + 1 < argc) {
+                extract_pattern = argv[++i];
+            }
+        }
+        return archive_decompress(argv[2], argv[3], extract_pattern);
+
     } else {
-        fprintf(stderr, "Unknown mode '%s'. Use 'c' or 'd'.\n", argv[1]);
+        fprintf(stderr, "Unknown mode '%s'. Use 'c', 'a', 'd', 'l', or 'x'.\n", argv[1]);
         return 1;
     }
 }

@@ -68,6 +68,19 @@ export function SettingsPanel({ isOpen, onClose, settings, onSettingsChange }: S
             </p>
           </div>
 
+          {/* HPK6 Archive mode info */}
+          <div className="p-4 bg-hp-bg rounded-xl border border-hp-border space-y-2">
+            <div className="flex items-center gap-2">
+              <span className="text-lg">📦</span>
+              <span className="text-sm font-medium text-hp-text">Archive Mode (HPK6)</span>
+            </div>
+            <p className="text-xs text-hp-muted leading-relaxed">
+              Archive mode (HPK6) is automatically used when multiple files or a folder is selected. 
+              Single files use the classic HPK5 format. HPK6 adds a file/directory table, CRC checksums, 
+              and block-level deduplication for repeated content.
+            </p>
+          </div>
+
           {/* WASM limitations note */}
           <div className="p-4 bg-hp-accent/5 rounded-xl border border-hp-accent/20 space-y-2">
             <div className="flex items-center gap-2">

@@ -22,7 +22,7 @@ emcc "$SRC" \
     -s MODULARIZE=1 \
     -s EXPORT_NAME='createHyperPack' \
     -s FORCE_FILESYSTEM=1 \
-    -s "EXPORTED_FUNCTIONS=['_hp_compress','_hp_decompress','_malloc','_free']" \
+    -s "EXPORTED_FUNCTIONS=['_hp_compress','_hp_decompress','_hp_archive_compress','_hp_archive_decompress','_hp_archive_list','_hp_detect_format','_malloc','_free']" \
     -s "EXPORTED_RUNTIME_METHODS=['FS','cwrap','ccall']" \
     -s ALLOW_MEMORY_GROWTH=1 \
     -s INITIAL_MEMORY=268435456 \
