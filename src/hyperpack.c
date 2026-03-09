@@ -3280,10 +3280,22 @@ static int lzma_compress(const uint8_t *data, int n, uint8_t *out, int size_limi
     int *dec_dists = (int *)malloc((OPT_AHEAD + LZMA_MAX_MATCH + 1) * sizeof(int));
     int *dec_reps_flag = (int *)malloc((OPT_AHEAD + LZMA_MAX_MATCH + 1) * sizeof(int));
 
+    /* Price tables: precomputed once per DP round (4×272 = ~4KB, fits in L1 cache).
+       Eliminates 2.2B repeated lzma_len_price() calls in the inner DP loops. */
+    uint32_t rep_ptable[LZMA_POS_STATES][LZMA_MAX_MATCH - LZMA_MIN_MATCH + 1];
+    uint32_t match_ptable[LZMA_POS_STATES][LZMA_MAX_MATCH - LZMA_MIN_MATCH + 1];
+
     while (pos < n) {
         /* === Phase 1: Forward DP pricing === */
         int ahead = n - pos;
         if (ahead > OPT_AHEAD) ahead = OPT_AHEAD;
+
+        /* Refresh price tables for this DP round (probabilities change as symbols are emitted) */
+        for (int ps = 0; ps < LZMA_POS_STATES; ps++)
+            for (int l = LZMA_MIN_MATCH; l <= LZMA_MAX_MATCH; l++) {
+                rep_ptable[ps][l - LZMA_MIN_MATCH]   = lzma_len_price(&probs.rep_len,   l, ps);
+                match_ptable[ps][l - LZMA_MIN_MATCH] = lzma_len_price(&probs.match_len, l, ps);
+            }
 
         /* Initialize node 0 */
         opt[0].price = 0;
@@ -3402,7 +3414,7 @@ static int lzma_compress(const uint8_t *data, int n, uint8_t *out, int size_limi
 
                     /* Try all lengths */
                     for (int l = LZMA_MIN_MATCH; l <= len; l++) {
-                        uint32_t price = rep_price + lzma_len_price(&probs.rep_len, l, pos_state);
+                        uint32_t price = rep_price + rep_ptable[pos_state][l - LZMA_MIN_MATCH];
                         int next = cur + l;
                         if (next <= (int)(n - pos) && price < opt[next].price) {
                             opt[next].price = price;
@@ -3457,7 +3469,7 @@ static int lzma_compress(const uint8_t *data, int n, uint8_t *out, int size_limi
                         if (l > 32 && l < mlen && (l & 7) != 0) continue;
 
                         uint32_t price = normal_price;
-                        price += lzma_len_price(&probs.match_len, l, pos_state);
+                        price += match_ptable[pos_state][l - LZMA_MIN_MATCH];
                         price += lzma_dist_price(&probs, dist, l);
 
                         int next = cur + l;
