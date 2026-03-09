@@ -3212,36 +3212,64 @@ static uint32_t lzma_dist_price(const LzmaProbs *p, uint32_t dist, int len) {
 }
 
 /* ===== Match Finder (Hash Chain) ===== */
+/* Hash sizes for short-length match boosting.
+ * hash2: 2^16 = 65536 entries for all 2-byte pairs (exact, no collisions for len=2)
+ * hash3: 2^16 = 65536 entries for 3-byte combinations (may collide, still helps)
+ * These let the match finder reliably find length-2 and length-3 matches that the
+ * 4-byte hash chain misses; critical for code-heavy data (C tokens, x86 opcodes). */
+#define LZMA_HASH2_SIZE  (1 << 16)
+#define LZMA_HASH2_MASK  (LZMA_HASH2_SIZE - 1)
+#define LZMA_HASH3_BITS  16
+#define LZMA_HASH3_SIZE  (1 << LZMA_HASH3_BITS)
+#define LZMA_HASH3_MASK  (LZMA_HASH3_SIZE - 1)
+
 typedef struct {
     const uint8_t *data;
     int size;
     int pos;
-    int32_t *head;    /* hash -> last position */
+    int32_t *head;    /* hash4 -> last position */
     int32_t *chain;   /* circular chain buffer */
+    int32_t *head2;   /* hash2 -> last position (2-byte matches) */
+    int32_t *head3;   /* hash3 -> last position (3-byte matches) */
     int window_size;
     int chain_max;    /* Phase 3: configurable search depth */
+    int nice_len;     /* stop chain search early when match >= nice_len */
 } LzmaMF;
 
 static inline uint32_t lzma_mf_hash4(const uint8_t *p) {
     uint32_t v = p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
     return (v * 2654435761u) >> (32 - LZMA_MF_HASH_BITS);
 }
+static inline uint32_t lzma_mf_hash2(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8);  /* exact 2-byte pair index */
+}
+static inline uint32_t lzma_mf_hash3(const uint8_t *p) {
+    uint32_t v = p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
+    return (v * 2654435761u) >> (32 - LZMA_HASH3_BITS);
+}
 
-static void lzma_mf_init(LzmaMF *mf, const uint8_t *data, int size, int window_size, int chain_max) {
+static void lzma_mf_init(LzmaMF *mf, const uint8_t *data, int size, int window_size, int chain_max, int nice_len) {
     mf->data = data;
     mf->size = size;
     mf->pos = 0;
     mf->window_size = window_size;
+    mf->nice_len = nice_len;
     mf->chain_max = chain_max;
-    mf->head = (int32_t *)malloc(LZMA_MF_HASH_SIZE * sizeof(int32_t));
+    mf->head  = (int32_t *)malloc(LZMA_MF_HASH_SIZE * sizeof(int32_t));
     mf->chain = (int32_t *)malloc(window_size * sizeof(int32_t));
-    memset(mf->head, -1, LZMA_MF_HASH_SIZE * sizeof(int32_t));
+    mf->head2 = (int32_t *)malloc(LZMA_HASH2_SIZE * sizeof(int32_t));
+    mf->head3 = (int32_t *)malloc(LZMA_HASH3_SIZE * sizeof(int32_t));
+    memset(mf->head,  -1, LZMA_MF_HASH_SIZE * sizeof(int32_t));
     memset(mf->chain, -1, window_size * sizeof(int32_t));
+    memset(mf->head2, -1, LZMA_HASH2_SIZE * sizeof(int32_t));
+    memset(mf->head3, -1, LZMA_HASH3_SIZE * sizeof(int32_t));
 }
 
 static void lzma_mf_free(LzmaMF *mf) {
     free(mf->head);
     free(mf->chain);
+    free(mf->head2);
+    free(mf->head3);
 }
 
 /* Match result: array of (dist, len) pairs. Returns count. */
@@ -3294,6 +3322,7 @@ static int lzma_mf_find_all(LzmaMF *mf, int pos, uint32_t *reps,
                         np++;
                     }
                     if (len >= max_len) break;
+                    if (len >= mf->nice_len) break; /* good enough — stop early */
                 }
             }
             chain_pos = mf->chain[chain_pos % mf->window_size];
@@ -3345,9 +3374,10 @@ static int lzma_compress(const uint8_t *data, int n, uint8_t *out, int size_limi
     /* Phase 3: Reduce chain depth when competing against existing result.
      * Full depth (128) when no limit; fast depth (32) when speculative. */
     int chain_depth = (size_limit > 0) ? 32 : LZMA_MF_CHAIN_MAX;
+    int nice_len = LZMA_MAX_MATCH; /* no early exit by default */
 
     LzmaMF mf;
-    lzma_mf_init(&mf, data, n, window_size, chain_depth);
+    lzma_mf_init(&mf, data, n, window_size, chain_depth, nice_len);
 
     LRCEnc rc;
     lrc_enc_init(&rc, out);
