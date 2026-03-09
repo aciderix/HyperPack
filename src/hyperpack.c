@@ -15,7 +15,17 @@
 #include <stdint.h>
 #include <time.h>
 #include <math.h>
+#ifndef HYPERPACK_WASM
 #include <pthread.h>
+#else
+/* WASM build: stub out pthreads (single-threaded only) */
+typedef int pthread_t;
+static inline int pthread_create_stub(pthread_t *t, const void *a, void *(*f)(void*), void *arg)
+    { (void)t;(void)a;(void)f;(void)arg; return -1; }
+static inline int pthread_join_stub(pthread_t t, void **r) { (void)t;(void)r; return 0; }
+#define pthread_create pthread_create_stub
+#define pthread_join   pthread_join_stub
+#endif
 
 /* ===== Configuration ===== */
 #define DEFAULT_BS    (128 << 20)   /* 128 MB — BWT needs large blocks */
@@ -3995,6 +4005,11 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
         work_bde.cws = cws2;
     }
     
+#ifdef HYPERPACK_WASM
+    /* WASM: run strategy groups sequentially (no pthreads) */
+    if (run_ac) thread_groups_AC(&work_ac);
+    if (run_bde) thread_groups_BDE(&work_bde);
+#else
     /* Launch threads only for groups we need */
     if (run_ac && run_bde) {
         /* Both groups: parallel (original behavior) */
@@ -4009,6 +4024,7 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
         /* Only BDE group */
         thread_groups_BDE(&work_bde);
     }
+#endif
     
     /* Pick best from whichever groups ran */
     if (run_ac && run_bde) {
@@ -5018,6 +5034,7 @@ static int file_decompress(const char *inpath, const char *outpath) {
 }
 
 /* ===== Main ===== */
+#ifndef HYPERPACK_WASM
 int main(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr,
@@ -5062,3 +5079,4 @@ int main(int argc, char **argv) {
         return 1;
     }
 }
+#endif /* HYPERPACK_WASM */

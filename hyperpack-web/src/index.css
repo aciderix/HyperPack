@@ -1,0 +1,79 @@
+@import "tailwindcss";
+
+@theme {
+  --color-hp-bg: #0f0f13;
+  --color-hp-card: #1a1a24;
+  --color-hp-hover: #252535;
+  --color-hp-border: #2a2a3a;
+  --color-hp-text: #e4e4ef;
+  --color-hp-muted: #8888a0;
+  --color-hp-accent: #6c5ce7;
+  --color-hp-accent-hover: #7c6cf7;
+  --color-hp-success: #00d26a;
+  --color-hp-warning: #ffd166;
+  --color-hp-error: #ff6b6b;
+}
+
+body {
+  background-color: var(--color-hp-bg);
+  color: var(--color-hp-text);
+  font-family: 'Inter', system-ui, sans-serif;
+}
+
+/* Settings panel slide-in animation */
+@keyframes slideInRight {
+  from {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.animate-slide-in-right {
+  animation: slideInRight 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.2s ease-out;
+}
+
+/* Progress bar shimmer */
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.progress-shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--color-hp-accent) 0%,
+    #9b59b6 25%,
+    #a78bfa 50%,
+    #9b59b6 75%,
+    var(--color-hp-accent) 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 2s linear infinite;
+}
+
+/* Page-wide drag overlay */
+@keyframes breathe {
+  0%, 100% { border-color: var(--color-hp-accent); }
+  50% { border-color: #a78bfa; }
+}
+
+.drag-overlay {
+  animation: fadeIn 0.15s ease-out, breathe 1.5s ease-in-out infinite;
+}
