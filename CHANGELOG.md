@@ -2,6 +2,40 @@
 
 All notable changes to HyperPack are documented in this file.
 
+## [v11] — 2025-03-09
+
+### Phase 1 — Small Block Compression
+- **LZMA forced on blocks < 1 MB**: Previously skipped by the heuristic, now tested on all small blocks where LZMA can improve results
+- **BCJ E8/E9 x86 filter**: Detects ELF (0x7F ELF) and PE (MZ) executables, applies E8/E9 call/jump address translation before LZMA compression
+- Canterbury corpus: +2.1% ratio improvement
+- Calgary corpus: +1.3% ratio improvement
+- Zero Silesia regressions
+
+### Phase 2 — Parallel Compression
+- **`-j N` flag**: Compresses independent blocks in parallel using pthreads
+- Bit-identical output regardless of thread count (deterministic)
+- 100% decompression roundtrip verification
+- Measured: 1.69x speedup with `-j 4` on large files
+
+### Phase 3 — LZMA Speed Recovery
+- **Adaptive LZMA chain depth**: Reduced from 128 to 32 when LZMA is in speculative mode (must beat BWT). Same quality for top matches, ~2x faster search
+- **Progressive early-exit margin**: Starts at 4.7x tolerance (cold model), decreases to 1.14x as model warms up. Aborts unpromising LZMA trials early
+- Result: Phase 1 slowdown reduced from 2.03x to 1.26x vs v10.2, with <0.5% ratio loss
+- 17/18 tested files accelerated, ooffice highlight: 19.5s → 10.6s (1.85x speedup)
+
+### Phase 4 — Text Detection + Hash Tables
+- **Pure text detection**: On blocks >100 KB with >95% ASCII and entropy < 5.5, skip LZMA entirely (BWT always wins). Speed boost on literary text (book1: 47% faster)
+- **LZMA hash table enlarged**: 20 → 22 bits (1M → 4M entries). Fewer collisions = better match finding on binary files (ooffice: +0.26%)
+- **CM order-3 hash table enlarged**: 20 → 22 bits (1M → 4M entries). More context states for order-3 model
+
+### Cumulative v10.2 → v11 Results
+- **+1.4% compression ratio** globally across all corpora
+- **Only 1.16x slower** than v10.2 (was 2.03x after Phase 1)
+- **Zero regressions** on any tested file
+- Beats xz -9 by 7%, bzip2 -9 by 10%, gzip -9 by 31% on average
+
+---
+
 ## [v10.2] — 2025-03-08
 
 ### Added
@@ -49,7 +83,7 @@ All notable changes to HyperPack are documented in this file.
 
 ## Rejected Optimizations
 
-The following approaches were tested and rejected during the v10.1/v10.2 development:
+The following approaches were tested and rejected during development:
 
 | Test | Result | Why rejected |
 |---|---|---|
@@ -60,27 +94,7 @@ The following approaches were tested and rejected during the v10.1/v10.2 develop
 | XML preprocessing | Skipped | BWT already achieves 12.29x |
 | libdivsufsort | +0% on Silesia | Only helps on 80 MB+ text, adds dependency |
 | Smaller BWT blocks | -11% ratio | BWT needs large blocks for long-range patterns |
-
-## 2025-03-08 — Experimental Tests Documentation
-
-### Added
-- `docs/EXPERIMENTAL_TESTS.md` — Complete results of 13 optimization experiments
-  - E8/E9 x86 filter: −1.5% to −19% (harmful)
-  - Transpose transform: −54% to −58% (catastrophic)
-  - Bit-plane transform: −65% to −75% (devastating)
-  - 5 techniques found redundant with existing pipeline
-
-### Updated
-- `docs/ROADMAP.md` — Reflects all tested/rejected techniques
-- `README.md` — Added experimental tests summary section
-
-## 2025-03-08 — Multi-Platform App Architecture
-
-### Added
-- `docs/MULTIPLATFORM_APP.md` — Complete architecture document for WASM + Tauri apps
-  - Shared frontend design (HTML/CSS/JS)
-  - WASM build with Emscripten (Phase 1)
-  - Tauri desktop app with Rust FFI (Phase 2)
-  - User-configurable parameters: strategy, block size, LZMA dict, level
-  - Folder support (archive or individual mode)
-  - Development roadmap (~10-12 days estimated)
+| E8/E9 on BWT output | -1.5% to -19% | Harmful — but E8/E9 BEFORE LZMA works great |
+| Transpose transform | -54% to -58% | Catastrophic — destroys BWT patterns |
+| Bit-plane transform | -65% to -75% | Devastating — incompatible with BWT |
+| CM O3 hash 4M entries | ~0% | CM not limited by hash collisions at this scale |

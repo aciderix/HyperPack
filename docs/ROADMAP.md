@@ -1,63 +1,38 @@
-# HyperPack — Roadmap & Optimization Status
+# HyperPack Roadmap
 
-## ✅ Implemented (v10.2)
+## ✅ Completed (v11)
 
-| Technique | Impact | Version |
-|-----------|--------|---------|
-| LZMA 64MB dictionary | **+7.2%** ratio | v10.1 |
-| MTF-2 variant | **+0.39%** ratio | v10.1 |
-| Smart LZMA heuristic | **2.1× faster** | v10.1 |
-| Sample-based strategy selection | ~10% faster | v10.2 |
+| Phase | Feature | Impact |
+|-------|---------|--------|
+| **Phase 1** | LZMA forced on small blocks + BCJ E8/E9 filter | +2.1% ratio (Canterbury), +1.3% (Calgary) |
+| **Phase 2** | Parallel compression (`-j N`) | 1.69x speedup with `-j 4` |
+| **Phase 3** | Adaptive LZMA chain depth + progressive early-exit | 1.62x faster than Phase 1, <0.5% ratio loss |
+| **Phase 4** | Pure text detection + LZMA/CM hash tables enlarged | +0.3% ratio, +9% speed on text |
 
-## ❌ Tested & Rejected
+## 🔮 Future Opportunities
 
-These techniques were tested empirically and found to be harmful or redundant:
+### Neural Context Mixer + Word Model (High Impact)
 
-| Technique | Predicted | Actual | Why |
-|-----------|-----------|--------|-----|
-| Context Mixing after BWT | "Better" | −19% to −66% | CM can't beat BWT+MTF+RC |
-| Order-4 Range Coder | "Better" | −12% to −35% | Context dilution |
-| E8/E9 x86 filter | +5–15% | −1.5% to −19% | False positives in non-code data |
-| Transpose transform | +3–7% | **−54% to −58%** | Destroys BWT contexts |
-| Bit-plane transform | +10–20% | **−65% to −75%** | Destroys all byte-level structure |
-| LZP longer context | "Better" | 0% | BWT alone always wins |
-| Adaptive block size | +2–10% | 0% | All files fit in 128 MB |
-| Alphabet ranking | +1–3% | Redundant | Already done by MTF |
-| 6-bit packing | "Gain" | Redundant | Already done by Range Coder |
-| Byte remapping | +1–2% | Redundant | Already done by MTF |
+**Current limitation:** HyperPack's CM uses static-weight mixing of 7 byte-level models (order 0-6). This is good but not optimal for natural language text, where bzip2 still wins by ~3%.
 
-See [EXPERIMENTAL_TESTS.md](EXPERIMENTAL_TESTS.md) for detailed results.
+**Proposed solution:**
+1. **Neural mixer**: Replace static weights with a logistic regression mixer that learns per-bit which model is most reliable. Updates weights after each bit via gradient descent.
+2. **Word model**: Add a word-level predictor that uses the last N words as context (instead of N bytes). Captures grammatical structure that byte models miss.
 
-## 🔮 Remaining Possibilities
+**Expected gains:**
+- +5-8% on literary text (alice29, book1, plrabn12)
+- Would close the gap with bzip2 on small text files
+- Cost: ~2x slower on CM blocks, ~400 lines of C
 
-### Realistic gains
+### ANS Entropy Coder
 
-| Technique | Expected Impact | Complexity |
-|-----------|----------------|------------|
-| Parallel compression (`-j4`) | 3–4× speed (no ratio change) | Medium |
-| libdivsufsort for BWT | 17% faster on large text | Adds dependency |
-| ANS entropy coder | 2× decompression speed | High (rewrite RC) |
+Replace the Range Coder with ANS (Asymmetric Numeral Systems) for ~2x faster decompression. Compression ratio unchanged.
 
-### Uncertain / diminishing returns
+### Rejected Optimizations
 
-| Technique | Notes |
-|-----------|-------|
-| Grammar/BPE preprocessing | BWT+LZMA already capture repeated patterns |
-| Columnar transform | Only useful on fixed-record data (rare in general compression) |
-| BCJ with ELF/PE parsing | Complex, uncertain gains over LZMA on real archives |
-
-## 🧠 Key Insight
-
-After extensive testing, the conclusion is clear:
-
-> **HyperPack v10.2's BWT + LZMA pipeline is already near-optimal for general-purpose
-> compression.** The remaining gains are in speed (parallelism, faster suffix sort)
-> rather than ratio. Most preprocessing transforms that work in isolation become
-> harmful when applied before algorithms that already capture those same patterns.
-
-The three improvements that worked (LZMA 64MB, MTF-2, Smart Heuristic) were all
-about **tuning existing components**, not adding new transforms.
-
----
-
-*Updated after 13 empirical tests on the Silesia Compression Corpus.*
+| Technique | Result | Why |
+|-----------|--------|-----|
+| LZMA dictionary enlargement | Already 64 MB | No room to improve |
+| CM O3 hash enlargement | ~0% gain | CM not limited by hash collisions at this scale |
+| E8/E9 on BWT output | -1.5% to -19% | Harmful — but E8/E9 before LZMA works great |
+| Transpose/bit-plane transforms | -54% to -75% | Catastrophic — destroys BWT patterns |

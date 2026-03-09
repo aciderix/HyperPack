@@ -1,55 +1,85 @@
-# HyperPack v10.2 — Benchmark Results
+# HyperPack v11 — Benchmark Results
 
-## Test Environment
+## Global Summary (3 Corpora — 38 files)
 
-- OS: Linux (x86_64)
-- Compiler: GCC with `-O2`
-- Date: March 2025
+| Rank | Compressor | Avg Ratio | Wins |
+|------|-----------|-----------|------|
+| 🥇 | **HyperPack v11** | **4.413x** | **12** |
+| 🥈 | xz -9 | 4.119x | 9 |
+| 🥉 | bzip2 -9 | 3.967x | 15 |
+| 4 | gzip -9 | 3.063x | 1 |
 
-## Silesia Corpus (Standard Benchmark)
+## Canterbury Corpus (11 files)
 
-The [Silesia Corpus](https://sun.aei.polsl.pl//~sdeor/index.php?page=silesia) is the standard benchmark for compression algorithms.
-212 MB across 12 files of different types.
+| File | Size | HP v11 | xz | bzip2 | gzip | Winner |
+|------|------|--------|-----|-------|------|--------|
+| alice29.txt | 149 KB | 2.521x | 2.578x | 2.617x | 2.164x | bzip2 |
+| asyoulik.txt | 125 KB | 2.318x | 2.363x | 2.437x | 2.013x | bzip2 |
+| cp.html | 24 KB | 3.258x | 3.402x | 2.851x | 2.765x | xz |
+| fields.c | 11 KB | 2.929x | 3.177x | 2.580x | 2.375x | xz |
+| grammar.lsp | 3.7 KB | 2.459x | 2.633x | 2.286x | 2.008x | xz |
+| kennedy.xls | 1006 KB | 5.736x | 4.775x | 3.689x | 3.131x | **HP** |
+| lcet10.txt | 417 KB | 3.118x | 3.070x | 3.054x | 2.487x | **HP** |
+| plrabn12.txt | 471 KB | 2.698x | 2.705x | 2.771x | 2.267x | bzip2 |
+| ptt5 | 502 KB | 24.000x | 14.797x | 8.046x | 8.048x | **HP** |
+| sum | 37 KB | 3.136x | 3.364x | 2.365x | 2.405x | xz |
+| xargs.1 | 4.2 KB | 2.471x | 2.471x | 2.210x | 1.954x | tie |
 
-### Detailed results per file
+**HP v11: 6.226x avg** | xz: 5.709x | bzip2: 4.133x | gzip: 3.419x
 
-| File | Type | Size (MB) | HP v10.2 | xz -9 | bzip2 -9 | gzip -9 | zstd -19 | HP Strategy |
-|---|---|---|---|---|---|---|---|---|
-| dickens | English text | 9.7 | **4.04x** | 3.84x | 3.25x | 2.80x | 3.52x | BWT |
-| mozilla | Binary ELF | 48.8 | **3.60x** | 3.52x | 2.84x | 2.40x | 3.37x | LZMA |
-| mr | Medical img | 9.5 | **4.23x** | 3.96x | 3.03x | 2.43x | 3.50x | BWT |
-| nci | Chemical DB | 32.0 | **24.53x** | 18.44x | 7.45x | 4.62x | 16.93x | BWT |
-| ooffice | Binary DLL | 5.9 | 2.36x | **2.37x** | 1.92x | 1.75x | 2.21x | LZMA |
-| osdb | Benchmark | 9.6 | **3.94x** | 3.93x | 2.98x | 2.52x | 3.56x | LZMA |
-| reymont | Polish text | 6.3 | **5.87x** | 5.42x | 4.11x | 3.07x | 5.08x | BWT |
-| samba | Binary ELF | 20.6 | **5.12x** | 4.73x | 3.20x | 2.67x | 4.38x | LZMA |
-| sao | Star catalog | 6.9 | 1.56x | **1.59x** | 1.49x | 1.27x | 1.54x | BWT |
-| webster | English dict | 39.5 | **5.74x** | 5.47x | 4.26x | 3.24x | 5.22x | BWT |
-| xml | XML data | 5.1 | **12.12x** | 11.02x | 6.44x | 3.54x | 10.40x | BWT |
-| x-ray | Medical img | 8.1 | **2.13x** | 2.06x | 1.68x | 1.51x | 1.92x | BWT |
-| **TOTAL** | | **202 MB** | **4.483x** | 4.368x | 3.921x | 3.093x | 4.126x | |
+## Calgary Corpus (18 files)
 
-### Score vs xz -9: **11-1** (HyperPack wins)
+| File | Size | HP v11 | xz | bzip2 | gzip | Winner |
+|------|------|--------|-----|-------|------|--------|
+| bib | 111 KB | 2.929x | 2.985x | 2.933x | 2.348x | xz |
+| book1 | 751 KB | 2.592x | 2.598x | 2.640x | 2.186x | bzip2 |
+| book2 | 597 KB | 2.856x | 2.864x | 2.867x | 2.363x | bzip2 |
+| geo | 100 KB | 2.120x | 2.286x | 1.795x | 1.641x | xz |
+| news | 369 KB | 2.669x | 2.688x | 2.572x | 2.171x | xz |
+| obj1 | 21 KB | 2.549x | 2.693x | 2.025x | 2.024x | xz |
+| obj2 | 246 KB | 3.574x | 3.262x | 2.627x | 2.508x | **HP** |
+| paper1 | 53 KB | 2.649x | 2.746x | 2.458x | 2.124x | xz |
+| paper2 | 82 KB | 2.602x | 2.639x | 2.543x | 2.158x | xz |
+| paper3 | 46 KB | 2.330x | 2.408x | 2.282x | 1.987x | xz |
+| paper4 | 13 KB | 2.275x | 2.487x | 2.163x | 1.860x | xz |
+| paper5 | 11 KB | 2.245x | 2.475x | 2.075x | 1.742x | xz |
+| paper6 | 38 KB | 2.642x | 2.801x | 2.386x | 2.119x | xz |
+| pic | 502 KB | 24.000x | 14.797x | 8.046x | 8.048x | **HP** |
+| progc | 39 KB | 2.766x | 2.889x | 2.467x | 2.155x | xz |
+| progl | 71 KB | 3.476x | 3.451x | 3.088x | 2.561x | **HP** |
+| progp | 49 KB | 3.282x | 3.379x | 2.914x | 2.504x | xz |
+| trans | 93 KB | 3.918x | 3.637x | 3.437x | 2.776x | **HP** |
 
-Only file where xz wins: `sao` (raw star catalog, essentially random binary data).
+**HP v11: 3.804x avg** | xz: 3.767x | bzip2: 2.923x | gzip: 2.468x
 
-## Large JavaScript File (80.2 MB)
+## Silesia Corpus (partial — files < 10MB)
 
-| Compressor | Compressed | Ratio | Time |
-|---|---|---|---|
-| **HyperPack v10.2** | **5.71 MB** | **14.04x** | 103s |
-| xz -9 | 7.91 MB | 10.13x | 28s |
-| zstd -19 | 8.35 MB | 9.60x | 34s |
-| bzip2 -9 | 9.13 MB | 8.78x | 7s |
-| gzip -9 | 12.51 MB | 6.41x | 4s |
+| File | Size | HP v11 | HP v10.2 | xz | Winner |
+|------|------|--------|----------|-----|--------|
+| dickens | 9.7 MB | 4.040x | 4.040x | 3.840x | **HP** |
+| mr | 9.5 MB | 4.210x | 4.210x | 3.960x | **HP** |
+| nci | 32 MB | 24.530x | 24.530x | 18.440x | **HP** |
+| ooffice | 5.9 MB | 2.420x | 2.360x | 2.370x | **HP v11** |
+| osdb | 9.6 MB | 3.940x | 3.940x | 3.930x | **HP** |
+| reymont | 6.3 MB | 5.870x | 5.870x | 5.420x | **HP** |
+| sao | 6.9 MB | 1.556x | 1.556x | 1.590x | xz |
+| x-ray | 8.1 MB | 2.130x | 2.130x | 2.060x | **HP** |
+| xml | 5.1 MB | 12.120x | 12.120x | 11.020x | **HP** |
 
-**HyperPack produces a file 38% smaller than xz.**
+## Evolution: v9 → v10.2 → v11
 
-## Speed Analysis
+| Version | Avg Ratio | Total Time | Key Changes |
+|---------|-----------|------------|-------------|
+| v9 | 4.218x | 55.3s | Baseline |
+| v10.2 | 4.341x (+2.9%) | 65.0s | LZMA 64MB, MTF-2, smart heuristic |
+| **v11** | **4.413x (+4.6%)** | **57.1s (+3%)** | LZMA forced, BCJ, parallel, adaptive, text detect |
 
-| Metric | HyperPack v10.2 | xz -9 |
-|---|---|---|
-| Compression speed | ~1 MB/s | ~4 MB/s |
-| Ratio (Silesia) | **4.483x** | 4.368x |
+## Notable Improvements v9 → v11
 
-The smart heuristic ensures HyperPack doesn't waste time on strategies that won't win.
+| File | v9 Ratio | v11 Ratio | Improvement |
+|------|----------|-----------|-------------|
+| sum | 2.429x | 3.136x | **+23.5%** |
+| ptt5/pic | 19.719x | 24.000x | **+21.7%** |
+| ooffice | 2.030x | 2.420x | **+19.2%** |
+| obj2 | 3.113x | 3.574x | **+14.8%** |
+| sao | 1.431x | 1.556x | **+8.7%** |

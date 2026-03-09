@@ -1,13 +1,13 @@
 /*
- * HyperPack Quantum v10 — LZP Sub-Stream Compression — Ultra-High Compression Engine (C)
+ * HyperPack Quantum v11 — LZP Sub-Stream Compression — Ultra-High Compression Engine (C)
  *
  * Pipeline A: [Delta] -> [LZP] -> BWT(SA) -> MTF -> ZRLE -> Range Coder (order-0/1)
  * Pipeline B: Context Mixing (7 models + logistic mixer + bit-level range coder)
  * Multi-strategy per block, entropy detection, block dedup, CRC-32 integrity.
  *
- * Compile: gcc -O3 -nodefaultlibs -o hyperpack10 hyperpack10.c -lc -lm
- * Usage:   ./hyperpack10 c [-b SIZE_MB] input output.hpk
- *          ./hyperpack10 d input.hpk output
+ * Compile: gcc -O3 -nodefaultlibs -o hyperpack src/hyperpack.c -lc -lm
+ * Usage:   ./hyperpack c [-b SIZE_MB] input output.hpk
+ *          ./hyperpack d input.hpk output
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,7 +46,8 @@ enum Strategy {
     S_LZP_BWT_O2=14, S_DLZP_BWT_O2=15,
     S_PPM=16, S_BWT_PPM=17, S_BWT_MTF_PPM=18, S_AUDIO=19, S_BASE64=20, S_BASE64_V2=21,
     S_LZ77_O0=22, S_LZ77_O1=23,
-    S_LZMA=24
+    S_LZMA=24,
+    S_BCJ_LZMA=25
 };
 static const char *strat_names[] = {
     "STORE","BWT+O0","BWT+O1","D+BWT+O0","D+BWT+O1",
@@ -55,7 +56,8 @@ static const char *strat_names[] = {
     "BWT+O2","D+BWT+O2","LZP+BWT+O2","D+LZP+BWT+O2",
     "PPM","BWT+PPM","BWT+MTF+PPM","Audio", "Base64", "Base64v2",
     "LZ77+BWT+O0","LZ77+BWT+O1",
-    "LZMA"
+    "LZMA",
+    "BCJ+LZMA"
 };
 
 /* ===== Inline buffer helpers ===== */
@@ -859,6 +861,59 @@ static void delta_decode(const uint8_t *in, int n, uint8_t *out) {
     for (int i = 1; i < n; i++) out[i] = in[i] + out[i-1];
 }
 
+/* ===== BCJ E8/E9 Transform (x86 CALL/JMP relative->absolute) ===== */
+static int bcj_is_executable(const uint8_t *data, int n) {
+    if (n >= 4 && data[0] == 0x7f && data[1] == 'E' && data[2] == 'L' && data[3] == 'F')
+        return 1;
+    if (n >= 2 && data[0] == 'M' && data[1] == 'Z')
+        return 1;
+    if (n >= 1024) {
+        int e8_count = 0;
+        int check_len = n < 65536 ? n : 65536;
+        for (int i = 0; i < check_len - 4; i++) {
+            if (data[i] == 0xE8 || data[i] == 0xE9) e8_count++;
+        }
+        if (e8_count * 50 > check_len) return 1;
+    }
+    return 0;
+}
+
+static void bcj_e8e9_encode(const uint8_t *in, int n, uint8_t *out) {
+    memcpy(out, in, n);
+    for (int i = 0; i < n - 4; i++) {
+        if (out[i] == 0xE8 || out[i] == 0xE9) {
+            int32_t rel = (int32_t)((uint32_t)out[i+1] |
+                          ((uint32_t)out[i+2] << 8) |
+                          ((uint32_t)out[i+3] << 16) |
+                          ((uint32_t)out[i+4] << 24));
+            int32_t abs_addr = rel + i;
+            out[i+1] = (uint8_t)(abs_addr);
+            out[i+2] = (uint8_t)(abs_addr >> 8);
+            out[i+3] = (uint8_t)(abs_addr >> 16);
+            out[i+4] = (uint8_t)(abs_addr >> 24);
+            i += 4;
+        }
+    }
+}
+
+static void bcj_e8e9_decode(const uint8_t *in, int n, uint8_t *out) {
+    memcpy(out, in, n);
+    for (int i = 0; i < n - 4; i++) {
+        if (out[i] == 0xE8 || out[i] == 0xE9) {
+            int32_t abs_addr = (int32_t)((uint32_t)out[i+1] |
+                               ((uint32_t)out[i+2] << 8) |
+                               ((uint32_t)out[i+3] << 16) |
+                               ((uint32_t)out[i+4] << 24));
+            int32_t rel = abs_addr - i;
+            out[i+1] = (uint8_t)(rel);
+            out[i+2] = (uint8_t)(rel >> 8);
+            out[i+3] = (uint8_t)(rel >> 16);
+            out[i+4] = (uint8_t)(rel >> 24);
+            i += 4;
+        }
+    }
+}
+
 /* ===== Audio Pipeline (16-bit PCM) ===== */
 static int audio_detect(const uint8_t *data, int n) {
     if (n < 4096) return 0;
@@ -1312,7 +1367,11 @@ static int lzp_decode(const uint8_t *in, int in_size, uint8_t *out, int orig_siz
 #define CM_PSCALE  (1 << CM_SCALE)       /* 4096 */
 #define CM_NMOD    7
 #define CM_O2_BITS 20
-#define CM_O3_BITS 20
+/* Phase 6: Enlarged order-3 hash for literary text.
+ * 20 bits (1M entries) → 22 bits (4M entries).
+ * Order-3 captures letter trigrams and word beginnings;
+ * reducing collisions improves prediction on small text files. */
+#define CM_O3_BITS 22
 #define CM_O4_BITS 22
 #define CM_O6_BITS 22
 #define CM_O2_SIZE (1 << CM_O2_BITS)     /* 1M */
@@ -2129,7 +2188,7 @@ static size_t wp_decode(const uint8_t *src, size_t sn, uint8_t *dst, size_t dcap
 }
 
 /* Forward declarations for LZMA */
-static int lzma_compress(const uint8_t *data, int n, uint8_t *out);
+static int lzma_compress(const uint8_t *data, int n, uint8_t *out, int size_limit);
 static int lzma_decompress(const uint8_t *in, uint8_t *out, int n);
 
 /* Forward declaration for LZMA heuristic */
@@ -2310,7 +2369,7 @@ static int compress_substream(const uint8_t *data, int n, uint8_t *out, int *sub
         if (try_sub_lzma) {
         uint8_t *lzma_out = (uint8_t*)malloc(n + n/4 + 65536);
         if (lzma_out) {
-            int lzma_sz = lzma_compress(data, n, lzma_out);
+            int lzma_sz = lzma_compress(data, n, lzma_out, best);
             if (lzma_sz > 0 && lzma_sz < best) {
                 best = lzma_sz; *sub_order = 14;
                 memcpy(out, lzma_out, lzma_sz);
@@ -2443,7 +2502,11 @@ static void decompress_substream(const uint8_t *cdata, int csize, int sub_order,
 #define LZMA_NUM_LEN_STATES 4
 
 /* Match finder */
-#define LZMA_MF_HASH_BITS   20
+/* Phase 5: Enlarged hash table for better match finding on binaries.
+ * 20 bits (1M entries) → 22 bits (4M entries).
+ * With a 64MB window, avg chain length drops from 64 to 16,
+ * dramatically improving match quality especially with chain_max=32. */
+#define LZMA_MF_HASH_BITS   22
 #define LZMA_MF_HASH_SIZE   (1 << LZMA_MF_HASH_BITS)
 #define LZMA_MF_HASH_MASK   (LZMA_MF_HASH_SIZE - 1)
 #define LZMA_MF_CHAIN_MAX   128
@@ -2950,6 +3013,7 @@ typedef struct {
     int32_t *head;    /* hash -> last position */
     int32_t *chain;   /* circular chain buffer */
     int window_size;
+    int chain_max;    /* Phase 3: configurable search depth */
 } LzmaMF;
 
 static inline uint32_t lzma_mf_hash4(const uint8_t *p) {
@@ -2957,11 +3021,12 @@ static inline uint32_t lzma_mf_hash4(const uint8_t *p) {
     return (v * 2654435761u) >> (32 - LZMA_MF_HASH_BITS);
 }
 
-static void lzma_mf_init(LzmaMF *mf, const uint8_t *data, int size, int window_size) {
+static void lzma_mf_init(LzmaMF *mf, const uint8_t *data, int size, int window_size, int chain_max) {
     mf->data = data;
     mf->size = size;
     mf->pos = 0;
     mf->window_size = window_size;
+    mf->chain_max = chain_max;
     mf->head = (int32_t *)malloc(LZMA_MF_HASH_SIZE * sizeof(int32_t));
     mf->chain = (int32_t *)malloc(window_size * sizeof(int32_t));
     memset(mf->head, -1, LZMA_MF_HASH_SIZE * sizeof(int32_t));
@@ -3011,7 +3076,7 @@ static int lzma_mf_find_all(LzmaMF *mf, int pos, uint32_t *reps,
         int tries = 0;
         int max_dist = (pos < mf->window_size) ? pos : mf->window_size;
 
-        while (chain_pos >= 0 && (pos - chain_pos) <= max_dist && tries < LZMA_MF_CHAIN_MAX) {
+        while (chain_pos >= 0 && (pos - chain_pos) <= max_dist && tries < mf->chain_max) {
             if (data[chain_pos + best_len] == data[pos + best_len]) {
                 int len = 0;
                 while (len < max_len && data[chain_pos + len] == data[pos + len]) len++;
@@ -3056,7 +3121,7 @@ typedef struct {
 } OptNode;
 
 /* ===== LZMA Encoder with Optimal Parsing ===== */
-static int lzma_compress(const uint8_t *data, int n, uint8_t *out) {
+static int lzma_compress(const uint8_t *data, int n, uint8_t *out, int size_limit) {
     if (n == 0) return 0;
 
     init_price_tables();
@@ -3071,8 +3136,12 @@ static int lzma_compress(const uint8_t *data, int n, uint8_t *out) {
     int window_size = LZMA_MF_WINDOW;
     if (window_size > n) window_size = n;
 
+    /* Phase 3: Reduce chain depth when competing against existing result.
+     * Full depth (128) when no limit; fast depth (32) when speculative. */
+    int chain_depth = (size_limit > 0) ? 32 : LZMA_MF_CHAIN_MAX;
+
     LzmaMF mf;
-    lzma_mf_init(&mf, data, n, window_size);
+    lzma_mf_init(&mf, data, n, window_size, chain_depth);
 
     LRCEnc rc;
     lrc_enc_init(&rc, out);
@@ -3409,6 +3478,27 @@ static int lzma_compress(const uint8_t *data, int n, uint8_t *out) {
         }
 
         pos = emit_pos;
+
+        /* Phase 3: Early-exit — abort if LZMA can't beat current best.
+         * Progressive margin: very lenient when model is cold, strict when warm.
+         * margin = 1.10 + 4.0*(1-pct)^2:  5%→4.7x, 25%→3.4x, 50%→2.1x, 90%→1.14x
+         * This preserves LZMA wins on compressible data (pic/ptt5) while
+         * catching clearly-worse cases (kennedy/xml) early. */
+        if (size_limit > 0 && pos >= 4096 && (int64_t)pos * 20 >= (int64_t)n) {
+            int64_t out_est = (int64_t)(rc.pos + rc.cache_size);
+            int64_t projected = out_est * n / pos;
+            int64_t pct_remain = (int64_t)(n - pos) * 100 / n;
+            int64_t margin_x100 = 110 + 4 * pct_remain * pct_remain / 100;
+            if (projected * 100 > (int64_t)size_limit * margin_x100) {
+                fprintf(stderr, "    [LZMA] early-exit at %.0f%% (projected %lld > limit*%.1f=%lld)\n",
+                        (double)pos*100/n, (long long)projected,
+                        (double)margin_x100/100, (long long)((int64_t)size_limit * margin_x100 / 100));
+                lzma_mf_free(&mf);
+                free(opt); free(pairs);
+                free(dec_lens); free(dec_dists); free(dec_reps_flag);
+                return -1;
+            }
+        }
 
         /* Update pricing probs from encoding probs (sync models) */
         memcpy(&probs, &enc_probs, sizeof(LzmaProbs));
@@ -4225,17 +4315,36 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
      * Heuristic: skip if entropy < 5.0 OR (ASCII% > 95% AND entropy < 6.0)
      * This saves ~50% compression time with zero ratio loss. */
     int try_lzma = (n <= 64*1024*1024);
-    if (try_lzma) {
+    if (try_lzma && n > 1024*1024) {
+        /* Skip heuristic only for blocks > 1 MB where BWT has enough context */
         double asc = ascii_ratio(data, n);
         if (ent < 5.0 || (asc > 0.95 && ent < 6.0)) {
             try_lzma = 0;
             fprintf(stderr, "    [LZMA] skipped by heuristic (ent=%.2f, ascii=%.1f%%)\n", ent, asc*100);
         }
     }
+    /* Phase 4: Smart LZMA for small blocks (< 1MB).
+     * Phase 1 forced LZMA on ALL small blocks, but this wastes time on
+     * large natural language text (novels, plays) where BWT always wins.
+     * Heuristic: skip LZMA ONLY on clearly literary text:
+     *   - Very high ASCII ratio (>95% = natural language, not code)
+     *   - Moderate entropy (<5.5 = text, not binary)
+     *   - Large enough to matter (>100KB = the slow ones)
+     * Small source code (<100KB) keeps LZMA where it wins +5-12%. */
+    if (n <= 1024*1024) {
+        double asc = ascii_ratio(data, n);
+        if (asc > 0.95 && ent < 5.5 && n > 100*1024) {
+            try_lzma = 0;
+            fprintf(stderr, "    [LZMA] skipped: large text detected (ent=%.2f, ascii=%.1f%%, %d bytes)\n", ent, asc*100, n);
+        } else {
+            try_lzma = 1;
+            fprintf(stderr, "    [LZMA] forced for small block (%d bytes, ent=%.2f, ascii=%.1f%%)\n", n, ent, asc*100);
+        }
+    }
     if (try_lzma) {
         uint8_t *lzma_out = (uint8_t*)malloc(n + n/4 + 65536);
         if (lzma_out) {
-            int lzma_sz = lzma_compress(data, n, lzma_out);
+            int lzma_sz = lzma_compress(data, n, lzma_out, best_size);
             if (lzma_sz > 0 && lzma_sz < best_size) {
                 best_size = lzma_sz;
                 *strat = S_LZMA;
@@ -4248,6 +4357,27 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
         }
     } else {
         fprintf(stderr, "    [LZMA] skipped (block %d > 64MB threshold)\n", n);
+    }
+
+    /* ======= Group I: BCJ+LZMA (S_BCJ_LZMA) ======= */
+    /* Phase 1.3: E8/E9 transform on x86 executables, then LZMA */
+    if (bcj_is_executable(data, n) && n >= 256) {
+        uint8_t *bcj_buf = (uint8_t*)malloc(n);
+        uint8_t *bcj_lzma_out = (uint8_t*)malloc(n + n/4 + 65536);
+        if (bcj_buf && bcj_lzma_out) {
+            bcj_e8e9_encode(data, n, bcj_buf);
+            int bcj_lzma_sz = lzma_compress(bcj_buf, n, bcj_lzma_out, best_size);
+            if (bcj_lzma_sz > 0 && bcj_lzma_sz < best_size) {
+                best_size = bcj_lzma_sz;
+                *strat = S_BCJ_LZMA;
+                memcpy(out, bcj_lzma_out, bcj_lzma_sz);
+                fprintf(stderr, "    [BCJ+LZMA] %d -> %d (%.2fx) *** NEW BEST ***\n", n, bcj_lzma_sz, (double)n/bcj_lzma_sz);
+            } else {
+                fprintf(stderr, "    [BCJ+LZMA] %d -> %d (%.2fx)\n", n, bcj_lzma_sz > 0 ? bcj_lzma_sz : n, bcj_lzma_sz > 0 ? (double)n/bcj_lzma_sz : 1.0);
+            }
+        }
+        if (bcj_buf) free(bcj_buf);
+        if (bcj_lzma_out) free(bcj_lzma_out);
     }
 
     free(saved_bwt); free(saved_mtf);
@@ -4264,6 +4394,13 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
 
     if (strat == S_LZMA) {
         lzma_decompress(cdata, out, orig_size);
+        return orig_size;
+    }
+    if (strat == S_BCJ_LZMA) {
+        uint8_t *tmp = (uint8_t*)malloc(orig_size);
+        lzma_decompress(cdata, tmp, orig_size);
+        bcj_e8e9_decode(tmp, orig_size, out);
+        free(tmp);
         return orig_size;
     }
 
@@ -4580,6 +4717,31 @@ static uint64_t read64(FILE *f) {
     return (hi << 32) | lo;
 }
 
+
+/* ===== Phase 2: Parallel Block Compression ===== */
+typedef struct {
+    const uint8_t *input;
+    int input_size;
+    uint8_t *output;
+    int output_size;
+    int strategy;
+    uint32_t crc;
+    uint64_t hash;
+    BWTWorkspace *bwt_ws;
+    CompressWorkspace *cws;
+    volatile int done;
+} BlockJob;
+
+static void *compress_block_worker(void *arg) {
+    BlockJob *job = (BlockJob *)arg;
+    job->output_size = compress_block(job->input, job->input_size, 
+                                       job->output, &job->strategy, 
+                                       job->bwt_ws, job->cws);
+    job->crc = crc32(job->input, job->input_size);
+    job->done = 1;
+    return NULL;
+}
+
 /* ===== File Compress ===== */
 /*
  * File format:
@@ -4589,7 +4751,7 @@ static uint64_t read64(FILE *f) {
  *     if is_dup: DUP_REF(4)
  *     else: STRATEGY(1) COMP_SIZE(4) ORIG_BLOCK_SIZE(4) CRC32(4) DATA(comp_size)
  */
-static int file_compress(const char *inpath, const char *outpath, int block_size) {
+static int file_compress(const char *inpath, const char *outpath, int block_size, int nthreads) {
     FILE *fin = fopen(inpath, "rb");
     if (!fin) { fprintf(stderr, "Cannot open %s\n", inpath); return 1; }
     fseek(fin, 0, SEEK_END);
@@ -4618,48 +4780,155 @@ static int file_compress(const char *inpath, const char *outpath, int block_size
     int *strategies  = (int*)calloc(nblocks, sizeof(int));
 
     int64_t total_comp = 0;
-    BWTWorkspace *bwt_ws = bwt_ws_create(block_size + 262144);
-    CompressWorkspace *cws = cws_create(block_size);
     clock_t start = clock();
 
-    for (int b = 0; b < nblocks; b++) {
-        int bsz = (int)fread(inbuf, 1, block_size, fin);
-        if (bsz <= 0) break;
-        uint64_t hash = fnv1a(inbuf, bsz);
-        hashes[b] = hash;
+    /* Phase 2: Parallel block compression with nthreads workers */
+    if (nthreads <= 1 || nblocks <= 1) {
+        /* Sequential path (original behavior) */
+        BWTWorkspace *bwt_ws = bwt_ws_create(block_size + 262144);
+        CompressWorkspace *cws = cws_create(block_size);
+        
+        for (int b = 0; b < nblocks; b++) {
+            int bsz = (int)fread(inbuf, 1, block_size, fin);
+            if (bsz <= 0) break;
+            uint64_t hash = fnv1a(inbuf, bsz);
+            hashes[b] = hash;
 
-        /* Check for duplicate block */
-        int dup_ref = -1;
-        for (int p = 0; p < b; p++) {
-            if (hashes[p] == hash) { dup_ref = p; break; }
+            int dup_ref = -1;
+            for (int p = 0; p < b; p++) {
+                if (hashes[p] == hash) { dup_ref = p; break; }
+            }
+
+            if (dup_ref >= 0) {
+                fputc(1, fout);
+                write32(fout, (uint32_t)dup_ref);
+                total_comp += 5;
+                fprintf(stderr, "  Block %d/%d: DUP of %d\n", b+1, nblocks, dup_ref+1);
+            } else {
+                int strat;
+                int csz = compress_block(inbuf, bsz, outbuf, &strat, bwt_ws, cws);
+                uint32_t crc = crc32(inbuf, bsz);
+
+                fputc(0, fout);
+                fputc((uint8_t)strat, fout);
+                write32(fout, (uint32_t)csz);
+                write32(fout, (uint32_t)bsz);
+                write32(fout, crc);
+                fwrite(outbuf, 1, csz, fout);
+
+                total_comp += 14 + csz;
+                strategies[b] = strat;
+                comp_sizes[b] = csz;
+
+                double ratio = (double)bsz / csz;
+                fprintf(stderr, "  Block %d/%d: %d -> %d (%.2fx) [%s]\n",
+                        b+1, nblocks, bsz, csz, ratio, strat_names[strat]);
+            }
         }
-
-        if (dup_ref >= 0) {
-            /* Duplicate block */
-            fputc(1, fout); /* flags: is_dup */
-            write32(fout, (uint32_t)dup_ref);
-            total_comp += 5;
-            fprintf(stderr, "  Block %d/%d: DUP of %d\n", b+1, nblocks, dup_ref+1);
-        } else {
-            int strat;
-            int csz = compress_block(inbuf, bsz, outbuf, &strat, bwt_ws, cws);
-            uint32_t crc = crc32(inbuf, bsz);
-
-            fputc(0, fout); /* flags: not dup */
-            fputc((uint8_t)strat, fout);
-            write32(fout, (uint32_t)csz);
-            write32(fout, (uint32_t)bsz);
-            write32(fout, crc);
-            fwrite(outbuf, 1, csz, fout);
-
-            total_comp += 14 + csz;
-            strategies[b] = strat;
-            comp_sizes[b] = csz;
-
-            double ratio = (double)bsz / csz;
-            fprintf(stderr, "  Block %d/%d: %d -> %d (%.2fx) [%s]\n",
-                    b+1, nblocks, bsz, csz, ratio, strat_names[strat]);
+        bwt_ws_free(bwt_ws);
+        cws_free(cws);
+    } else {
+        /* Parallel path: process blocks in batches of nthreads */
+        int jt = nthreads;
+        if (jt > nblocks) jt = nblocks;
+        
+        BlockJob *jobs = (BlockJob*)calloc(jt, sizeof(BlockJob));
+        pthread_t *threads = (pthread_t*)calloc(jt, sizeof(pthread_t));
+        
+        for (int j = 0; j < jt; j++) {
+            jobs[j].bwt_ws = bwt_ws_create(block_size + 262144);
+            jobs[j].cws = cws_create(block_size);
+            jobs[j].output = (uint8_t*)malloc(block_size + block_size/4 + 4096);
         }
+        
+        int b = 0;
+        while (b < nblocks) {
+            int batch = nblocks - b;
+            if (batch > jt) batch = jt;
+            
+            /* Read blocks and compute hashes */
+            uint8_t **block_data = (uint8_t**)calloc(batch, sizeof(uint8_t*));
+            int *block_sizes_arr = (int*)calloc(batch, sizeof(int));
+            int *dup_refs = (int*)calloc(batch, sizeof(int));
+            
+            for (int i = 0; i < batch; i++) {
+                block_data[i] = (uint8_t*)malloc(block_size);
+                block_sizes_arr[i] = (int)fread(block_data[i], 1, block_size, fin);
+                if (block_sizes_arr[i] <= 0) { batch = i; break; }
+                
+                uint64_t hash = fnv1a(block_data[i], block_sizes_arr[i]);
+                hashes[b + i] = hash;
+                
+                dup_refs[i] = -1;
+                for (int p = 0; p < b + i; p++) {
+                    if (hashes[p] == hash) { dup_refs[i] = p; break; }
+                }
+            }
+            
+            /* Launch compression threads for non-duplicate blocks */
+            int launched = 0;
+            for (int i = 0; i < batch; i++) {
+                if (dup_refs[i] >= 0) continue;
+                
+                int j = launched % jt;
+                jobs[j].input = block_data[i];
+                jobs[j].input_size = block_sizes_arr[i];
+                jobs[j].done = 0;
+                pthread_create(&threads[launched], NULL, compress_block_worker, &jobs[j]);
+                launched++;
+            }
+            
+            /* Wait for all threads */
+            for (int i = 0; i < launched; i++) {
+                pthread_join(threads[i], NULL);
+            }
+            
+            /* Write results in order */
+            int job_idx = 0;
+            for (int i = 0; i < batch; i++) {
+                if (dup_refs[i] >= 0) {
+                    fputc(1, fout);
+                    write32(fout, (uint32_t)dup_refs[i]);
+                    total_comp += 5;
+                    fprintf(stderr, "  Block %d/%d: DUP of %d\n", b+i+1, nblocks, dup_refs[i]+1);
+                } else {
+                    int j = job_idx % jt;
+                    int strat = jobs[j].strategy;
+                    int csz = jobs[j].output_size;
+                    uint32_t crc = jobs[j].crc;
+                    
+                    fputc(0, fout);
+                    fputc((uint8_t)strat, fout);
+                    write32(fout, (uint32_t)csz);
+                    write32(fout, (uint32_t)block_sizes_arr[i]);
+                    write32(fout, crc);
+                    fwrite(jobs[j].output, 1, csz, fout);
+                    
+                    total_comp += 14 + csz;
+                    strategies[b + i] = strat;
+                    comp_sizes[b + i] = csz;
+                    
+                    double ratio = (double)block_sizes_arr[i] / csz;
+                    fprintf(stderr, "  Block %d/%d: %d -> %d (%.2fx) [%s]\n",
+                            b+i+1, nblocks, block_sizes_arr[i], csz, ratio, strat_names[strat]);
+                    job_idx++;
+                }
+            }
+            
+            for (int i = 0; i < batch; i++) free(block_data[i]);
+            free(block_data);
+            free(block_sizes_arr);
+            free(dup_refs);
+            b += batch;
+        }
+        
+        for (int j = 0; j < jt; j++) {
+            bwt_ws_free(jobs[j].bwt_ws);
+            cws_free(jobs[j].cws);
+            free(jobs[j].output);
+        }
+        free(jobs);
+        free(threads);
     }
 
     double elapsed = (double)(clock() - start) / CLOCKS_PER_SEC;
@@ -4669,8 +4938,6 @@ static int file_compress(const char *inpath, const char *outpath, int block_size
             (long long)fsize, (long long)file_total,
             (double)fsize / file_total, elapsed);
 
-    bwt_ws_free(bwt_ws);
-    cws_free(cws);
     fclose(fin); fclose(fout);
     free(inbuf); free(outbuf); free(hashes); free(comp_sizes); free(strategies);
     return 0;
@@ -4754,26 +5021,40 @@ static int file_decompress(const char *inpath, const char *outpath) {
 int main(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr,
-            "HyperPack Quantum v10 — LZP Sub-Stream Compression — Ultra-High Compression Engine\n"
+            "HyperPack Quantum v11 — Ultra-High Compression Engine\n"
             "Usage:\n"
-            "  %s c [-b SIZE_MB] input output.hpk   Compress\n"
-            "  %s d input.hpk output                 Decompress\n",
+            "  %s c [-b SIZE_MB] [-j THREADS] input output.hpk   Compress\n"
+            "  %s d input.hpk output                               Decompress\n",
             argv[0], argv[0]);
         return 1;
     }
 
     if (argv[1][0] == 'c') {
-        int block_mb = DEFAULT_BS >> 20;  /* use config default */
-        const char *inpath, *outpath;
-        if (argc >= 6 && strcmp(argv[2], "-b") == 0) {
-            block_mb = atoi(argv[3]);
-            if (block_mb < 1) block_mb = 1;
-            if (block_mb > 128) block_mb = 128;
-            inpath = argv[4]; outpath = argv[5];
-        } else {
-            inpath = argv[2]; outpath = argv[3];
+        int block_mb = DEFAULT_BS >> 20;
+        int nthreads = 1;
+        const char *inpath = NULL, *outpath = NULL;
+        
+        /* Parse options: -b SIZE_MB, -j THREADS */
+        int i = 2;
+        while (i < argc - 2) {
+            if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
+                block_mb = atoi(argv[++i]);
+                if (block_mb < 1) block_mb = 1;
+                if (block_mb > 128) block_mb = 128;
+                i++;
+            } else if (strcmp(argv[i], "-j") == 0 && i + 1 < argc) {
+                nthreads = atoi(argv[++i]);
+                if (nthreads < 1) nthreads = 1;
+                if (nthreads > 16) nthreads = 16;
+                i++;
+            } else break;
         }
-        return file_compress(inpath, outpath, block_mb << 20);
+        inpath = argv[i]; outpath = argv[i+1];
+        
+        if (nthreads > 1) {
+            fprintf(stderr, "[HP5] Using %d parallel threads\n", nthreads);
+        }
+        return file_compress(inpath, outpath, block_mb << 20, nthreads);
     } else if (argv[1][0] == 'd') {
         return file_decompress(argv[2], argv[3]);
     } else {
