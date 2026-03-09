@@ -66,7 +66,8 @@ enum Strategy {
     S_F32_BWT=26,  /* IEEE 754 float32 XOR-delta → BWT+RC */
     S_BWT_O0_PS=27, /* BWT+RC O0 with pre-scanned frequency table (cold-start fix) */
     S_BWT_RANS=28,  /* BWT+rANS O0 (table-based decode, same ratio as O0_PS) */
-    S_BWT_CTX2=29   /* BWT+RC 2-context O0 (run-ctx vs literal-ctx models) */
+    S_BWT_CTX2=29,  /* BWT+RC 2-context O0 (run-ctx vs literal-ctx models) */
+    S_BWT_O1_PS=30  /* BWT+RC O1 with pre-scanned global freq init (warm start) */
 };
 static const char *strat_names[] = {
     "STORE","BWT+O0","BWT+O1","D+BWT+O0","D+BWT+O1",
@@ -80,7 +81,8 @@ static const char *strat_names[] = {
     "F32XOR+BWT",
     "BWT+O0PS",
     "BWT+rANS",
-    "BWT+CTX2"
+    "BWT+CTX2",
+    "BWT+O1PS"
 };
 
 /* ===== HPK6 Archive Structures ===== */
@@ -803,6 +805,104 @@ static void arith_dec_o0_ps(const uint8_t *in, int nsyms, uint16_t *out) {
     }
 }
 
+
+/* ===== Arithmetic Coding O1 with Pre-Scanned global frequency init (S_BWT_O1_PS) =====
+ *
+ * Same as arith_enc_o1 but initialises all 258 context models from a single
+ * global frequency table (258-byte header) instead of a uniform distribution.
+ *
+ * Effect:
+ *   1. Dead-symbol removal: symbols that never appear in the stream get freq=0
+ *      in every sub-model, eliminating permanently wasted probability mass.
+ *   2. Warm start: first symbols per context already use near-global priors
+ *      rather than a uniform 1/258 guess.
+ *
+ * Overhead: ZRLE_ALPHA (258) bytes — identical to O0_PS.
+ * Format: [258 bytes global_freq_table | range-coded O1 stream]
+ */
+static int arith_enc_o1_ps(const uint16_t *syms, int nsyms, uint8_t *out) {
+    /* Phase 1: build global frequency table */
+    int count[ZRLE_ALPHA];
+    memset(count, 0, sizeof(count));
+    for (int i = 0; i < nsyms; i++) count[syms[i]]++;
+
+    int maxcount = 0;
+    for (int i = 0; i < ZRLE_ALPHA; i++)
+        if (count[i] > maxcount) maxcount = count[i];
+
+    uint8_t *header = out;
+    if (maxcount == 0) {
+        /* empty stream — write zero header */
+        memset(header, 0, ZRLE_ALPHA);
+    } else {
+        for (int i = 0; i < ZRLE_ALPHA; i++) {
+            header[i] = (count[i] == 0) ? 0
+                        : (uint8_t)((int64_t)count[i] * 254 / maxcount + 1);
+        }
+    }
+
+    /* Phase 2: init all 258 O1 models from the global table */
+    Model *models = (Model*)malloc(ZRLE_ALPHA * sizeof(Model));
+    for (int ctx = 0; ctx < ZRLE_ALPHA; ctx++) {
+        Model *m = &models[ctx];
+        memset(m, 0, sizeof(Model));
+        for (int i = 0; i < ZRLE_ALPHA; i++) {
+            m->freq[i] = header[i];
+            m->total  += header[i];
+        }
+        /* fall back to uniform if all frequencies are zero (shouldn't happen) */
+        if (m->total == 0) {
+            for (int i = 0; i < ZRLE_ALPHA; i++) m->freq[i] = 1;
+            m->total = ZRLE_ALPHA;
+        }
+        model_build_tree(m);
+    }
+
+    /* Phase 3: encode with O1 adaptive range coding */
+    RCEnc rc; rc_enc_init(&rc, out + ZRLE_ALPHA);
+    int prev = 0;
+    for (int i = 0; i < nsyms; i++) {
+        int s = syms[i];
+        Model *m = &models[prev];
+        rc_enc(&rc, (uint32_t)model_cum(m, s), (uint32_t)model_freq_of(m, s), (uint32_t)m->total);
+        model_update(m, s);
+        prev = s;
+    }
+    free(models);
+    int arith_bytes = rc_enc_finish(&rc);
+    return ZRLE_ALPHA + arith_bytes;
+}
+
+static void arith_dec_o1_ps(const uint8_t *in, int nsyms, uint16_t *out) {
+    /* Read global freq header and warm-start all 258 O1 models */
+    Model *models = (Model*)malloc(ZRLE_ALPHA * sizeof(Model));
+    for (int ctx = 0; ctx < ZRLE_ALPHA; ctx++) {
+        Model *m = &models[ctx];
+        memset(m, 0, sizeof(Model));
+        for (int i = 0; i < ZRLE_ALPHA; i++) {
+            m->freq[i] = in[i];
+            m->total  += in[i];
+        }
+        if (m->total == 0) {
+            for (int i = 0; i < ZRLE_ALPHA; i++) m->freq[i] = 1;
+            m->total = ZRLE_ALPHA;
+        }
+        model_build_tree(m);
+    }
+
+    RCDec rc; rc_dec_init(&rc, in + ZRLE_ALPHA);
+    int prev = 0;
+    for (int i = 0; i < nsyms; i++) {
+        Model *m = &models[prev];
+        uint32_t target = rc_dec_cum(&rc, (uint32_t)m->total);
+        int s = model_find(m, (int)target);
+        rc_dec_update(&rc, (uint32_t)model_cum(m, s), (uint32_t)model_freq_of(m, s));
+        out[i] = (uint16_t)s;
+        model_update(m, s);
+        prev = s;
+    }
+    free(models);
+}
 
 /* ===== rANS O0 Entropy Coder (S_BWT_RANS) =====
  *
@@ -4345,7 +4445,7 @@ static void *thread_groups_AC(void *arg) {
         int o0cmp = (total <= w->best_size * 5 / 4);
         /* v10.2: Skip higher orders if sample already determined winner */
         int skip_o1o2 = (w->hint_strat == S_BWT_O0);
-        int skip_o0o2 = (w->hint_strat == S_BWT_O1);
+        int skip_o0o2 = (w->hint_strat == S_BWT_O1 || w->hint_strat == S_BWT_O1_PS);
         if (o0cmp && !skip_o1o2) {
             /* O1 */
             asize = arith_enc_o1(zrle_buf, nz, arith_buf);
@@ -4356,8 +4456,19 @@ static void *thread_groups_AC(void *arg) {
                 put_u32be(w->out_buf + 4, nz);
                 memcpy(w->out_buf + 8, arith_buf, asize);
             }
+            /* O1_PS: O1 with global warm-start header (258 bytes overhead).
+             * Removes dead symbols from all sub-models and provides a better
+             * prior than uniform, especially for short blocks / sparse contexts. */
+            asize = arith_enc_o1_ps(zrle_buf, nz, arith_buf);
+            total = 8 + asize;
+            if (total < w->best_size) {
+                w->best_size = total; w->best_strat = S_BWT_O1_PS;
+                put_u32be(w->out_buf, pidx);
+                put_u32be(w->out_buf + 4, nz);
+                memcpy(w->out_buf + 8, arith_buf, asize);
+            }
             /* O2 */
-            if (!skip_o1o2 && !skip_o0o2) {
+            if (!skip_o0o2) {
             asize = arith_enc_o2(zrle_buf, nz, arith_buf);
             total = 8 + asize;
             if (total < w->best_size) {
@@ -4650,7 +4761,7 @@ static double ascii_ratio(const uint8_t *data, int n) {
 
 static int is_ac_strategy(int s) {
     return s == S_BWT_O0 || s == S_BWT_O1 || s == S_BWT_O2 || s == S_BWT_O0_PS ||
-           s == S_BWT_RANS || s == S_BWT_CTX2 ||
+           s == S_BWT_RANS || s == S_BWT_CTX2 || s == S_BWT_O1_PS ||
            s == S_LZP_BWT_O0 || s == S_LZP_BWT_O1 || s == S_LZP_BWT_O2;
 }
 static int is_bde_strategy(int s) {
@@ -5411,6 +5522,7 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
     else if (strat == S_BWT_O0_PS)    arith_dec_o0_ps(arith_data, nz, zrle_buf);
     else if (strat == S_BWT_RANS)     rans_dec_o0(arith_data, nz, zrle_buf);
     else if (strat == S_BWT_CTX2)     arith_dec_ctx2(arith_data, nz, zrle_buf);
+    else if (strat == S_BWT_O1_PS)    arith_dec_o1_ps(arith_data, nz, zrle_buf);
     else                              arith_dec_o0(arith_data, nz, zrle_buf);
 
     zrle_decode(zrle_buf, nz, mtf_buf, decode_size);
