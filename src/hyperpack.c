@@ -64,7 +64,9 @@ enum Strategy {
     S_LZMA=24,
     S_BCJ_LZMA=25,
     S_F32_BWT=26,  /* IEEE 754 float32 XOR-delta → BWT+RC */
-    S_BWT_O0_PS=27 /* BWT+RC O0 with pre-scanned frequency table (cold-start fix) */
+    S_BWT_O0_PS=27, /* BWT+RC O0 with pre-scanned frequency table (cold-start fix) */
+    S_BWT_RANS=28,  /* BWT+rANS O0 (table-based decode, same ratio as O0_PS) */
+    S_BWT_CTX2=29   /* BWT+RC 2-context O0 (run-ctx vs literal-ctx models) */
 };
 static const char *strat_names[] = {
     "STORE","BWT+O0","BWT+O1","D+BWT+O0","D+BWT+O1",
@@ -76,7 +78,9 @@ static const char *strat_names[] = {
     "LZMA",
     "BCJ+LZMA",
     "F32XOR+BWT",
-    "BWT+O0PS"
+    "BWT+O0PS",
+    "BWT+rANS",
+    "BWT+CTX2"
 };
 
 /* ===== HPK6 Archive Structures ===== */
@@ -799,6 +803,230 @@ static void arith_dec_o0_ps(const uint8_t *in, int nsyms, uint16_t *out) {
     }
 }
 
+
+/* ===== rANS O0 Entropy Coder (S_BWT_RANS) =====
+ *
+ * Streaming rANS with M=4096 normalization target.
+ * Same compression ratio as O0_PS range coder, but O(1) table-based decode.
+ *
+ * Format: [258 bytes freq_table | 4 bytes initial_state (LE) | byte stream]
+ *   freq_table[i]: 0 = symbol absent, 1..255 = proportional weight
+ *   Encoder emits bytes in reverse order, then reverses in-place.
+ *   Decoder reads bytes forward.
+ */
+#define RANS_M 4096  /* normalization target; must be power of 2 and >= ZRLE_ALPHA */
+
+typedef struct { uint16_t sym; uint16_t freq; uint16_t bias; } RansSlot;
+
+static int rans_enc_o0(const uint16_t *syms, int nsyms, uint8_t *out) {
+    /* Phase 1: count raw frequencies */
+    int count[ZRLE_ALPHA];
+    memset(count, 0, sizeof(count));
+    for (int i = 0; i < nsyms; i++) count[syms[i]]++;
+
+    int maxcount = 0;
+    for (int i = 0; i < ZRLE_ALPHA; i++) if (count[i] > maxcount) maxcount = count[i];
+
+    /* Phase 2: write 258-byte header (same scale as O0_PS: 1..255 for seen, 0 unseen) */
+    uint8_t *header = out;
+    for (int i = 0; i < ZRLE_ALPHA; i++) {
+        if (count[i] == 0) { header[i] = 0; }
+        else { header[i] = (uint8_t)((int64_t)count[i] * 254 / maxcount + 1); }
+    }
+
+    /* Phase 3: normalize to sum exactly RANS_M using largest-remainder method */
+    int raw[ZRLE_ALPHA], nseen = 0;
+    int raw_total = 0;
+    for (int i = 0; i < ZRLE_ALPHA; i++) {
+        if (header[i]) { raw[i] = header[i]; raw_total += header[i]; nseen++; }
+        else raw[i] = 0;
+    }
+    /* Scale: freq_norm[i] = max(1, round(raw[i] * RANS_M / raw_total)) */
+    int freq[ZRLE_ALPHA];
+    int fsum = 0;
+    for (int i = 0; i < ZRLE_ALPHA; i++) {
+        if (raw[i] == 0) { freq[i] = 0; continue; }
+        freq[i] = (int)((int64_t)raw[i] * RANS_M / raw_total);
+        if (freq[i] == 0) freq[i] = 1;
+        fsum += freq[i];
+    }
+    /* Adjust rounding error: add/remove from most frequent seen symbol */
+    int diff = RANS_M - fsum;
+    if (diff != 0) {
+        int best = -1;
+        for (int i = 0; i < ZRLE_ALPHA; i++)
+            if (freq[i] > 0 && (best < 0 || freq[i] > freq[best])) best = i;
+        if (best >= 0) freq[best] += diff;
+    }
+
+    /* Phase 4: compute cumulative */
+    int cum[ZRLE_ALPHA + 1];
+    cum[0] = 0;
+    for (int i = 0; i < ZRLE_ALPHA; i++) cum[i+1] = cum[i] + freq[i];
+
+    /* Phase 5: encode in reverse into a temporary buffer */
+    int cap = nsyms * 2 + 16;
+    uint8_t *tmp = (uint8_t*)malloc(cap);
+    int tlen = 0;
+
+    uint32_t x = RANS_M; /* initial state */
+    for (int i = nsyms - 1; i >= 0; i--) {
+        int s = syms[i];
+        int fs = freq[s];
+        /* renormalize: flush bytes while x >= fs * 256 */
+        while (x >= (uint32_t)fs * 256) {
+            if (tlen >= cap) { cap *= 2; tmp = (uint8_t*)realloc(tmp, cap); }
+            tmp[tlen++] = (uint8_t)(x & 0xFF);
+            x >>= 8;
+        }
+        /* rANS step: x = (x / fs) * RANS_M + cum[s] + (x % fs) */
+        x = (x / fs) * RANS_M + cum[s] + (x % fs);
+    }
+
+    /* Phase 6: write final state (LE u32) then reversed stream */
+    uint8_t *p = out + ZRLE_ALPHA;
+    p[0] = (uint8_t)(x & 0xFF); p[1] = (uint8_t)((x>>8)&0xFF);
+    p[2] = (uint8_t)((x>>16)&0xFF); p[3] = (uint8_t)((x>>24)&0xFF);
+    p += 4;
+    /* bytes in tmp are in reverse order; write them reversed = correct forward order */
+    for (int i = tlen - 1; i >= 0; i--) *p++ = tmp[i];
+    free(tmp);
+
+    return ZRLE_ALPHA + 4 + tlen;
+}
+
+static void rans_dec_o0(const uint8_t *in, int nsyms, uint16_t *out) {
+    /* Build M-normalized freq from header */
+    int raw[ZRLE_ALPHA], raw_total = 0;
+    for (int i = 0; i < ZRLE_ALPHA; i++) { raw[i] = in[i]; raw_total += in[i]; }
+
+    int freq[ZRLE_ALPHA], fsum = 0;
+    for (int i = 0; i < ZRLE_ALPHA; i++) {
+        if (raw[i] == 0) { freq[i] = 0; continue; }
+        freq[i] = (int)((int64_t)raw[i] * RANS_M / raw_total);
+        if (freq[i] == 0) freq[i] = 1;
+        fsum += freq[i];
+    }
+    int diff = RANS_M - fsum;
+    if (diff != 0) {
+        int best = -1;
+        for (int i = 0; i < ZRLE_ALPHA; i++)
+            if (freq[i] > 0 && (best < 0 || freq[i] > freq[best])) best = i;
+        if (best >= 0) freq[best] += diff;
+    }
+
+    int cum[ZRLE_ALPHA + 1];
+    cum[0] = 0;
+    for (int i = 0; i < ZRLE_ALPHA; i++) cum[i+1] = cum[i] + freq[i];
+
+    /* Build O(1) decode table: dtab[slot] = {sym, freq, bias} */
+    RansSlot *dtab = (RansSlot*)malloc(RANS_M * sizeof(RansSlot));
+    for (int s = 0; s < ZRLE_ALPHA; s++) {
+        for (int j = cum[s]; j < cum[s+1]; j++) {
+            dtab[j].sym  = (uint16_t)s;
+            dtab[j].freq = (uint16_t)freq[s];
+            dtab[j].bias = (uint16_t)cum[s];
+        }
+    }
+
+    /* Read initial state */
+    const uint8_t *p = in + ZRLE_ALPHA;
+    uint32_t x = (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
+    p += 4;
+
+    /* Decode */
+    for (int i = 0; i < nsyms; i++) {
+        uint32_t slot = x % RANS_M;
+        RansSlot sl = dtab[slot];
+        out[i] = sl.sym;
+        x = (uint32_t)sl.freq * (x / RANS_M) + slot - sl.bias;
+        /* renorm */
+        while (x < (uint32_t)RANS_M) x = (x << 8) | *p++;
+    }
+
+    free(dtab);
+}
+
+/* ===== 2-Context Range Coder (S_BWT_CTX2) =====
+ *
+ * Two independent O0 models conditioned on whether the previous symbol
+ * was a run code (RUNA/RUNB, sym < 2) or a literal (sym >= 2).
+ *
+ * Format: [258 bytes freq_ctx0 | 258 bytes freq_ctx1 | range-coded stream]
+ * Context: ctx = (prev_sym < 2) ? 0 : 1; first symbol uses ctx=1.
+ */
+static int arith_enc_ctx2(const uint16_t *syms, int nsyms, uint8_t *out) {
+    /* Phase 1: count per-context frequencies */
+    int count[2][ZRLE_ALPHA];
+    memset(count, 0, sizeof(count));
+    int prev = 2; /* first sym: ctx=1 (prev>=2) */
+    for (int i = 0; i < nsyms; i++) {
+        int ctx = (prev < 2) ? 0 : 1;
+        count[ctx][syms[i]]++;
+        prev = syms[i];
+    }
+
+    /* Phase 2: write two 258-byte headers */
+    for (int c = 0; c < 2; c++) {
+        int maxcount = 0;
+        for (int i = 0; i < ZRLE_ALPHA; i++) if (count[c][i] > maxcount) maxcount = count[c][i];
+        uint8_t *hdr = out + c * ZRLE_ALPHA;
+        for (int i = 0; i < ZRLE_ALPHA; i++) {
+            if (count[c][i] == 0) hdr[i] = 0;
+            else hdr[i] = (uint8_t)((int64_t)count[c][i] * 254 / maxcount + 1);
+        }
+    }
+
+    /* Phase 3: init two models */
+    Model m[2];
+    for (int c = 0; c < 2; c++) {
+        memset(&m[c], 0, sizeof(Model));
+        for (int i = 0; i < ZRLE_ALPHA; i++) {
+            m[c].freq[i] = out[c * ZRLE_ALPHA + i];
+            m[c].total  += out[c * ZRLE_ALPHA + i];
+        }
+        model_build_tree(&m[c]);
+    }
+
+    /* Phase 4: range-encode with 2 contexts */
+    RCEnc rc; rc_enc_init(&rc, out + 2 * ZRLE_ALPHA);
+    prev = 2;
+    for (int i = 0; i < nsyms; i++) {
+        int ctx = (prev < 2) ? 0 : 1;
+        int s = syms[i];
+        rc_enc(&rc, (uint32_t)model_cum(&m[ctx], s),
+                    (uint32_t)model_freq_of(&m[ctx], s),
+                    (uint32_t)m[ctx].total);
+        model_update(&m[ctx], s);
+        prev = s;
+    }
+    int arith_bytes = rc_enc_finish(&rc);
+    return 2 * ZRLE_ALPHA + arith_bytes;
+}
+
+static void arith_dec_ctx2(const uint8_t *in, int nsyms, uint16_t *out) {
+    Model m[2];
+    for (int c = 0; c < 2; c++) {
+        memset(&m[c], 0, sizeof(Model));
+        for (int i = 0; i < ZRLE_ALPHA; i++) {
+            m[c].freq[i] = in[c * ZRLE_ALPHA + i];
+            m[c].total  += in[c * ZRLE_ALPHA + i];
+        }
+        model_build_tree(&m[c]);
+    }
+    RCDec rc; rc_dec_init(&rc, in + 2 * ZRLE_ALPHA);
+    int prev = 2;
+    for (int i = 0; i < nsyms; i++) {
+        int ctx = (prev < 2) ? 0 : 1;
+        uint32_t target = rc_dec_cum(&rc, (uint32_t)m[ctx].total);
+        int s = model_find(&m[ctx], (int)target);
+        rc_dec_update(&rc, (uint32_t)model_cum(&m[ctx], s),
+                           (uint32_t)model_freq_of(&m[ctx], s));
+        out[i] = (uint16_t)s;
+        model_update(&m[ctx], s);
+        prev = s;
+    }
+}
 
 /* ===== LZ77 Hash-Chain Encoder/Decoder ===== */
 #define LZ_HASH_BITS  16
@@ -3401,6 +3629,132 @@ typedef struct {
     int back_rep;    /* 1 if this is a rep/shortrep, 0 if normal match or literal */
 } OptNode;
 
+/* ===== SA-LZMA: Suffix Array long-match supplement =====
+ *
+ * For blocks <= SA_LZMA_THRESHOLD (8MB), builds a suffix array + ISA + LCP
+ * using the existing sais_core(). During LZMA DP, supplements hash chain by
+ * finding the globally best long match via SA neighborhood scan.
+ *
+ * Only adds a match to pairs[] if it is strictly longer than the best
+ * match the hash chain already found.
+ *
+ * Memory: 3 * n * 4 bytes (SA + ISA + LCP). For n=8MB: 96MB.
+ */
+#define SA_LZMA_THRESHOLD (8 * 1024 * 1024)
+#define SA_SCAN_LIMIT 64  /* max neighbors to scan left/right in SA */
+
+typedef struct {
+    int32_t *sa;
+    int32_t *isa;
+    int32_t *lcp;
+    const uint8_t *data;
+    int n;
+} SaCtx;
+
+static SaCtx *sa_ctx_build(const uint8_t *data, int n) {
+    SaCtx *ctx = (SaCtx *)malloc(sizeof(SaCtx));
+    if (!ctx) return NULL;
+    ctx->data = data;
+    ctx->n = n;
+
+    ctx->sa  = (int32_t *)malloc((size_t)(n + 1) * sizeof(int32_t));
+    ctx->isa = (int32_t *)malloc((size_t)n * sizeof(int32_t));
+    ctx->lcp = (int32_t *)malloc((size_t)(n + 1) * sizeof(int32_t));
+    if (!ctx->sa || !ctx->isa || !ctx->lcp) {
+        free(ctx->sa); free(ctx->isa); free(ctx->lcp); free(ctx);
+        return NULL;
+    }
+
+    /* Build integer array for sais_core: T[i] = data[i], T[n] = 0 (sentinel) */
+    int32_t *T = (int32_t *)malloc((size_t)(n + 1) * sizeof(int32_t));
+    if (!T) { free(ctx->sa); free(ctx->isa); free(ctx->lcp); free(ctx); return NULL; }
+    for (int i = 0; i < n; i++) T[i] = (int32_t)data[i] + 1; /* shift: 1..256 */
+    T[n] = 0; /* sentinel must be 0 and unique minimum */
+
+    sais_core(T, ctx->sa, n + 1, 257); /* alphabet: 0..256 (0=sentinel, 1..256=bytes+1) */
+    free(T);
+
+    /* Build ISA (inverse SA) */
+    for (int i = 0; i <= n; i++) {
+        if (ctx->sa[i] < n) ctx->isa[ctx->sa[i]] = i;
+    }
+
+    /* Build LCP array using Kasai's algorithm */
+    memset(ctx->lcp, 0, (size_t)(n + 1) * sizeof(int32_t));
+    int h = 0;
+    for (int i = 0; i < n; i++) {
+        int rank = ctx->isa[i];
+        if (rank > 0) {
+            int j = ctx->sa[rank - 1];
+            if (j < n) {
+                while (i + h < n && j + h < n && data[i + h] == data[j + h]) h++;
+                ctx->lcp[rank] = h;
+            }
+            if (h > 0) h--;
+        }
+    }
+    return ctx;
+}
+
+static void sa_ctx_free(SaCtx *ctx) {
+    if (!ctx) return;
+    free(ctx->sa); free(ctx->isa); free(ctx->lcp); free(ctx);
+}
+
+/* Find best match at position pos using SA neighborhood.
+ * Returns match length > min_len, or 0 if nothing better found.
+ * out_dist: distance (1-based, i.e., pos - match_start) */
+static int sa_find_best_match(const SaCtx *ctx, int pos, int max_dist,
+                               int min_len, int *out_dist) {
+    const uint8_t *data = ctx->data;
+    int n = ctx->n;
+    int remaining = n - pos;
+    if (remaining <= min_len) return 0;
+    int max_match = remaining;
+    if (max_match > LZMA_MAX_MATCH) max_match = LZMA_MAX_MATCH;
+
+    int rank = ctx->isa[pos];
+    int best_len = min_len;
+    int best_dist = 0;
+
+    /* Scan left in SA */
+    int min_lcp = max_match;
+    for (int k = rank - 1; k >= 0 && (rank - k) <= SA_SCAN_LIMIT; k--) {
+        if (ctx->lcp[k + 1] < min_lcp) min_lcp = ctx->lcp[k + 1];
+        if (min_lcp <= best_len) break;
+        int ref = ctx->sa[k];
+        if (ref >= n) continue; /* sentinel position */
+        int dist = pos - ref;
+        if (dist <= 0 || dist > max_dist) continue;
+        /* Verify actual match length (min_lcp is a lower bound) */
+        int len = min_lcp;
+        while (len < max_match && data[pos + len] == data[ref + len]) len++;
+        if (len > best_len) { best_len = len; best_dist = dist; }
+        if (best_len == max_match) break;
+    }
+
+    /* Scan right in SA */
+    min_lcp = max_match;
+    for (int k = rank + 1; k <= n && (k - rank) <= SA_SCAN_LIMIT; k++) {
+        if (ctx->lcp[k] < min_lcp) min_lcp = ctx->lcp[k];
+        if (min_lcp <= best_len) break;
+        int ref = ctx->sa[k];
+        if (ref >= n) continue;
+        int dist = pos - ref;
+        if (dist <= 0 || dist > max_dist) continue;
+        int len = min_lcp;
+        while (len < max_match && data[pos + len] == data[ref + len]) len++;
+        if (len > best_len) { best_len = len; best_dist = dist; }
+        if (best_len == max_match) break;
+    }
+
+    if (best_len > min_len && best_dist > 0) {
+        *out_dist = best_dist;
+        return best_len;
+    }
+    return 0;
+}
+
 /* ===== LZMA Encoder with Optimal Parsing ===== */
 static int lzma_compress(const uint8_t *data, int n, uint8_t *out, int size_limit) {
     if (n == 0) return 0;
@@ -3433,9 +3787,14 @@ static int lzma_compress(const uint8_t *data, int n, uint8_t *out, int size_limi
     uint8_t prev_byte = 0;
     int pos = 0;
 
+    /* Build SA for small blocks to supplement hash chain with globally best matches */
+    SaCtx *sa_ctx = NULL;
+    if (n <= SA_LZMA_THRESHOLD) sa_ctx = sa_ctx_build(data, n);
+
     /* Allocate optimal parsing array */
     OptNode *opt = (OptNode *)malloc((OPT_AHEAD + LZMA_MAX_MATCH + 1) * sizeof(OptNode));
-    MatchPair *pairs = (MatchPair *)malloc(LZMA_MAX_MATCH * sizeof(MatchPair));
+    /* +1 slot reserved for SA match supplement */
+    MatchPair *pairs = (MatchPair *)malloc((LZMA_MAX_MATCH + 1) * sizeof(MatchPair));
 
     /* Decision buffer for emitting */
     int *dec_lens = (int *)malloc((OPT_AHEAD + LZMA_MAX_MATCH + 1) * sizeof(int));
@@ -3612,6 +3971,20 @@ static int lzma_compress(const uint8_t *data, int n, uint8_t *out, int size_limi
                 int interior_depth = (n > 4 * 1024 * 1024) ? 8 : mf.chain_max;
                 int cur_chain = (cur == 0) ? mf.chain_max : interior_depth;
                 int np = lzma_mf_find_all(&mf, abs_pos, cur_reps, pairs, LZMA_MAX_MATCH, cur_chain);
+
+                /* SA supplement: for small blocks, find globally best long match */
+                if (sa_ctx && abs_pos < sa_ctx->n) {
+                    int best_chain_len = (np > 0) ? pairs[np - 1].len : (LZMA_MIN_MATCH - 1);
+                    int sa_dist = 0;
+                    int sa_len = sa_find_best_match(sa_ctx, abs_pos,
+                                                     LZMA_MF_WINDOW, best_chain_len, &sa_dist);
+                    if (sa_len > best_chain_len) {
+                        pairs[np].len  = sa_len;
+                        /* sa_dist is 1-based (pos - ref); LZMA pairs use 0-based (pos - ref - 1) */
+                        pairs[np].dist = (uint32_t)(sa_dist - 1);
+                        np++;
+                    }
+                }
 
                 /* NOW update hash for this position (after searching) */
                 lzma_mf_update(&mf, abs_pos);
@@ -3798,6 +4171,7 @@ static int lzma_compress(const uint8_t *data, int n, uint8_t *out, int size_limi
                 lzma_mf_free(&mf);
                 free(opt); free(pairs);
                 free(dec_lens); free(dec_dists); free(dec_reps_flag);
+                sa_ctx_free(sa_ctx);
                 return -1;
             }
         }
@@ -3813,6 +4187,7 @@ static int lzma_compress(const uint8_t *data, int n, uint8_t *out, int size_limi
     free(dec_lens);
     free(dec_dists);
     free(dec_reps_flag);
+    sa_ctx_free(sa_ctx);
     return comp_size;
 }
 
@@ -4003,6 +4378,26 @@ static void *thread_groups_AC(void *arg) {
             total = 8 + asize;
             if (total < w->best_size) {
                 w->best_size = total; w->best_strat = S_BWT_O0_PS;
+                put_u32be(w->out_buf, pidx);
+                put_u32be(w->out_buf + 4, nz);
+                memcpy(w->out_buf + 8, arith_buf, asize);
+            }
+
+            /* rANS O0: same ratio as O0_PS, O(1) table-based decode */
+            asize = rans_enc_o0(zrle_buf, nz, arith_buf);
+            total = 8 + asize;
+            if (total < w->best_size) {
+                w->best_size = total; w->best_strat = S_BWT_RANS;
+                put_u32be(w->out_buf, pidx);
+                put_u32be(w->out_buf + 4, nz);
+                memcpy(w->out_buf + 8, arith_buf, asize);
+            }
+
+            /* 2-context RC O0: separate run-ctx vs literal-ctx models */
+            asize = arith_enc_ctx2(zrle_buf, nz, arith_buf);
+            total = 8 + asize;
+            if (total < w->best_size) {
+                w->best_size = total; w->best_strat = S_BWT_CTX2;
                 put_u32be(w->out_buf, pidx);
                 put_u32be(w->out_buf + 4, nz);
                 memcpy(w->out_buf + 8, arith_buf, asize);
@@ -4255,6 +4650,7 @@ static double ascii_ratio(const uint8_t *data, int n) {
 
 static int is_ac_strategy(int s) {
     return s == S_BWT_O0 || s == S_BWT_O1 || s == S_BWT_O2 || s == S_BWT_O0_PS ||
+           s == S_BWT_RANS || s == S_BWT_CTX2 ||
            s == S_LZP_BWT_O0 || s == S_LZP_BWT_O1 || s == S_LZP_BWT_O2;
 }
 static int is_bde_strategy(int s) {
@@ -5013,6 +5409,8 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
     if (is_o2)                        arith_dec_o2(arith_data, nz, zrle_buf);
     else if (is_o1)                   arith_dec_o1(arith_data, nz, zrle_buf);
     else if (strat == S_BWT_O0_PS)    arith_dec_o0_ps(arith_data, nz, zrle_buf);
+    else if (strat == S_BWT_RANS)     rans_dec_o0(arith_data, nz, zrle_buf);
+    else if (strat == S_BWT_CTX2)     arith_dec_ctx2(arith_data, nz, zrle_buf);
     else                              arith_dec_o0(arith_data, nz, zrle_buf);
 
     zrle_decode(zrle_buf, nz, mtf_buf, decode_size);
