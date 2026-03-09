@@ -62,7 +62,8 @@ enum Strategy {
     S_PPM=16, S_BWT_PPM=17, S_BWT_MTF_PPM=18, S_AUDIO=19, S_BASE64=20, S_BASE64_V2=21,
     S_LZ77_O0=22, S_LZ77_O1=23,
     S_LZMA=24,
-    S_BCJ_LZMA=25
+    S_BCJ_LZMA=25,
+    S_F32_BWT=26   /* IEEE 754 float32 XOR-delta → BWT+RC */
 };
 static const char *strat_names[] = {
     "STORE","BWT+O0","BWT+O1","D+BWT+O0","D+BWT+O1",
@@ -72,7 +73,8 @@ static const char *strat_names[] = {
     "PPM","BWT+PPM","BWT+MTF+PPM","Audio", "Base64", "Base64v2",
     "LZ77+BWT+O0","LZ77+BWT+O1",
     "LZMA",
-    "BCJ+LZMA"
+    "BCJ+LZMA",
+    "F32XOR+BWT"
 };
 
 /* ===== HPK6 Archive Structures ===== */
@@ -942,6 +944,94 @@ static void bcj_e8e9_decode(const uint8_t *in, int n, uint8_t *out) {
             i += 4;
         }
     }
+}
+
+/* ===== IEEE 754 Float32 XOR-Delta Transform ===== */
+/*
+ * For data containing float32 values with similar magnitudes (scientific data,
+ * sensor arrays, FITS catalogs), XORing consecutive 4-byte values cancels out
+ * shared exponent bits, clustering the differences near zero and making the
+ * BWT suffix sort far more effective.
+ *
+ * Detection: if XOR-delta reduces the entropy of the high byte (exponent+sign
+ * of LE float32) by ≥15%, the data is likely float-encoded and benefits from
+ * this filter.
+ */
+static int float_xor_detect(const uint8_t *data, int n) {
+    if (n < 4096) return 0;
+    int tn = n < 65536 ? n : 65536;
+    tn &= ~3;  /* align to 4-byte boundary */
+    if (tn < 1024) return 0;
+
+    /* Full-byte entropy of raw data */
+    int freq0[256] = {0};
+    for (int i = 0; i < tn; i++) freq0[data[i]]++;
+    double ent0 = 0.0;
+    for (int i = 0; i < 256; i++) {
+        if (freq0[i] > 0) { double p = (double)freq0[i] / tn; ent0 -= p * log2(p); }
+    }
+
+    /* Full-byte entropy of XOR-delta output */
+    int freq1[256] = {0};
+    uint32_t prev = 0;
+    for (int i = 0; i < tn; i += 4) {
+        uint32_t curr = (uint32_t)data[i]          |
+                        ((uint32_t)data[i+1] <<  8) |
+                        ((uint32_t)data[i+2] << 16) |
+                        ((uint32_t)data[i+3] << 24);
+        uint32_t d = curr ^ prev;
+        freq1[ d        & 0xFF]++;
+        freq1[(d >>  8) & 0xFF]++;
+        freq1[(d >> 16) & 0xFF]++;
+        freq1[(d >> 24) & 0xFF]++;
+        prev = curr;
+    }
+    double ent1 = 0.0;
+    for (int i = 0; i < 256; i++) {
+        if (freq1[i] > 0) { double p = (double)freq1[i] / tn; ent1 -= p * log2(p); }
+    }
+
+    /* Trigger if XOR-delta reduces full entropy by ≥10%.
+       This catches both:
+       - varying-exponent floats (ent0 normal, ent1 lower)
+       - same-exponent floats (ent0 already low, ent1 even lower due to 0x00 high bytes) */
+    return (ent0 > 4.0 && ent1 < ent0 * 0.90);
+}
+
+static void float_xor_encode(const uint8_t *in, int n, uint8_t *out) {
+    uint32_t prev = 0;
+    int i;
+    for (i = 0; i + 3 < n; i += 4) {
+        uint32_t curr = (uint32_t)in[i]         |
+                        ((uint32_t)in[i+1] << 8)  |
+                        ((uint32_t)in[i+2] << 16) |
+                        ((uint32_t)in[i+3] << 24);
+        uint32_t d = curr ^ prev;
+        out[i]   = d & 0xFF;
+        out[i+1] = (d >> 8)  & 0xFF;
+        out[i+2] = (d >> 16) & 0xFF;
+        out[i+3] = (d >> 24) & 0xFF;
+        prev = curr;
+    }
+    for (; i < n; i++) out[i] = in[i];  /* tail bytes (n % 4) */
+}
+
+static void float_xor_decode(const uint8_t *in, int n, uint8_t *out) {
+    uint32_t prev = 0;
+    int i;
+    for (i = 0; i + 3 < n; i += 4) {
+        uint32_t d = (uint32_t)in[i]         |
+                     ((uint32_t)in[i+1] << 8)  |
+                     ((uint32_t)in[i+2] << 16) |
+                     ((uint32_t)in[i+3] << 24);
+        uint32_t curr = d ^ prev;
+        out[i]   = curr & 0xFF;
+        out[i+1] = (curr >> 8)  & 0xFF;
+        out[i+2] = (curr >> 16) & 0xFF;
+        out[i+3] = (curr >> 24) & 0xFF;
+        prev = curr;
+    }
+    for (; i < n; i++) out[i] = in[i];
 }
 
 /* ===== Audio Pipeline (16-bit PCM) ===== */
@@ -3873,6 +3963,31 @@ static void *thread_groups_BDE(void *arg) {
         }
     }
     
+    /* Group F32: IEEE 754 Float32 XOR-delta → BWT+RC */
+    /* Targets scientific/sensor data where consecutive floats share exponent bits.
+       Uses delta_buf (already allocated, size n) as the XOR-transformed buffer. */
+    if (w->hint_strat < 0 || w->hint_strat == S_F32_BWT) {
+        if (float_xor_detect(data, n)) {
+            float_xor_encode(data, n, delta_buf);  /* delta_buf reused */
+            pidx = bwt_encode_ws(delta_buf, n, bwt_buf, w->bwt_ws);
+            mtf_encode(bwt_buf, n, mtf_buf);
+            nz = zrle_encode(mtf_buf, n, zrle_buf);
+            asize = arith_enc_o0(zrle_buf, nz, arith_buf);
+            total = 8 + asize;
+            if (total < w->best_size) {
+                w->best_size = total; w->best_strat = S_F32_BWT;
+                put_u32be(w->out_buf, pidx);
+                put_u32be(w->out_buf + 4, nz);
+                memcpy(w->out_buf + 8, arith_buf, asize);
+                fprintf(stderr, "    [F32XOR+BWT] %d -> %d (%.2fx) *** NEW BEST ***\n",
+                        n, total, (double)n / total);
+            } else {
+                fprintf(stderr, "    [F32XOR+BWT] %d -> %d (%.2fx)\n",
+                        n, total, (double)n / total);
+            }
+        }
+    }
+
     /* Group E: LZ77+BWT */
     /* v10.2: Skip LZ77 if sample showed BWT/Delta wins */
     if (w->hint_strat < 0 || w->hint_strat == S_LZ77_O0 || w->hint_strat == S_LZ77_O1)
@@ -3948,7 +4063,8 @@ static int is_ac_strategy(int s) {
 static int is_bde_strategy(int s) {
     return s == S_DBWT_O0 || s == S_DBWT_O1 || s == S_DBWT_O2 ||
            s == S_DLZP_BWT_O0 || s == S_DLZP_BWT_O1 || s == S_DLZP_BWT_O2 ||
-           s == S_LZ77_O0 || s == S_LZ77_O1;
+           s == S_LZ77_O0 || s == S_LZ77_O1 ||
+           s == S_F32_BWT;
 }
 
 static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, BWTWorkspace *bwt_ws, CompressWorkspace *cws) {
@@ -4721,6 +4837,13 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
         uint8_t *tmp = (uint8_t*)malloc(orig_size);
         memcpy(tmp, out, orig_size);
         delta_decode(tmp, orig_size, out);
+        free(tmp);
+    }
+
+    if (strat == S_F32_BWT) {
+        uint8_t *tmp = (uint8_t*)malloc(orig_size);
+        memcpy(tmp, out, orig_size);
+        float_xor_decode(tmp, orig_size, out);
         free(tmp);
     }
 
