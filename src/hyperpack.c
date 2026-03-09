@@ -3278,7 +3278,7 @@ typedef struct { uint32_t dist; int len; } MatchPair;
 /* Find ALL matches at position pos. Returns them sorted by length ascending.
    Also check rep distances. max_pairs is the capacity of pairs[]. */
 static int lzma_mf_find_all(LzmaMF *mf, int pos, uint32_t *reps,
-                             MatchPair *pairs, int max_pairs) {
+                             MatchPair *pairs, int max_pairs, int chain_limit) {
     const uint8_t *data = mf->data;
     int size = mf->size;
     int np = 0;
@@ -3349,7 +3349,7 @@ static int lzma_mf_find_all(LzmaMF *mf, int pos, uint32_t *reps,
         int tries = 0;
         int max_dist = (pos < mf->window_size) ? pos : mf->window_size;
 
-        while (chain_pos >= 0 && (pos - chain_pos) <= max_dist && tries < mf->chain_max) {
+        while (chain_pos >= 0 && (pos - chain_pos) <= max_dist && tries < chain_limit) {
             if (data[chain_pos + best_len] == data[pos + best_len]) {
                 int len = 0;
                 while (len < max_len && data[chain_pos + len] == data[pos + len]) len++;
@@ -3604,7 +3604,14 @@ static int lzma_compress(const uint8_t *data, int n, uint8_t *out, int size_limi
             /* === Try normal matches from hash chain === */
             /* IMPORTANT: find matches BEFORE updating hash to avoid self-match */
             {
-                int np = lzma_mf_find_all(&mf, abs_pos, cur_reps, pairs, LZMA_MAX_MATCH);
+                /* Interior DP positions (cur > 0) use a reduced chain depth:
+                 * they only need to find matches competitive with the already-known
+                 * cur=0 path, so deep search is wasteful. cur=0 always uses full depth.
+                 * For large blocks (> 4MB), reduce to 8 to limit O(n*last_opt) cost.
+                 * Small blocks keep full depth — the extra cost is negligible. */
+                int interior_depth = (n > 4 * 1024 * 1024) ? 8 : mf.chain_max;
+                int cur_chain = (cur == 0) ? mf.chain_max : interior_depth;
+                int np = lzma_mf_find_all(&mf, abs_pos, cur_reps, pairs, LZMA_MAX_MATCH, cur_chain);
 
                 /* NOW update hash for this position (after searching) */
                 lzma_mf_update(&mf, abs_pos);
@@ -3649,6 +3656,7 @@ static int lzma_compress(const uint8_t *data, int n, uint8_t *out, int size_limi
                             if (next > last_opt) last_opt = next;
                         }
                     }
+
                 }
             }
         }
