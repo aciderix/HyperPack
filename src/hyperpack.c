@@ -63,7 +63,8 @@ enum Strategy {
     S_LZ77_O0=22, S_LZ77_O1=23,
     S_LZMA=24,
     S_BCJ_LZMA=25,
-    S_F32_BWT=26   /* IEEE 754 float32 XOR-delta → BWT+RC */
+    S_F32_BWT=26,  /* IEEE 754 float32 XOR-delta → BWT+RC */
+    S_BWT_O0_PS=27 /* BWT+RC O0 with pre-scanned frequency table (cold-start fix) */
 };
 static const char *strat_names[] = {
     "STORE","BWT+O0","BWT+O1","D+BWT+O0","D+BWT+O1",
@@ -74,7 +75,8 @@ static const char *strat_names[] = {
     "LZ77+BWT+O0","LZ77+BWT+O1",
     "LZMA",
     "BCJ+LZMA",
-    "F32XOR+BWT"
+    "F32XOR+BWT",
+    "BWT+O0PS"
 };
 
 /* ===== HPK6 Archive Structures ===== */
@@ -711,6 +713,90 @@ static void arith_dec_o2(const uint8_t *in, int nsyms, uint16_t *out) {
         prev2 = prev1; prev1 = s;
     }
     free(models);
+}
+
+/* ===== Arithmetic Coding O0 with Pre-Scanned frequency table (S_BWT_O0_PS) =====
+ *
+ * Root cause of HP's 2-3% gap vs bzip2 on small text files:
+ *  1. Cold-start: model starts uniform (1/258 per symbol), wastes bits during
+ *     the first ~16K symbols while converging to the true distribution.
+ *  2. Dead symbols: ~200 of 258 ZRLE symbols never appear; their constant
+ *     freq=1 permanently "steals" ~2% of probability mass from active symbols.
+ *
+ * Fix: one forward pass to count actual frequencies, then store a 258-byte
+ * normalized frequency table at the start of the compressed stream.  Both
+ * encoder and decoder initialise the model from this table, so the coder
+ * starts with near-optimal probabilities and active symbols share 100% of the
+ * probability mass.  Overhead: ZRLE_ALPHA (258) bytes per BWT block.
+ *
+ * Format: [258 bytes freq_table | range-coded stream]
+ *   freq_table[i] = 0          → symbol i never appears (excluded from model)
+ *   freq_table[i] = 1..255     → proportional initial weight (scaled so that
+ *                                 the most-frequent symbol gets 255)
+ */
+static int arith_enc_o0_ps(const uint16_t *syms, int nsyms, uint8_t *out) {
+    /* Phase 1: count raw frequencies */
+    int count[ZRLE_ALPHA];
+    memset(count, 0, sizeof(count));
+    for (int i = 0; i < nsyms; i++) count[syms[i]]++;
+
+    /* Scale to uint8_t [1..255] for seen symbols, 0 for never-seen */
+    int maxcount = 0;
+    for (int i = 0; i < ZRLE_ALPHA; i++)
+        if (count[i] > maxcount) maxcount = count[i];
+
+    uint8_t *header = out;                     /* first 258 bytes = freq table */
+    for (int i = 0; i < ZRLE_ALPHA; i++) {
+        if (count[i] == 0) {
+            header[i] = 0;
+        } else {
+            int scaled = (int)((int64_t)count[i] * 254 / maxcount) + 1; /* 1..255 */
+            header[i] = (uint8_t)scaled;
+        }
+    }
+
+    /* Phase 2: init model from frequency table */
+    Model m;
+    memset(&m, 0, sizeof(m));
+    m.total = 0;
+    for (int i = 0; i < ZRLE_ALPHA; i++) {
+        m.freq[i] = header[i];
+        m.total  += header[i];
+    }
+    model_build_tree(&m);
+
+    /* Phase 3: adaptive range coding (encoder and decoder stay in sync) */
+    RCEnc rc; rc_enc_init(&rc, out + ZRLE_ALPHA);
+    for (int i = 0; i < nsyms; i++) {
+        int s = syms[i];
+        rc_enc(&rc, (uint32_t)model_cum(&m, s), (uint32_t)model_freq_of(&m, s),
+               (uint32_t)m.total);
+        model_update(&m, s);
+    }
+    int arith_bytes = rc_enc_finish(&rc);
+    return ZRLE_ALPHA + arith_bytes;
+}
+
+static void arith_dec_o0_ps(const uint8_t *in, int nsyms, uint16_t *out) {
+    /* Read frequency table header and init model */
+    Model m;
+    memset(&m, 0, sizeof(m));
+    m.total = 0;
+    for (int i = 0; i < ZRLE_ALPHA; i++) {
+        m.freq[i] = in[i];
+        m.total  += in[i];
+    }
+    model_build_tree(&m);
+
+    /* Decode */
+    RCDec rc; rc_dec_init(&rc, in + ZRLE_ALPHA);
+    for (int i = 0; i < nsyms; i++) {
+        uint32_t target = rc_dec_cum(&rc, (uint32_t)m.total);
+        int s = model_find(&m, (int)target);
+        rc_dec_update(&rc, (uint32_t)model_cum(&m, s), (uint32_t)model_freq_of(&m, s));
+        out[i] = (uint16_t)s;
+        model_update(&m, s);
+    }
 }
 
 
@@ -3823,7 +3909,22 @@ static void *thread_groups_AC(void *arg) {
             }
             } /* end skip_o2 */
         }
-        
+
+        /* O0_PS: pre-scanned O0 — fixes cold-start and dead-symbol wasted probability.
+         * Only tried when O0 was competitive (o0cmp) and no sample hint forced O1/O2.
+         * Overhead vs plain O0: ZRLE_ALPHA (258) bytes per block.
+         * Expected gain: ~2% on small text files; neutral on large files. */
+        if (o0cmp && w->hint_strat != S_BWT_O1 && w->hint_strat != S_BWT_O2) {
+            asize = arith_enc_o0_ps(zrle_buf, nz, arith_buf);
+            total = 8 + asize;
+            if (total < w->best_size) {
+                w->best_size = total; w->best_strat = S_BWT_O0_PS;
+                put_u32be(w->out_buf, pidx);
+                put_u32be(w->out_buf + 4, nz);
+                memcpy(w->out_buf + 8, arith_buf, asize);
+            }
+        }
+
         /* Group C: LZP+BWT */
         if (!skip_lzp) {
             int lzp_size = lzp_encode(data, n, lzp_buf);
@@ -4069,7 +4170,7 @@ static double ascii_ratio(const uint8_t *data, int n) {
 #define SAMPLE_THRESHOLD (4*1024*1024) /* only for blocks > 4 MB */
 
 static int is_ac_strategy(int s) {
-    return s == S_BWT_O0 || s == S_BWT_O1 || s == S_BWT_O2 ||
+    return s == S_BWT_O0 || s == S_BWT_O1 || s == S_BWT_O2 || s == S_BWT_O0_PS ||
            s == S_LZP_BWT_O0 || s == S_LZP_BWT_O1 || s == S_LZP_BWT_O2;
 }
 static int is_bde_strategy(int s) {
@@ -4825,9 +4926,10 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
                  strat == S_LZP_BWT_O2 || strat == S_DLZP_BWT_O2);
     int is_o1 = (strat == S_BWT_O1 || strat == S_DBWT_O1 ||
                  strat == S_LZP_BWT_O1 || strat == S_DLZP_BWT_O1);
-    if (is_o2)      arith_dec_o2(arith_data, nz, zrle_buf);
-    else if (is_o1) arith_dec_o1(arith_data, nz, zrle_buf);
-    else            arith_dec_o0(arith_data, nz, zrle_buf);
+    if (is_o2)                        arith_dec_o2(arith_data, nz, zrle_buf);
+    else if (is_o1)                   arith_dec_o1(arith_data, nz, zrle_buf);
+    else if (strat == S_BWT_O0_PS)    arith_dec_o0_ps(arith_data, nz, zrle_buf);
+    else                              arith_dec_o0(arith_data, nz, zrle_buf);
 
     zrle_decode(zrle_buf, nz, mtf_buf, decode_size);
     mtf_decode(mtf_buf, decode_size, bwt_buf);
