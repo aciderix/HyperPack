@@ -16,14 +16,16 @@
 #include <time.h>
 #include <math.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#define mkdir(path, mode) _mkdir(path)
+#endif
 #include <sys/types.h>
 #include <dirent.h>
 #include <errno.h>
-#ifndef HYPERPACK_WASM
 #include <pthread.h>
-#else
-/* WASM build: stub out pthreads (single-threaded only) */
-typedef int pthread_t;
+#ifdef HYPERPACK_WASM
+/* WASM build: prevent thread creation; mutex/join are no-ops via Emscripten stubs */
 static inline int pthread_create_stub(pthread_t *t, const void *a, void *(*f)(void*), void *arg)
     { (void)t;(void)a;(void)f;(void)arg; return -1; }
 static inline int pthread_join_stub(pthread_t t, void **r) { (void)t;(void)r; return 0; }
