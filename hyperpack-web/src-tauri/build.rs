@@ -18,7 +18,8 @@ fn main() {
 
     // Link platform-specific system libraries
     if cfg!(target_os = "windows") {
-        // With x86_64-pc-windows-gnu, MinGW pthreads and zlib must be linked explicitly.
+        // With x86_64-pc-windows-gnu, link pthread and zlib dynamically.
+        // libwinpthread-1.dll is bundled into the installer via tauri.windows.conf.json.
         println!("cargo:rustc-link-lib=pthread");
         println!("cargo:rustc-link-lib=z");
     } else if cfg!(target_os = "macos") {

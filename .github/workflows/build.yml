@@ -73,7 +73,7 @@ jobs:
           install: mingw-w64-x86_64-gcc mingw-w64-x86_64-zlib diffutils
 
       - name: Build
-        run: gcc -O2 -Wall -o hyperpack.exe src/hyperpack.c -lm -lpthread -lz
+        run: gcc -O2 -Wall -static -o hyperpack.exe src/hyperpack.c -lm -lpthread -lz
 
       - name: Smoke test
         run: |
@@ -252,8 +252,32 @@ jobs:
       - name: Install frontend deps
         run: cd hyperpack-web && npm install
 
+      - name: Copy libwinpthread-1.dll for Tauri bundling
+        shell: pwsh
+        run: |
+          # Copy the MinGW runtime DLL into src-tauri/ so tauri.windows.conf.json
+          # can include it as a resource in the NSIS installer.
+          Copy-Item "C:\msys64\mingw64\bin\libwinpthread-1.dll" "hyperpack-web/src-tauri/"
+          Write-Host "libwinpthread-1.dll copied to src-tauri/"
+
       - name: Build Tauri app
         run: cd hyperpack-web && npm run tauri build
+
+      - name: Copy WebView2Loader.dll to bundle (for portable use)
+        shell: pwsh
+        run: |
+          # The webview2-com-sys build script places WebView2Loader.dll next to
+          # the compiled binary; copy it into the NSIS bundle directory so that
+          # users who extract the installer or use the portable binary also have it.
+          $src = "hyperpack-web/src-tauri/target/release/WebView2Loader.dll"
+          $dst = "hyperpack-web/src-tauri/target/release/bundle/nsis/"
+          if (Test-Path $src) {
+            New-Item -ItemType Directory -Force -Path $dst | Out-Null
+            Copy-Item $src $dst
+            Write-Host "WebView2Loader.dll copied to NSIS bundle directory"
+          } else {
+            Write-Host "WebView2Loader.dll not found at $src (may already be bundled by installer)"
+          }
 
       - uses: actions/upload-artifact@v4
         with:
@@ -261,6 +285,7 @@ jobs:
           # GNU toolchain produces NSIS (.exe) instead of WiX (.msi)
           path: |
             hyperpack-web/src-tauri/target/release/bundle/nsis/*.exe
+            hyperpack-web/src-tauri/target/release/bundle/nsis/WebView2Loader.dll
             hyperpack-web/src-tauri/target/release/bundle/msi/*.msi
           if-no-files-found: ignore
 
