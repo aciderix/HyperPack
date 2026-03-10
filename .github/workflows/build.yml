@@ -228,8 +228,8 @@ jobs:
           install: mingw-w64-x86_64-gcc mingw-w64-x86_64-zlib
 
       - name: Add MinGW-w64 to PATH
-        shell: pwsh
-        run: Add-Content $env:GITHUB_PATH "C:\msys64\mingw64\bin"
+        shell: msys2 {0}
+        run: echo "$(cygpath -w /mingw64/bin)" >> $GITHUB_PATH
 
       - name: Setup Node
         uses: actions/setup-node@v4
