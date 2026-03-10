@@ -5845,11 +5845,18 @@ static int png_reconstruct(const uint8_t *meta, uint32_t meta_size,
  *     if is_dup: DUP_REF(4)
  *     else: STRATEGY(1) COMP_SIZE(4) ORIG_BLOCK_SIZE(4) CRC32(4) DATA(comp_size)
  */
+static int file_compress_impl(const char *inpath, const char *outpath, int block_size, int nthreads, int force_no_png);
+
 static int file_compress(const char *inpath, const char *outpath, int block_size, int nthreads) {
+    return file_compress_impl(inpath, outpath, block_size, nthreads, 0);
+}
+
+static int file_compress_impl(const char *inpath, const char *outpath, int block_size, int nthreads, int force_no_png) {
     FILE *fin = fopen(inpath, "rb");
     if (!fin) { fprintf(stderr, "Cannot open %s\n", inpath); return 1; }
     fseek(fin, 0, SEEK_END);
     int64_t fsize = ftell(fin); fseek(fin, 0, SEEK_SET);
+    int64_t original_fsize = fsize; /* save original file size before any pre-transform */
 
     /* Auto-detect PNG and inflate its IDAT for better HP compression */
     uint8_t pretransform = PT_NONE;
@@ -5857,7 +5864,7 @@ static int file_compress(const char *inpath, const char *outpath, int block_size
     uint8_t *transformed_data = NULL; size_t transformed_size = 0;
     {
         uint8_t sig[8];
-        if (fsize >= 8 && fread(sig, 1, 8, fin) == 8 &&
+        if (!force_no_png && fsize >= 8 && fread(sig, 1, 8, fin) == 8 &&
             memcmp(sig, HP_PNG_SIG, 8) == 0) {
             if (png_extract(fin, fsize, &png_meta, &png_meta_size,
                             &transformed_data, &transformed_size) == 0) {
@@ -6064,6 +6071,15 @@ static int file_compress(const char *inpath, const char *outpath, int block_size
     free(inbuf); free(outbuf); free(hashes); free(comp_sizes); free(strategies);
     if (transformed_data) free(transformed_data);
     if (png_meta) free(png_meta);
+
+    /* If PNG pre-transform made the file larger than the original, fall back to raw */
+    if (pretransform == PT_PNG && file_total >= original_fsize) {
+        fprintf(stderr, "[HP5] PNG pre-transform increased size (%lld -> %lld bytes), retrying as raw\n",
+                (long long)original_fsize, (long long)file_total);
+        remove(outpath);
+        return file_compress_impl(inpath, outpath, block_size, nthreads, 1);
+    }
+
     return 0;
 }
 
