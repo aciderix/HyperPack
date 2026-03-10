@@ -252,6 +252,14 @@ jobs:
       - name: Install frontend deps
         run: cd hyperpack-web && npm install
 
+      - name: Copy libwinpthread-1.dll for Tauri bundling
+        shell: pwsh
+        run: |
+          # Copy the MinGW runtime DLL into src-tauri/ so tauri.windows.conf.json
+          # can include it as a resource in the NSIS installer.
+          Copy-Item "C:\msys64\mingw64\bin\libwinpthread-1.dll" "hyperpack-web/src-tauri/"
+          Write-Host "libwinpthread-1.dll copied to src-tauri/"
+
       - name: Build Tauri app
         run: cd hyperpack-web && npm run tauri build
 
