@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -O2 -Wall
-LDFLAGS = -lm -lpthread
+LDFLAGS = -lm -lpthread -lz
 SRC = src/hyperpack.c
 BIN = hyperpack
 

@@ -24,6 +24,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <pthread.h>
+#include <zlib.h>
 #ifdef HYPERPACK_WASM
 /* WASM build: prevent thread creation; mutex/join are no-ops via Emscripten stubs */
 static inline int pthread_create_stub(pthread_t *t, const void *a, void *(*f)(void*), void *arg)
@@ -41,7 +42,11 @@ static inline int pthread_join_stub(pthread_t t, void **r) { (void)t;(void)r; re
 #define MAX_TOTAL     16383
 #define MAGIC         0x48504B35u /* "HPK5" */
 #define MAGIC6        0x48504B36u /* "HPK6" archive */
-#define VERSION       10
+#define VERSION       11
+
+/* Pre-transform types (stored in HPK5 V11 header byte after VERSION) */
+#define PT_NONE  0   /* no pre-transform — raw file bytes */
+#define PT_PNG   1   /* PNG: IDAT inflated; meta = non-IDAT/IEND chunks */
 
 /* LZP configuration */
 #define LZP_HTAB_BITS  20
@@ -124,9 +129,17 @@ static void crc_init(void) {
     crc_ready = 1;
 }
 
-static uint32_t crc32(const uint8_t *d, size_t len) {
+static uint32_t hp_crc32(const uint8_t *d, size_t len) {
     if (!crc_ready) crc_init();
     uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++) c = (c >> 8) ^ crc_tab[(c ^ d[i]) & 0xFF];
+    return c ^ 0xFFFFFFFFu;
+}
+
+/* Chained CRC32: continue from a previous result (e.g. for PNG chunk CRCs) */
+static uint32_t hp_crc32_chain(uint32_t prev, const uint8_t *d, size_t len) {
+    if (!crc_ready) crc_init();
+    uint32_t c = prev ^ 0xFFFFFFFFu;
     for (size_t i = 0; i < len; i++) c = (c >> 8) ^ crc_tab[(c ^ d[i]) & 0xFF];
     return c ^ 0xFFFFFFFFu;
 }
@@ -5671,14 +5684,151 @@ static void *compress_block_worker(void *arg) {
     job->output_size = compress_block(job->input, job->input_size, 
                                        job->output, &job->strategy, 
                                        job->bwt_ws, job->cws);
-    job->crc = crc32(job->input, job->input_size);
+    job->crc = hp_crc32(job->input, job->input_size);
     job->done = 1;
     return NULL;
 }
 
+/* ===== PNG Pre-Transform ===== */
+
+static const uint8_t HP_PNG_SIG[8] = {0x89,'P','N','G','\r','\n',0x1a,'\n'};
+
+/* PNG chunk CRC: CRC32 over type(4 bytes) + data(len bytes) */
+static uint32_t png_chunk_crc(const uint8_t *type, const uint8_t *data, uint32_t len) {
+    uint32_t c = hp_crc32_chain(0, type, 4);
+    if (len > 0) c = hp_crc32_chain(c, data, len);
+    return c;
+}
+
+static void fwrite_be32(FILE *f, uint32_t v) {
+    uint8_t b[4] = {(uint8_t)(v>>24),(uint8_t)(v>>16),(uint8_t)(v>>8),(uint8_t)v};
+    fwrite(b, 1, 4, f);
+}
+
+static uint32_t buf_be32(const uint8_t *p) {
+    return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
+}
+
+/*
+ * png_extract: read a PNG file, inflate its IDAT stream into raw filtered scanlines.
+ *   meta_out / meta_size  = PNG signature + all non-IDAT/IEND chunks (caller frees)
+ *   data_out / data_size  = inflated IDAT scanlines (caller frees)
+ * Returns 0 on success.
+ */
+static int png_extract(FILE *fin, int64_t fsize,
+                        uint8_t **meta_out, uint32_t *meta_size,
+                        uint8_t **data_out, size_t *data_size)
+{
+    uint8_t *filebuf = (uint8_t*)malloc((size_t)fsize);
+    if (!filebuf) return 1;
+    fseek(fin, 0, SEEK_SET);
+    if ((int64_t)fread(filebuf, 1, (size_t)fsize, fin) != fsize) {
+        free(filebuf); return 1;
+    }
+    if (fsize < 8 || memcmp(filebuf, HP_PNG_SIG, 8) != 0) { free(filebuf); return 1; }
+
+    uint8_t *meta_buf = (uint8_t*)malloc((size_t)fsize);
+    uint8_t *idat_buf = (uint8_t*)malloc((size_t)fsize);
+    if (!meta_buf || !idat_buf) {
+        free(filebuf); free(meta_buf); free(idat_buf); return 1;
+    }
+    size_t meta_len = 0, idat_len = 0;
+    memcpy(meta_buf, HP_PNG_SIG, 8);
+    meta_len = 8;
+
+    size_t pos = 8;
+    while (pos + 12 <= (size_t)fsize) {
+        uint32_t chunk_len = buf_be32(filebuf + pos);
+        if (pos + 12 + chunk_len > (size_t)fsize) break;
+        const uint8_t *chunk_type = filebuf + pos + 4;
+        const uint8_t *chunk_data = filebuf + pos + 8;
+        if (memcmp(chunk_type, "IDAT", 4) == 0) {
+            memcpy(idat_buf + idat_len, chunk_data, chunk_len);
+            idat_len += chunk_len;
+        } else if (memcmp(chunk_type, "IEND", 4) == 0) {
+            break;
+        } else {
+            memcpy(meta_buf + meta_len, filebuf + pos, 12 + chunk_len);
+            meta_len += 12 + chunk_len;
+        }
+        pos += 12 + chunk_len;
+    }
+    free(filebuf);
+    if (idat_len == 0) { free(meta_buf); free(idat_buf); return 1; }
+
+    /* Inflate IDAT (zlib-wrapped deflate); retry with larger buffer if needed */
+    size_t out_alloc = idat_len * 4 + (1 << 20);
+    uint8_t *out_buf = (uint8_t*)malloc(out_alloc);
+    if (!out_buf) { free(meta_buf); free(idat_buf); return 1; }
+    for (;;) {
+        z_stream zs; memset(&zs, 0, sizeof(zs));
+        zs.next_in  = idat_buf;
+        zs.avail_in = (uInt)idat_len;
+        zs.next_out = out_buf;
+        zs.avail_out = (uInt)(out_alloc < 0xFFFFFFFFu ? out_alloc : 0xFFFFFFFFu);
+        if (inflateInit(&zs) != Z_OK) {
+            free(meta_buf); free(idat_buf); free(out_buf); return 1;
+        }
+        int ret = inflate(&zs, Z_FINISH);
+        size_t got = zs.total_out;
+        inflateEnd(&zs);
+        if (ret == Z_STREAM_END) {
+            free(idat_buf);
+            *meta_out  = meta_buf; *meta_size = (uint32_t)meta_len;
+            *data_out  = out_buf;  *data_size = got;
+            return 0;
+        } else if (ret == Z_BUF_ERROR || zs.avail_out == 0) {
+            out_alloc *= 2;
+            free(out_buf);
+            out_buf = (uint8_t*)malloc(out_alloc);
+            if (!out_buf) { free(meta_buf); free(idat_buf); return 1; }
+        } else {
+            free(meta_buf); free(idat_buf); free(out_buf); return 1;
+        }
+    }
+}
+
+/*
+ * png_reconstruct: deflate the inflated scanlines and write a valid PNG to outpath.
+ * meta = PNG signature + all original non-IDAT/IEND chunks.
+ * Returns 0 on success.
+ */
+static int png_reconstruct(const uint8_t *meta, uint32_t meta_size,
+                             const uint8_t *inflated, size_t inflated_size,
+                             const char *outpath)
+{
+    uLong deflate_bound = compressBound((uLong)inflated_size);
+    uint8_t *idat_data = (uint8_t*)malloc((size_t)deflate_bound);
+    if (!idat_data) return 1;
+    uLong idat_size = deflate_bound;
+    int zret = compress2(idat_data, &idat_size,
+                         (const Bytef*)inflated, (uLong)inflated_size,
+                         Z_DEFAULT_COMPRESSION);
+    if (zret != Z_OK) { free(idat_data); return 1; }
+
+    FILE *fout = fopen(outpath, "wb");
+    if (!fout) { free(idat_data); return 1; }
+    fwrite(meta, 1, meta_size, fout);
+    /* IDAT chunk */
+    fwrite_be32(fout, (uint32_t)idat_size);
+    fwrite("IDAT", 1, 4, fout);
+    fwrite(idat_data, 1, (size_t)idat_size, fout);
+    fwrite_be32(fout, png_chunk_crc((const uint8_t*)"IDAT", idat_data, (uint32_t)idat_size));
+    /* IEND chunk */
+    fwrite_be32(fout, 0);
+    fwrite("IEND", 1, 4, fout);
+    fwrite_be32(fout, png_chunk_crc((const uint8_t*)"IEND", NULL, 0));
+    fclose(fout);
+    free(idat_data);
+    return 0;
+}
+
 /* ===== File Compress ===== */
 /*
- * File format:
+ * File format V11:
+ *   MAGIC(4) VERSION(1) PRETRANSFORM(1) [if PT!=PT_NONE: META_SIZE(4) META(meta_size)]
+ *   BLOCK_SIZE(4) ORIG_SIZE(8) NBLOCKS(4)
+ * File format V5-V10 (legacy):
  *   MAGIC(4) VERSION(1) BLOCK_SIZE(4) ORIG_SIZE(8) NBLOCKS(4)
  *   For each block:
  *     FLAGS(1)  -- bit 0: is_dup
@@ -5691,6 +5841,28 @@ static int file_compress(const char *inpath, const char *outpath, int block_size
     fseek(fin, 0, SEEK_END);
     int64_t fsize = ftell(fin); fseek(fin, 0, SEEK_SET);
 
+    /* Auto-detect PNG and inflate its IDAT for better HP compression */
+    uint8_t pretransform = PT_NONE;
+    uint8_t *png_meta = NULL; uint32_t png_meta_size = 0;
+    uint8_t *transformed_data = NULL; size_t transformed_size = 0;
+    {
+        uint8_t sig[8];
+        if (fsize >= 8 && fread(sig, 1, 8, fin) == 8 &&
+            memcmp(sig, HP_PNG_SIG, 8) == 0) {
+            if (png_extract(fin, fsize, &png_meta, &png_meta_size,
+                            &transformed_data, &transformed_size) == 0) {
+                pretransform = PT_PNG;
+                fprintf(stderr, "[HP5] PNG detected: %.2f MB compressed → %.2f MB inflated scanlines\n",
+                        fsize/1048576.0, transformed_size/1048576.0);
+                /* Replace fin with an in-memory stream over the inflated data */
+                fclose(fin);
+                fin = fmemopen(transformed_data, transformed_size, "rb");
+                fsize = (int64_t)transformed_size;
+            }
+        }
+        if (pretransform == PT_NONE) fseek(fin, 0, SEEK_SET);
+    }
+
     int nblocks = (int)((fsize + block_size - 1) / block_size);
     fprintf(stderr, "[HP5] Compressing %s (%.2f MB, %d blocks of %d MB)\n",
             inpath, fsize / 1048576.0, nblocks, block_size >> 20);
@@ -5698,9 +5870,14 @@ static int file_compress(const char *inpath, const char *outpath, int block_size
     FILE *fout = fopen(outpath, "wb");
     if (!fout) { fprintf(stderr, "Cannot create %s\n", outpath); fclose(fin); return 1; }
 
-    /* Write header */
+    /* Write V11 header: MAGIC VERSION PRETRANSFORM [META_SIZE META] BLOCK_SIZE ORIG_SIZE NBLOCKS */
     write32(fout, MAGIC);
     fputc(VERSION, fout);
+    fputc(pretransform, fout);
+    if (pretransform != PT_NONE) {
+        write32(fout, png_meta_size);
+        fwrite(png_meta, 1, png_meta_size, fout);
+    }
     write32(fout, (uint32_t)block_size);
     write64(fout, (uint64_t)fsize);
     write32(fout, (uint32_t)nblocks);
@@ -5741,7 +5918,7 @@ static int file_compress(const char *inpath, const char *outpath, int block_size
             } else {
                 int strat;
                 int csz = compress_block(inbuf, bsz, outbuf, &strat, bwt_ws, cws);
-                uint32_t crc = crc32(inbuf, bsz);
+                uint32_t crc = hp_crc32(inbuf, bsz);
 
                 fputc(0, fout);
                 fputc((uint8_t)strat, fout);
@@ -5866,7 +6043,8 @@ static int file_compress(const char *inpath, const char *outpath, int block_size
     }
 
     double elapsed = (double)(clock() - start) / CLOCKS_PER_SEC;
-    int64_t header_size = 21; /* 4+1+4+8+4 */
+    /* V11 header: MAGIC(4) VERSION(1) PRETRANSFORM(1) [META_SIZE(4) META] BLOCK_SIZE(4) ORIG_SIZE(8) NBLOCKS(4) */
+    int64_t header_size = 6 + (pretransform != PT_NONE ? 4 + (int64_t)png_meta_size : 0) + 16;
     int64_t file_total = header_size + total_comp;
     fprintf(stderr, "[HP5] Done: %lld -> %lld bytes (%.2fx) in %.1fs\n",
             (long long)fsize, (long long)file_total,
@@ -5874,6 +6052,8 @@ static int file_compress(const char *inpath, const char *outpath, int block_size
 
     fclose(fin); fclose(fout);
     free(inbuf); free(outbuf); free(hashes); free(comp_sizes); free(strategies);
+    if (transformed_data) free(transformed_data);
+    if (png_meta) free(png_meta);
     return 0;
 }
 
@@ -5907,7 +6087,7 @@ static void *hp_par_decomp_worker(void *arg) {
         HpParBlock *b = &q->blocks[i];
         if (b->is_dup) continue;
         decompress_block(b->cdata, b->csz, b->strat, b->orig_b, b->outbuf);
-        b->crc_ok = (crc32(b->outbuf, b->orig_b) == b->expected_crc);
+        b->crc_ok = (hp_crc32(b->outbuf, b->orig_b) == b->expected_crc);
     }
     return NULL;
 }
@@ -5922,11 +6102,26 @@ static int file_decompress(const char *inpath, const char *outpath) {
     int ver = fgetc(fin);
     if (ver < 5 || ver > VERSION) { fprintf(stderr, "Unsupported version %d\n", ver); fclose(fin); return 1; }
 
+    /* V11+: read PRETRANSFORM byte and optional metadata */
+    uint8_t pretransform = PT_NONE;
+    uint8_t *png_meta = NULL; uint32_t png_meta_size = 0;
+    if (ver >= 11) {
+        pretransform = (uint8_t)fgetc(fin);
+        if (pretransform == PT_PNG) {
+            png_meta_size = read32(fin);
+            png_meta = (uint8_t*)malloc(png_meta_size > 0 ? png_meta_size : 1);
+            if (!png_meta) { fclose(fin); return 1; }
+            fread(png_meta, 1, png_meta_size, fin);
+        }
+    }
+
     uint32_t block_size = read32(fin);
     uint64_t orig_size  = read64(fin);
     uint32_t nblocks    = read32(fin);
 
-    fprintf(stderr, "[HP5] Decompressing (%.2f MB, %d blocks)\n", orig_size/1048576.0, nblocks);
+    fprintf(stderr, "[HP5] Decompressing (%.2f MB, %d blocks)%s\n",
+            orig_size/1048576.0, nblocks,
+            pretransform == PT_PNG ? " [PNG rebuild]" : "");
 
     FILE *fout = fopen(outpath, "wb");
     if (!fout) { fprintf(stderr, "Cannot create %s\n", outpath); fclose(fin); return 1; }
@@ -6025,7 +6220,32 @@ static int file_decompress(const char *inpath, const char *outpath) {
 
     for (uint32_t b2 = 0; b2 < nblocks; b2++) free(block_cache[b2]);
     free(block_cache); free(block_sizes);
-    fclose(fin); fclose(fout);
+    fclose(fin); fclose(fout); fout = NULL;
+
+    /* PT_PNG post-processing: read back inflated scanlines, rebuild PNG */
+    if (pretransform == PT_PNG && !error) {
+        FILE *ftmp = fopen(outpath, "rb");
+        if (ftmp) {
+            fseek(ftmp, 0, SEEK_END);
+            size_t infl_sz = (size_t)ftell(ftmp);
+            fseek(ftmp, 0, SEEK_SET);
+            uint8_t *infl_buf = (uint8_t*)malloc(infl_sz > 0 ? infl_sz : 1);
+            if (infl_buf && fread(infl_buf, 1, infl_sz, ftmp) == infl_sz) {
+                fclose(ftmp);
+                fprintf(stderr, "[HP5] Rebuilding PNG from %.2f MB inflated scanlines...\n",
+                        infl_sz/1048576.0);
+                error = png_reconstruct(png_meta, png_meta_size, infl_buf, infl_sz, outpath);
+                if (!error) fprintf(stderr, "[HP5] PNG reconstructed successfully\n");
+            } else {
+                fclose(ftmp);
+                error = 1;
+            }
+            free(infl_buf);
+        } else {
+            error = 1;
+        }
+    }
+    if (png_meta) free(png_meta);
     return error;
 }
 
@@ -6337,7 +6557,7 @@ static int archive_compress(int npaths, const char **paths, const char *outpath,
             } else {
                 int strat;
                 int csz = compress_block(inbuf, bsz, outbuf, &strat, bwt_ws, cws);
-                uint32_t blk_crc = crc32(inbuf, bsz);
+                uint32_t blk_crc = hp_crc32(inbuf, bsz);
 
                 fputc(0, fout);
                 fputc(strat, fout);
@@ -6462,7 +6682,7 @@ static int archive_decompress(const char *inpath, const char *outdir,
 
             decompress_block(cbuf, csz, strat, orig_b, dec_outbuf);
 
-            uint32_t actual_crc = crc32(dec_outbuf, orig_b);
+            uint32_t actual_crc = hp_crc32(dec_outbuf, orig_b);
             if (actual_crc != expected_crc) {
                 fprintf(stderr, "  Block %d: CRC MISMATCH! Expected %08X got %08X\n",
                         b+1, expected_crc, actual_crc);
