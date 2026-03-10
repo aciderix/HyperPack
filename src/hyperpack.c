@@ -9,8 +9,6 @@
  * Usage:   ./hyperpack c [-b SIZE_MB] input output.hpk
  *          ./hyperpack d input.hpk output
  */
-/* Expose fmemopen and other POSIX/GNU extensions (required on MinGW-w64) */
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +19,16 @@
 #ifdef _WIN32
 #include <direct.h>
 #define mkdir(path, mode) _mkdir(path)
+/* fmemopen polyfill for Windows: create a self-deleting tmpfile, write buf, rewind */
+static FILE *hp_fmemopen(void *buf, size_t size, const char *mode) {
+    (void)mode;
+    FILE *f = tmpfile();
+    if (!f) return NULL;
+    if (size > 0) fwrite(buf, 1, size, f);
+    rewind(f);
+    return f;
+}
+#define fmemopen hp_fmemopen
 #endif
 #include <sys/types.h>
 #include <dirent.h>
