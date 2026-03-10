@@ -2489,7 +2489,7 @@ static int b64_decode_chunk(const uint8_t *in, int len, uint8_t *out) {
 
 /* Encode to base64. Returns encoded length. */
 static int b64_encode_chunk(const uint8_t *in, int len, uint8_t *out) {
-    static const char *ch = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    static const uint8_t ch[64] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     int j = 0, i;
     for (i = 0; i + 2 < len; i += 3) {
         uint32_t v = ((uint32_t)in[i] << 16) | ((uint32_t)in[i+1] << 8) | in[i+2];
@@ -3000,6 +3000,13 @@ static void decompress_substream(const uint8_t *cdata, int csize, int sub_order,
     free(zrle_s); free(mtf_s); free(bwt_s);
 }
 
+/* Thread helper: decompress one substream in a background thread */
+typedef struct { const uint8_t *cdata; int csize, order, orig_n; uint8_t *out; } SubstreamArg;
+static void *decompress_substream_thread(void *arg) {
+    SubstreamArg *a = (SubstreamArg*)arg;
+    decompress_substream(a->cdata, a->csize, a->order, a->orig_n, a->out);
+    return NULL;
+}
 
 
 /* ===================================================================
@@ -5400,12 +5407,18 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
         b64_decode_pos(p, pos_tbl_sz, runs, n_runs);
         p += pos_tbl_sz;
 
+        /* Decompress skeleton and decoded substreams in parallel (independent) */
+        const uint8_t *sk_data  = p;
+        const uint8_t *dec_data = p + sk_comp_sz;
         uint8_t *skeleton = (uint8_t*)malloc(skel_orig > 0 ? skel_orig : 1);
-        decompress_substream(p, sk_comp_sz, sk_order, skel_orig, skeleton);
-        p += sk_comp_sz;
-
-        uint8_t *decoded = (uint8_t*)malloc(dec_orig > 0 ? dec_orig : 1);
-        decompress_substream(p, dec_comp_sz, dec_order, dec_orig, decoded);
+        uint8_t *decoded  = (uint8_t*)malloc(dec_orig > 0 ? dec_orig : 1);
+        SubstreamArg sarg = {sk_data,  sk_comp_sz,  sk_order,  skel_orig, skeleton};
+        SubstreamArg darg = {dec_data, dec_comp_sz, dec_order, dec_orig,  decoded};
+        pthread_t sth, dth;
+        pthread_create(&sth, NULL, decompress_substream_thread, &sarg);
+        pthread_create(&dth, NULL, decompress_substream_thread, &darg);
+        pthread_join(sth, NULL);
+        pthread_join(dth, NULL);
 
         /* Reconstruct: interleave skeleton and base64-re-encoded data */
         int o = 0, sk = 0, dc = 0, prev_end = 0;
@@ -5436,21 +5449,27 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
         int pos_comp_sz  = get_u32be(p); p += 4;
         int pos_order    = *p++;
 
-        /* Decompress position table */
-        uint8_t *pos_tbl = (uint8_t*)malloc(pos_tbl_orig > 0 ? pos_tbl_orig : 1);
-        decompress_substream(p, pos_comp_sz, pos_order, pos_tbl_orig, pos_tbl);
-        p += pos_comp_sz;
+        /* Decompress all 3 substreams in parallel (pos_tbl, skeleton, decoded are independent) */
+        const uint8_t *pos_data = p;
+        const uint8_t *sk_data  = p + pos_comp_sz;
+        const uint8_t *dec_data = p + pos_comp_sz + sk_comp_sz;
+        uint8_t *pos_tbl  = (uint8_t*)malloc(pos_tbl_orig > 0 ? pos_tbl_orig : 1);
+        uint8_t *skeleton = (uint8_t*)malloc(skel_orig > 0 ? skel_orig : 1);
+        uint8_t *decoded  = (uint8_t*)malloc(dec_orig > 0 ? dec_orig : 1);
+        SubstreamArg parg = {pos_data, pos_comp_sz, pos_order, pos_tbl_orig, pos_tbl};
+        SubstreamArg sarg = {sk_data,  sk_comp_sz,  sk_order,  skel_orig,    skeleton};
+        SubstreamArg darg = {dec_data, dec_comp_sz, dec_order, dec_orig,     decoded};
+        pthread_t pth, sth, dth;
+        pthread_create(&pth, NULL, decompress_substream_thread, &parg);
+        pthread_create(&sth, NULL, decompress_substream_thread, &sarg);
+        pthread_create(&dth, NULL, decompress_substream_thread, &darg);
+        pthread_join(pth, NULL);
+        pthread_join(sth, NULL);
+        pthread_join(dth, NULL);
 
         B64Run *runs = (B64Run*)malloc(n_runs * sizeof(B64Run));
         b64_decode_pos(pos_tbl, pos_tbl_orig, runs, n_runs);
         free(pos_tbl);
-
-        uint8_t *skeleton = (uint8_t*)malloc(skel_orig > 0 ? skel_orig : 1);
-        decompress_substream(p, sk_comp_sz, sk_order, skel_orig, skeleton);
-        p += sk_comp_sz;
-
-        uint8_t *decoded = (uint8_t*)malloc(dec_orig > 0 ? dec_orig : 1);
-        decompress_substream(p, dec_comp_sz, dec_order, dec_orig, decoded);
 
         /* Reconstruct */
         int o = 0, sk = 0, dc = 0, prev_end = 0;
@@ -5810,6 +5829,41 @@ static int file_compress(const char *inpath, const char *outpath, int block_size
     return 0;
 }
 
+/* ===== Parallel Block Decompression Helpers ===== */
+#define HP_PAR_THREADS 4
+
+typedef struct {
+    int is_dup;
+    uint32_t dup_ref;
+    int strat, csz, orig_b;
+    uint32_t expected_crc;
+    uint8_t *cdata;   /* compressed data (malloced, NULL for dup) */
+    uint8_t *outbuf;  /* decompressed output (malloced, NULL for dup) */
+    int crc_ok;
+} HpParBlock;
+
+typedef struct {
+    HpParBlock *blocks;
+    int n;
+    pthread_mutex_t mu;
+    int next;
+} HpParQ;
+
+static void *hp_par_decomp_worker(void *arg) {
+    HpParQ *q = (HpParQ*)arg;
+    for (;;) {
+        pthread_mutex_lock(&q->mu);
+        int i = q->next++;
+        pthread_mutex_unlock(&q->mu);
+        if (i >= q->n) break;
+        HpParBlock *b = &q->blocks[i];
+        if (b->is_dup) continue;
+        decompress_block(b->cdata, b->csz, b->strat, b->orig_b, b->outbuf);
+        b->crc_ok = (crc32(b->outbuf, b->orig_b) == b->expected_crc);
+    }
+    return NULL;
+}
+
 /* ===== File Decompress ===== */
 static int file_decompress(const char *inpath, const char *outpath) {
     FILE *fin = fopen(inpath, "rb");
@@ -5829,47 +5883,91 @@ static int file_decompress(const char *inpath, const char *outpath) {
     FILE *fout = fopen(outpath, "wb");
     if (!fout) { fprintf(stderr, "Cannot create %s\n", outpath); fclose(fin); return 1; }
 
-    uint8_t *outbuf = (uint8_t*)malloc(block_size);
-    uint8_t *cbuf   = (uint8_t*)malloc(block_size + block_size/4 + 4096);
-
     /* Store decompressed blocks for dedup references */
     uint8_t **block_cache = (uint8_t**)calloc(nblocks, sizeof(uint8_t*));
     int *block_sizes = (int*)calloc(nblocks, sizeof(int));
 
     clock_t start = clock();
+    int error = 0;
 
-    for (uint32_t b = 0; b < nblocks; b++) {
-        int flags = fgetc(fin);
-        if (flags & 1) {
-            /* Duplicate */
-            uint32_t ref = read32(fin);
-            fwrite(block_cache[ref], 1, block_sizes[ref], fout);
-            block_cache[b] = (uint8_t*)malloc(block_sizes[ref]);
-            memcpy(block_cache[b], block_cache[ref], block_sizes[ref]);
-            block_sizes[b] = block_sizes[ref];
-            fprintf(stderr, "  Block %d/%d: DUP of %d\n", b+1, nblocks, ref+1);
-        } else {
-            int strat  = fgetc(fin);
-            int csz    = (int)read32(fin);
-            int orig_b = (int)read32(fin);
-            uint32_t expected_crc = read32(fin);
-            fread(cbuf, 1, csz, fin);
-
-            decompress_block(cbuf, csz, strat, orig_b, outbuf);
-
-            uint32_t actual_crc = crc32(outbuf, orig_b);
-            if (actual_crc != expected_crc) {
-                fprintf(stderr, "  Block %d: CRC MISMATCH! Expected %08X got %08X\n",
-                        b+1, expected_crc, actual_crc);
-                fclose(fin); fclose(fout); return 1;
+    /* Process blocks in parallel batches of HP_PAR_THREADS.
+     * Non-dup blocks within a batch are decompressed simultaneously.
+     * Dup blocks (fast memcpy) are handled after their batch's threads join. */
+    HpParBlock batch[HP_PAR_THREADS];
+    uint32_t b = 0;
+    while (b < nblocks && !error) {
+        /* Fill batch */
+        int bsz = 0;
+        while (bsz < HP_PAR_THREADS && b < nblocks) {
+            HpParBlock *pb = &batch[bsz];
+            int flags = fgetc(fin);
+            pb->is_dup = (flags & 1);
+            pb->cdata  = NULL;
+            pb->outbuf = NULL;
+            pb->crc_ok = 0;
+            if (pb->is_dup) {
+                pb->dup_ref = read32(fin);
+            } else {
+                pb->strat  = fgetc(fin);
+                pb->csz    = (int)read32(fin);
+                pb->orig_b = (int)read32(fin);
+                pb->expected_crc = read32(fin);
+                pb->cdata  = (uint8_t*)malloc(pb->csz);
+                pb->outbuf = (uint8_t*)malloc(pb->orig_b > 0 ? pb->orig_b : 1);
+                fread(pb->cdata, 1, pb->csz, fin);
             }
+            bsz++;
+            b++;
+        }
 
-            fwrite(outbuf, 1, orig_b, fout);
-            block_cache[b] = (uint8_t*)malloc(orig_b);
-            memcpy(block_cache[b], outbuf, orig_b);
-            block_sizes[b] = orig_b;
-            fprintf(stderr, "  Block %d/%d: %d -> %d [%s] CRC OK\n",
-                    b+1, nblocks, csz, orig_b, strat_names[strat]);
+        /* Launch parallel decompression for non-dup blocks in this batch */
+        HpParQ q;
+        q.blocks = batch;
+        q.n = bsz;
+        q.next = 0;
+        pthread_mutex_init(&q.mu, NULL);
+        int nt = bsz < HP_PAR_THREADS ? bsz : HP_PAR_THREADS;
+        pthread_t threads[HP_PAR_THREADS];
+        for (int t = 0; t < nt; t++)
+            pthread_create(&threads[t], NULL, hp_par_decomp_worker, &q);
+        for (int t = 0; t < nt; t++)
+            pthread_join(threads[t], NULL);
+        pthread_mutex_destroy(&q.mu);
+
+        /* Write batch output in order, handle dup blocks */
+        uint32_t base_b = b - bsz;
+        for (int i = 0; i < bsz; i++) {
+            HpParBlock *pb = &batch[i];
+            uint32_t blk_idx = base_b + (uint32_t)i;
+            if (pb->is_dup) {
+                uint32_t ref = pb->dup_ref;
+                fwrite(block_cache[ref], 1, block_sizes[ref], fout);
+                block_cache[blk_idx] = (uint8_t*)malloc(block_sizes[ref]);
+                memcpy(block_cache[blk_idx], block_cache[ref], block_sizes[ref]);
+                block_sizes[blk_idx] = block_sizes[ref];
+                fprintf(stderr, "  Block %d/%d: DUP of %d\n", blk_idx+1, nblocks, ref+1);
+            } else {
+                if (!pb->crc_ok) {
+                    fprintf(stderr, "  Block %d: CRC MISMATCH!\n", blk_idx+1);
+                    error = 1;
+                }
+                fwrite(pb->outbuf, 1, pb->orig_b, fout);
+                block_cache[blk_idx] = pb->outbuf;  /* transfer ownership */
+                pb->outbuf = NULL;
+                block_sizes[blk_idx] = pb->orig_b;
+                fprintf(stderr, "  Block %d/%d: %d -> %d [%s] CRC %s\n",
+                        blk_idx+1, nblocks, pb->csz, pb->orig_b,
+                        strat_names[pb->strat], pb->crc_ok ? "OK" : "FAIL");
+                free(pb->cdata);
+                pb->cdata = NULL;
+            }
+        }
+        /* Free any unwritten outbufs on error */
+        if (error) {
+            for (int i = 0; i < bsz; i++) {
+                if (batch[i].cdata)  free(batch[i].cdata);
+                if (batch[i].outbuf) free(batch[i].outbuf);
+            }
         }
     }
 
@@ -5877,11 +5975,10 @@ static int file_decompress(const char *inpath, const char *outpath) {
     fprintf(stderr, "[HP5] Decompressed in %.1fs (%.1f MB/s)\n",
             elapsed, orig_size / 1048576.0 / (elapsed > 0.001 ? elapsed : 0.001));
 
-    for (uint32_t b = 0; b < nblocks; b++) free(block_cache[b]);
+    for (uint32_t b2 = 0; b2 < nblocks; b2++) free(block_cache[b2]);
     free(block_cache); free(block_sizes);
-    free(outbuf); free(cbuf);
     fclose(fin); fclose(fout);
-    return 0;
+    return error;
 }
 
 /* ===== HPK6 Archive Functions ===== */
