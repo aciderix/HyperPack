@@ -6,6 +6,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Needed for deploy-pages job
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
 jobs:
   # ─── Linux x86-64 ────────────────────────────────────────────────────────
   build-linux:
@@ -256,3 +262,45 @@ jobs:
             hyperpack-web/src-tauri/target/release/bundle/nsis/*.exe
             hyperpack-web/src-tauri/target/release/bundle/msi/*.msi
           if-no-files-found: ignore
+
+  # ─── GitHub Pages ─────────────────────────────────────────────────────────
+  deploy-pages:
+    name: Deploy to GitHub Pages
+    runs-on: ubuntu-latest
+    # Only deploy on push to main/master — not on PRs or feature branches
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    needs: [build-wasm]
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: '3.1.74'
+          actions-cache-folder: emsdk-cache
+
+      - name: Build WASM
+        run: bash build-wasm.sh
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install frontend deps
+        run: cd hyperpack-web && npm install
+
+      - name: Build frontend for GitHub Pages
+        run: cd hyperpack-web && GITHUB_PAGES=1 npm run build
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: hyperpack-web/dist/
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
