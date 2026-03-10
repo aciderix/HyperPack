@@ -5,11 +5,11 @@ fn main() {
         .opt_level(2)
         .flag_if_supported("-w"); // suppress warnings
 
-    // On Windows with the MSVC Rust toolchain, hyperpack.c uses POSIX headers
-    // (dirent.h, pthread.h, unistd.h) that cl.exe does not provide.
-    // MinGW-w64 gcc must be on PATH (added by CI; for local builds, install MSYS2
-    // or choco install mingw). We set the compiler explicitly here so that other
-    // cc-compiled crates (vswhom-sys, etc.) are unaffected.
+    // hyperpack.c uses POSIX APIs (dirent.h, pthread.h, unistd.h).
+    // On Windows we require the x86_64-pc-windows-gnu Rust toolchain so that
+    // MinGW gcc + linker are used throughout and POSIX symbols resolve correctly.
+    // The .compiler() call is a safety net; with the GNU toolchain cc already
+    // picks up MinGW's gcc from PATH automatically.
     if cfg!(target_os = "windows") {
         build.compiler("gcc");
     }
@@ -17,11 +17,12 @@ fn main() {
     build.compile("hyperpacklib");
 
     // Link platform-specific system libraries
-    if cfg!(target_os = "macos") {
-        // libm is part of libSystem on macOS; pthreads bundled in libSystem too
-        // — no explicit link needed.
-    } else if cfg!(target_os = "windows") {
-        // pthreads and libm are bundled in MinGW's libgcc/msvcrt — no explicit link.
+    if cfg!(target_os = "windows") {
+        // With x86_64-pc-windows-gnu, MinGW pthreads must be linked explicitly.
+        println!("cargo:rustc-link-lib=pthread");
+    } else if cfg!(target_os = "macos") {
+        // libm is part of libSystem; pthreads are bundled too — no explicit link.
+        println!("cargo:rustc-link-lib=pthread");
     } else {
         // Linux / other POSIX
         println!("cargo:rustc-link-lib=pthread");

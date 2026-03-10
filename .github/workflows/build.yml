@@ -203,39 +203,44 @@ jobs:
           path: hyperpack-web/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
 
   # ─── Tauri desktop app (Windows) ──────────────────────────────────────────
+  # hyperpack.c uses POSIX APIs (pthread, dirent, unistd) that are only available
+  # via MinGW-w64. We therefore use the x86_64-pc-windows-gnu Rust toolchain so
+  # that both the C library and Rust code share the same GNU/MinGW ABI throughout.
+  # MSVC link.exe cannot link MinGW-compiled objects (unresolved pthread, dirent…).
   build-tauri-windows:
     name: Tauri (Windows x86-64)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      # MinGW-w64 is required to compile the POSIX C engine (dirent.h, pthread.h, unistd.h)
       - name: Install MinGW-w64 via MSYS2
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
           update: false
-          install: mingw-w64-x86_64-gcc
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-pthread
+
+      - name: Add MinGW-w64 to PATH
+        shell: pwsh
+        run: Add-Content $env:GITHUB_PATH "C:\msys64\mingw64\bin"
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Setup Rust (MSVC toolchain)
+      # Use the GNU Rust toolchain so the MinGW-compiled C library links correctly.
+      # Tauri 2 supports x86_64-pc-windows-gnu and uses NSIS (not WiX) for bundling.
+      - name: Setup Rust (GNU toolchain)
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-gnu
+          targets: x86_64-pc-windows-gnu
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: hyperpack-web/src-tauri
-
-      - name: Add MinGW-w64 to PATH
-        # build.rs calls .compiler("gcc") explicitly so only our C code uses MinGW.
-        # We do NOT set CC/AR env vars globally to avoid breaking other cc crates
-        # (vswhom-sys, etc.) that expect MSVC tools.
-        shell: pwsh
-        run: Add-Content $env:GITHUB_PATH "C:\msys64\mingw64\bin"
 
       - name: Install frontend deps
         run: cd hyperpack-web && npm install
@@ -246,4 +251,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: hyperpack-tauri-windows
-          path: hyperpack-web/src-tauri/target/release/bundle/msi/*.msi
+          # GNU toolchain produces NSIS (.exe) instead of WiX (.msi)
+          path: |
+            hyperpack-web/src-tauri/target/release/bundle/nsis/*.exe
+            hyperpack-web/src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: ignore
