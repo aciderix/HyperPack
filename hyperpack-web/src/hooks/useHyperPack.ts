@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { CompressParams, FileEntry, WorkerResponse } from '../workers/bridge';
+import * as native from '../lib/native';
 
 export type HyperPackStatus = 'idle' | 'processing' | 'complete' | 'error';
 
@@ -22,6 +23,7 @@ export type HyperPackResult = {
   blocks: Array<{ strategy: string; inputSize: number; outputSize: number }>;
   outputBuffer: ArrayBuffer;
   outputFileName: string;
+  outputPath?: string;   // native mode: absolute path to output file
   fileCount?: number;
   dedupCount?: number;
   dedupSaved?: number;
@@ -142,14 +144,50 @@ export function useHyperPack() {
   const compress = useCallback(async (files: FileEntry[], params: CompressParams) => {
     setStatus('processing');
     setError(null);
-    setProgress({ percent: 0, currentBlock: 0, totalBlocks: 1, strategy: 'Initializing WASM...', speed: 0, eta: 0 });
+    setProgress({ percent: 0, currentBlock: 0, totalBlocks: 1, strategy: 'Initializing...', speed: 0, eta: 0 });
     setResult(null);
-
     startTimeRef.current = Date.now();
 
+    // ── Native (Tauri) path ──────────────────────────────────────────────
+    if (native.isNative()) {
+      try {
+        const isArchive = params.archiveMode || files.length > 1;
+        const inputPath = files[0]?.path ?? '';
+        const outputPath = inputPath
+          ? native.defaultCompressOutput(inputPath)
+          : '';
+
+        let res: native.NativeCompressResult;
+        if (isArchive) {
+          const paths = files.map((f) => f.path ?? f.name).filter(Boolean);
+          res = await native.archiveCompress(paths, outputPath, params.blockSizeMB, params.nthreads);
+        } else {
+          res = await native.compress(inputPath, outputPath, params.blockSizeMB, params.nthreads);
+        }
+
+        setStatus('complete');
+        setProgress(null);
+        setResult({
+          inputSize: res.inputBytes,
+          outputSize: res.outputBytes,
+          ratio: res.ratio,
+          totalMs: res.elapsedMs,
+          blocks: [],
+          outputBuffer: new ArrayBuffer(0),
+          outputFileName: outputPath.split(/[\\/]/).pop() ?? 'output.hpk',
+          outputPath: res.outputPath,
+        });
+      } catch (err) {
+        setStatus('error');
+        setError(String(err));
+        setProgress(null);
+      }
+      return;
+    }
+
+    // ── WASM (browser) path ──────────────────────────────────────────────
     await ensureWorkerReady();
 
-    // Determine output name
     let outputName: string;
     if (params.archiveMode || files.length > 1) {
       outputName = 'archive.hpk';
@@ -159,30 +197,56 @@ export function useHyperPack() {
       outputName = 'output.hpk';
     }
 
-    workerRef.current?.postMessage({
-      type: 'compress',
-      files,
-      params,
-      outputName,
-    });
+    workerRef.current?.postMessage({ type: 'compress', files, params, outputName });
   }, [ensureWorkerReady]);
 
   const decompress = useCallback(async (file: File) => {
     setStatus('processing');
     setError(null);
-    setProgress({ percent: 0, currentBlock: 0, totalBlocks: 1, strategy: 'Initializing WASM...', speed: 0, eta: 0 });
+    setProgress({ percent: 0, currentBlock: 0, totalBlocks: 1, strategy: 'Initializing...', speed: 0, eta: 0 });
     setResult(null);
-
     startTimeRef.current = Date.now();
 
-    await ensureWorkerReady();
+    // ── Native (Tauri) path ──────────────────────────────────────────────
+    if (native.isNative()) {
+      try {
+        // file.path is set by App.tsx in native mode
+        const inputPath = (file as File & { nativePath?: string }).nativePath ?? '';
+        const fmt = await native.detectFormat(inputPath);
+        let res: native.NativeDecompressResult;
 
+        if (fmt === 6) {
+          const outputDir = native.defaultDecompressDir(inputPath);
+          res = await native.archiveDecompress(inputPath, outputDir);
+        } else {
+          const outputPath = native.defaultDecompressOutput(inputPath);
+          res = await native.decompress(inputPath, outputPath);
+        }
+
+        setStatus('complete');
+        setProgress(null);
+        setResult({
+          inputSize: res.inputBytes,
+          outputSize: res.outputBytes,
+          ratio: res.inputBytes / Math.max(res.outputBytes, 1),
+          totalMs: res.elapsedMs,
+          blocks: [],
+          outputBuffer: new ArrayBuffer(0),
+          outputFileName: res.outputPath.split(/[\\/]/).pop() ?? 'output',
+          outputPath: res.outputPath,
+        });
+      } catch (err) {
+        setStatus('error');
+        setError(String(err));
+        setProgress(null);
+      }
+      return;
+    }
+
+    // ── WASM (browser) path ──────────────────────────────────────────────
+    await ensureWorkerReady();
     const fileBuffer = await file.arrayBuffer();
-    workerRef.current?.postMessage({
-      type: 'decompress',
-      file: fileBuffer,
-      name: file.name,
-    });
+    workerRef.current?.postMessage({ type: 'decompress', file: fileBuffer, name: file.name });
   }, [ensureWorkerReady]);
 
   const listArchive = useCallback(async (file: File) => {

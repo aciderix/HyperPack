@@ -1,6 +1,7 @@
 import { useCallback, useState, useRef } from 'react';
 import { UploadCloud, FolderOpen } from 'lucide-react';
 import { FileEntry } from '../workers/bridge';
+import * as native from '../lib/native';
 
 interface DropZoneProps {
   onFiles: (files: FileEntry[]) => void;
@@ -57,6 +58,32 @@ export function DropZone({ onFiles }: DropZoneProps) {
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
+  const isNativeMode = native.isNative();
+
+  // Native: open file dialog and build FileEntry with path (no data read)
+  const handleNativeBrowseFiles = useCallback(async () => {
+    const paths = await native.openFilePicker({ multiple: true });
+    if (!paths || paths.length === 0) return;
+    const entries: FileEntry[] = paths.map((p) => ({
+      name: p.split(/[\\/]/).pop() ?? p,
+      data: new ArrayBuffer(0),
+      size: 0, // size not known without stat; will be reported by native engine
+      path: p,
+    }));
+    onFiles(entries);
+  }, [onFiles]);
+
+  const handleNativeBrowseFolder = useCallback(async () => {
+    const path = await native.openFolderPicker();
+    if (!path) return;
+    const entry: FileEntry = {
+      name: path.split(/[\\/]/).pop() ?? path,
+      data: new ArrayBuffer(0),
+      size: 0,
+      path,
+    };
+    onFiles([entry]);
+  }, [onFiles]);
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -123,6 +150,39 @@ export function DropZone({ onFiles }: DropZoneProps) {
     }
   }, [onFiles]);
 
+  // Native mode: simple dialog buttons (no drag-drop needed)
+  if (isNativeMode) {
+    return (
+      <div className="relative flex flex-col items-center justify-center p-12 border-2 border-dashed rounded-xl border-hp-border bg-hp-card">
+        <UploadCloud className="w-12 h-12 mb-4 text-hp-muted" />
+        <h3 className="text-lg font-medium text-hp-text mb-1">Select files to compress or decompress</h3>
+        <p className="text-hp-muted mb-6">Native mode — no size limit, fully multi-threaded</p>
+        <div className="flex gap-3">
+          <button
+            type="button"
+            onClick={handleNativeBrowseFiles}
+            className="flex items-center gap-2 px-5 py-2.5 text-sm font-medium text-white bg-hp-accent hover:bg-hp-accent-hover rounded-lg transition-colors"
+          >
+            <UploadCloud className="w-4 h-4" />
+            Browse files
+          </button>
+          <button
+            type="button"
+            onClick={handleNativeBrowseFolder}
+            className="flex items-center gap-2 px-5 py-2.5 text-sm font-medium text-hp-accent bg-hp-accent/10 hover:bg-hp-accent/20 border border-hp-accent/30 rounded-lg transition-colors"
+          >
+            <FolderOpen className="w-4 h-4" />
+            Browse folder (HPK6)
+          </button>
+        </div>
+        <p className="text-xs text-hp-muted/70 text-center mt-4">
+          Single file → HPK5 &nbsp;|&nbsp; Folder / multiple files → HPK6 Archive
+        </p>
+      </div>
+    );
+  }
+
+  // Web / WASM mode: standard drag-drop
   return (
     <div
       className={`relative flex flex-col items-center justify-center p-12 border-2 border-dashed rounded-xl transition-all duration-300 cursor-pointer

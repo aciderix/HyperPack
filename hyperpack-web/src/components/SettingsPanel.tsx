@@ -1,5 +1,6 @@
 import { X } from 'lucide-react';
 import { CompressParams } from '../workers/bridge';
+import * as native from '../lib/native';
 
 interface SettingsPanelProps {
   isOpen: boolean;
@@ -10,6 +11,7 @@ interface SettingsPanelProps {
 
 export function SettingsPanel({ isOpen, onClose, settings, onSettingsChange }: SettingsPanelProps) {
   if (!isOpen) return null;
+  const isNativeMode = native.isNative();
 
   return (
     <div 
@@ -81,16 +83,41 @@ export function SettingsPanel({ isOpen, onClose, settings, onSettingsChange }: S
             </p>
           </div>
 
-          {/* WASM limitations note */}
+          {/* Threads (native only) */}
+          {isNativeMode && (
+            <div className="space-y-2">
+              <label className="block text-sm font-medium text-hp-text">
+                Threads
+                <span className="ml-2 text-hp-muted font-normal">
+                  {settings.nthreads === 0 ? '(auto)' : `${settings.nthreads} thread${settings.nthreads > 1 ? 's' : ''}`}
+                </span>
+              </label>
+              <input
+                type="range"
+                min={0}
+                max={navigator.hardwareConcurrency || 16}
+                value={settings.nthreads}
+                onChange={(e) => onSettingsChange({ ...settings, nthreads: Number(e.target.value) })}
+                className="w-full accent-hp-accent"
+              />
+              <p className="text-xs text-hp-muted">
+                0 = auto-detect (uses all available cores). Higher = faster on multi-block files.
+              </p>
+            </div>
+          )}
+
+          {/* Engine info */}
           <div className="p-4 bg-hp-accent/5 rounded-xl border border-hp-accent/20 space-y-2">
             <div className="flex items-center gap-2">
-              <span className="text-lg">🌐</span>
-              <span className="text-sm font-medium text-hp-text">Browser Engine</span>
+              <span className="text-lg">{isNativeMode ? '⚡' : '🌐'}</span>
+              <span className="text-sm font-medium text-hp-text">
+                {isNativeMode ? 'Native Engine' : 'Browser Engine'}
+              </span>
             </div>
             <p className="text-xs text-hp-muted leading-relaxed">
-              This runs the full HyperPack Quantum v11 engine compiled to WebAssembly. 
-              Processing is single-threaded in the browser. For maximum performance on large files, 
-              use the native CLI: <code className="text-hp-accent">./hyperpack c -j 8 input output.hpk</code>
+              {isNativeMode
+                ? 'Full multi-threaded HyperPack engine running natively. No file size limits. Output is saved directly to disk next to the input file.'
+                : 'HyperPack engine compiled to WebAssembly. Processing is single-threaded in the browser. For large files, use the native desktop app or CLI.'}
             </p>
           </div>
         </div>

@@ -6613,7 +6613,7 @@ static int archive_list(const char *inpath) {
 }
 
 /* ===== Main ===== */
-#ifndef HYPERPACK_WASM
+#if !defined(HYPERPACK_WASM) && !defined(HYPERPACK_LIB)
 int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr,
@@ -6732,4 +6732,4 @@ int main(int argc, char **argv) {
         return 1;
     }
 }
-#endif /* HYPERPACK_WASM */
+#endif /* !HYPERPACK_WASM && !HYPERPACK_LIB */

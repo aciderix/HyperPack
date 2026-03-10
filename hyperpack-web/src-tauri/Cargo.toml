@@ -1,0 +1,21 @@
+[package]
+name = "hyperpack"
+version = "0.1.0"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+cc = "1"
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

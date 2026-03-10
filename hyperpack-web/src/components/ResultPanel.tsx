@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef } from 'react';
-import { Download, RefreshCw, CheckCircle2 } from 'lucide-react';
+import { Download, RefreshCw, CheckCircle2, FolderOpen } from 'lucide-react';
 import { HyperPackResult } from '../hooks/useHyperPack';
+import * as native from '../lib/native';
 
 interface ResultPanelProps {
   result: HyperPackResult;
@@ -145,13 +146,25 @@ export function ResultPanel({ result, mode, onDownload, onReset }: ResultPanelPr
       )}
       
       <div className="flex gap-3 pt-2">
-        <button
-          onClick={onDownload}
-          className="flex-1 flex items-center justify-center gap-2 py-3 bg-hp-accent hover:bg-hp-accent-hover text-white rounded-lg font-medium transition-colors"
-        >
-          <Download className="w-5 h-5" />
-          Download {isCompress ? '.hpk' : ''}
-        </button>
+        {result.outputPath ? (
+          /* Native mode: reveal output in file manager */
+          <button
+            onClick={() => native.revealInFinder(result.outputPath!)}
+            className="flex-1 flex items-center justify-center gap-2 py-3 bg-hp-accent hover:bg-hp-accent-hover text-white rounded-lg font-medium transition-colors"
+          >
+            <FolderOpen className="w-5 h-5" />
+            Show in {navigator.userAgent.includes('Mac') ? 'Finder' : 'Explorer'}
+          </button>
+        ) : (
+          /* Web / WASM mode: download */
+          <button
+            onClick={onDownload}
+            className="flex-1 flex items-center justify-center gap-2 py-3 bg-hp-accent hover:bg-hp-accent-hover text-white rounded-lg font-medium transition-colors"
+          >
+            <Download className="w-5 h-5" />
+            Download {isCompress ? '.hpk' : ''}
+          </button>
+        )}
         <button
           onClick={onReset}
           className="flex items-center justify-center gap-2 px-6 py-3 bg-hp-hover hover:bg-hp-border text-hp-text rounded-lg font-medium transition-colors"

@@ -3,12 +3,14 @@
 export interface CompressParams {
   blockSizeMB: number;
   archiveMode: boolean; // true = HPK6 multi-file, false = HPK5 single file
+  nthreads: number;     // 0 = auto (native only, ignored in WASM)
 }
 
 export interface FileEntry {
-  name: string;        // relative path (e.g. "mydir/subdir/file.txt")
-  data: ArrayBuffer;   // file content
-  size: number;        // original size
+  name: string;         // relative path (e.g. "mydir/subdir/file.txt")
+  data: ArrayBuffer;    // file content (empty in native mode)
+  size: number;         // original size in bytes
+  path?: string;        // absolute filesystem path (native mode only)
 }
 
 export type WorkerRequest =

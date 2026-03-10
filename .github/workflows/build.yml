@@ -122,3 +122,113 @@ jobs:
         with:
           name: hyperpack-web-dist
           path: hyperpack-web/dist/
+
+  # ─── Tauri desktop app (Linux) ────────────────────────────────────────────
+  build-tauri-linux:
+    name: Tauri (Linux x86-64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hyperpack-web/src-tauri
+
+      - name: Install frontend deps
+        run: cd hyperpack-web && npm install
+
+      - name: Build Tauri app
+        run: cd hyperpack-web && npm run tauri build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperpack-tauri-linux
+          path: |
+            hyperpack-web/src-tauri/target/release/bundle/deb/*.deb
+            hyperpack-web/src-tauri/target/release/bundle/appimage/*.AppImage
+            hyperpack-web/src-tauri/target/release/hyperpack
+
+  # ─── Tauri desktop app (macOS) ────────────────────────────────────────────
+  build-tauri-macos:
+    name: Tauri (macOS universal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Rust (universal targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hyperpack-web/src-tauri
+
+      - name: Install frontend deps
+        run: cd hyperpack-web && npm install
+
+      - name: Build Tauri app (universal)
+        run: cd hyperpack-web && npm run tauri build -- --target universal-apple-darwin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperpack-tauri-macos
+          path: hyperpack-web/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+
+  # ─── Tauri desktop app (Windows) ──────────────────────────────────────────
+  build-tauri-windows:
+    name: Tauri (Windows x86-64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hyperpack-web/src-tauri
+
+      - name: Install frontend deps
+        run: cd hyperpack-web && npm install
+
+      - name: Build Tauri app
+        run: cd hyperpack-web && npm run tauri build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperpack-tauri-windows
+          path: hyperpack-web/src-tauri/target/release/bundle/msi/*.msi
