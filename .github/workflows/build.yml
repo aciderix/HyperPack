@@ -218,7 +218,7 @@ jobs:
         with:
           msystem: MINGW64
           update: false
-          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-pthread
+          install: mingw-w64-x86_64-gcc
 
       - name: Add MinGW-w64 to PATH
         shell: pwsh
