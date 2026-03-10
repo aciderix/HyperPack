@@ -186,6 +186,19 @@ export default function App() {
               <FileInfo files={files} onClear={handleClearFile} />
             )}
 
+            {status === 'processing' && !progress && (
+              <div className="p-5 bg-hp-card border border-hp-border rounded-xl">
+                <div className="flex justify-between items-center mb-3">
+                  <h4 className="text-hp-text font-medium">
+                    {mode === 'compress' ? 'Compressing' : 'Decompressing'}...
+                  </h4>
+                  <span className="text-sm text-hp-muted">Initializing…</span>
+                </div>
+                <div className="h-3 w-full bg-hp-bg rounded-full overflow-hidden">
+                  <div className="h-full progress-shimmer rounded-full w-full animate-pulse" />
+                </div>
+              </div>
+            )}
             {status === 'processing' && progress && (
               <ProgressBar progress={progress} mode={mode} />
             )}

@@ -197,6 +197,7 @@ export function DropZone({ onFiles }: DropZoneProps) {
         className="hidden"
         ref={fileInputRef}
         onChange={handleFileInput}
+        onClick={(e) => e.stopPropagation()}
         multiple
       />
       <input
@@ -204,6 +205,7 @@ export function DropZone({ onFiles }: DropZoneProps) {
         className="hidden"
         ref={folderInputRef}
         onChange={handleFolderInput}
+        onClick={(e) => e.stopPropagation()}
         // eslint-disable-next-line @typescript-eslint/ban-ts-comment
         {...{ webkitdirectory: '', directory: '' } as Record<string, string>}
         multiple

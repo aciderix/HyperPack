@@ -105,9 +105,10 @@ function compressArchive(files, params, outName) {
   const outPath = '/output.hpk';
   cleanupMemfs([outPath]);
 
-  // Remove old input dir
+  // Remove old input dir and recreate it fresh
   try { Module.FS.rmdir(dirName); } catch (e) {}
   removeRecursive(dirName);
+  try { Module.FS.mkdir(dirName); } catch (e) {}
 
   // Write all files to MEMFS directory structure
   let totalSize = 0;
