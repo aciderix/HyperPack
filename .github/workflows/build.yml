@@ -64,7 +64,7 @@ jobs:
         with:
           msystem: MINGW64
           update: false
-          install: mingw-w64-x86_64-gcc
+          install: mingw-w64-x86_64-gcc diffutils
 
       - name: Build
         run: gcc -O2 -Wall -o hyperpack.exe src/hyperpack.c -lm -lpthread
