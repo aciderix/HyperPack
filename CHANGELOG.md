@@ -2,6 +2,23 @@
 
 All notable changes to HyperPack are documented in this file.
 
+## [v12] — 2026-03-10
+
+### Speed — Parallel Decompression
+
+- **Parallel Base64 V1 substreams**: S_BASE64 decompression now launches 2 concurrent pthreads — one for skeleton, one for decoded — then joins before reconstruction. Independent substreams with no data dependencies.
+- **Parallel Base64 V2 substreams**: S_BASE64_V2 launches 3 concurrent pthreads (pos_tbl, skeleton, decoded simultaneously). Expected ~2-3× speedup for Base64-heavy files (e.g. classes.js).
+- **Parallel block decompression**: `file_decompress` now processes blocks in batches of 4 (HP_PAR_THREADS). Non-dup blocks within a batch are decompressed simultaneously. DUP blocks handled sequentially after thread join. Measured **~2.9× speedup** on 22-block files, **~3× on 11-block files**.
+- **b64_encode_chunk**: Changed char pointer lookup to `static const uint8_t[64]` array — avoids pointer indirection, improves icache behavior.
+
+### Regression Results
+- Calgary: 3.841× (no change)
+- Silesia: 4.574× (no regression)
+- Canterbury: 0 failures
+- All roundtrip diffs pass
+
+---
+
 ## [v11] — 2025-03-09
 
 ### Phase 1 — Small Block Compression

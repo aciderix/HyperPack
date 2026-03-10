@@ -16,14 +16,16 @@
 #include <time.h>
 #include <math.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#define mkdir(path, mode) _mkdir(path)
+#endif
 #include <sys/types.h>
 #include <dirent.h>
 #include <errno.h>
-#ifndef HYPERPACK_WASM
 #include <pthread.h>
-#else
-/* WASM build: stub out pthreads (single-threaded only) */
-typedef int pthread_t;
+#ifdef HYPERPACK_WASM
+/* WASM build: prevent thread creation; mutex/join are no-ops via Emscripten stubs */
 static inline int pthread_create_stub(pthread_t *t, const void *a, void *(*f)(void*), void *arg)
     { (void)t;(void)a;(void)f;(void)arg; return -1; }
 static inline int pthread_join_stub(pthread_t t, void **r) { (void)t;(void)r; return 0; }
@@ -62,7 +64,12 @@ enum Strategy {
     S_PPM=16, S_BWT_PPM=17, S_BWT_MTF_PPM=18, S_AUDIO=19, S_BASE64=20, S_BASE64_V2=21,
     S_LZ77_O0=22, S_LZ77_O1=23,
     S_LZMA=24,
-    S_BCJ_LZMA=25
+    S_BCJ_LZMA=25,
+    S_F32_BWT=26,  /* IEEE 754 float32 XOR-delta → BWT+RC */
+    S_BWT_O0_PS=27, /* BWT+RC O0 with pre-scanned frequency table (cold-start fix) */
+    S_BWT_RANS=28,  /* BWT+rANS O0 (table-based decode, same ratio as O0_PS) */
+    S_BWT_CTX2=29,  /* BWT+RC 2-context O0 (run-ctx vs literal-ctx models) */
+    S_BWT_O1_PS=30  /* BWT+RC O1 with pre-scanned global freq init (warm start) */
 };
 static const char *strat_names[] = {
     "STORE","BWT+O0","BWT+O1","D+BWT+O0","D+BWT+O1",
@@ -72,7 +79,12 @@ static const char *strat_names[] = {
     "PPM","BWT+PPM","BWT+MTF+PPM","Audio", "Base64", "Base64v2",
     "LZ77+BWT+O0","LZ77+BWT+O1",
     "LZMA",
-    "BCJ+LZMA"
+    "BCJ+LZMA",
+    "F32XOR+BWT",
+    "BWT+O0PS",
+    "BWT+rANS",
+    "BWT+CTX2",
+    "BWT+O1PS"
 };
 
 /* ===== HPK6 Archive Structures ===== */
@@ -711,6 +723,412 @@ static void arith_dec_o2(const uint8_t *in, int nsyms, uint16_t *out) {
     free(models);
 }
 
+/* ===== Arithmetic Coding O0 with Pre-Scanned frequency table (S_BWT_O0_PS) =====
+ *
+ * Root cause of HP's 2-3% gap vs bzip2 on small text files:
+ *  1. Cold-start: model starts uniform (1/258 per symbol), wastes bits during
+ *     the first ~16K symbols while converging to the true distribution.
+ *  2. Dead symbols: ~200 of 258 ZRLE symbols never appear; their constant
+ *     freq=1 permanently "steals" ~2% of probability mass from active symbols.
+ *
+ * Fix: one forward pass to count actual frequencies, then store a 258-byte
+ * normalized frequency table at the start of the compressed stream.  Both
+ * encoder and decoder initialise the model from this table, so the coder
+ * starts with near-optimal probabilities and active symbols share 100% of the
+ * probability mass.  Overhead: ZRLE_ALPHA (258) bytes per BWT block.
+ *
+ * Format: [258 bytes freq_table | range-coded stream]
+ *   freq_table[i] = 0          → symbol i never appears (excluded from model)
+ *   freq_table[i] = 1..255     → proportional initial weight (scaled so that
+ *                                 the most-frequent symbol gets 255)
+ */
+static int arith_enc_o0_ps(const uint16_t *syms, int nsyms, uint8_t *out) {
+    /* Phase 1: count raw frequencies */
+    int count[ZRLE_ALPHA];
+    memset(count, 0, sizeof(count));
+    for (int i = 0; i < nsyms; i++) count[syms[i]]++;
+
+    /* Scale to uint8_t [1..255] for seen symbols, 0 for never-seen */
+    int maxcount = 0;
+    for (int i = 0; i < ZRLE_ALPHA; i++)
+        if (count[i] > maxcount) maxcount = count[i];
+
+    uint8_t *header = out;                     /* first 258 bytes = freq table */
+    for (int i = 0; i < ZRLE_ALPHA; i++) {
+        if (count[i] == 0) {
+            header[i] = 0;
+        } else {
+            int scaled = (int)((int64_t)count[i] * 254 / maxcount) + 1; /* 1..255 */
+            header[i] = (uint8_t)scaled;
+        }
+    }
+
+    /* Phase 2: init model from frequency table */
+    Model m;
+    memset(&m, 0, sizeof(m));
+    m.total = 0;
+    for (int i = 0; i < ZRLE_ALPHA; i++) {
+        m.freq[i] = header[i];
+        m.total  += header[i];
+    }
+    model_build_tree(&m);
+
+    /* Phase 3: adaptive range coding (encoder and decoder stay in sync) */
+    RCEnc rc; rc_enc_init(&rc, out + ZRLE_ALPHA);
+    for (int i = 0; i < nsyms; i++) {
+        int s = syms[i];
+        rc_enc(&rc, (uint32_t)model_cum(&m, s), (uint32_t)model_freq_of(&m, s),
+               (uint32_t)m.total);
+        model_update(&m, s);
+    }
+    int arith_bytes = rc_enc_finish(&rc);
+    return ZRLE_ALPHA + arith_bytes;
+}
+
+static void arith_dec_o0_ps(const uint8_t *in, int nsyms, uint16_t *out) {
+    /* Read frequency table header and init model */
+    Model m;
+    memset(&m, 0, sizeof(m));
+    m.total = 0;
+    for (int i = 0; i < ZRLE_ALPHA; i++) {
+        m.freq[i] = in[i];
+        m.total  += in[i];
+    }
+    model_build_tree(&m);
+
+    /* Decode */
+    RCDec rc; rc_dec_init(&rc, in + ZRLE_ALPHA);
+    for (int i = 0; i < nsyms; i++) {
+        uint32_t target = rc_dec_cum(&rc, (uint32_t)m.total);
+        int s = model_find(&m, (int)target);
+        rc_dec_update(&rc, (uint32_t)model_cum(&m, s), (uint32_t)model_freq_of(&m, s));
+        out[i] = (uint16_t)s;
+        model_update(&m, s);
+    }
+}
+
+
+/* ===== Arithmetic Coding O1 with Pre-Scanned global frequency init (S_BWT_O1_PS) =====
+ *
+ * Same as arith_enc_o1 but initialises all 258 context models from a single
+ * global frequency table (258-byte header) instead of a uniform distribution.
+ *
+ * Effect:
+ *   1. Dead-symbol removal: symbols that never appear in the stream get freq=0
+ *      in every sub-model, eliminating permanently wasted probability mass.
+ *   2. Warm start: first symbols per context already use near-global priors
+ *      rather than a uniform 1/258 guess.
+ *
+ * Overhead: ZRLE_ALPHA (258) bytes — identical to O0_PS.
+ * Format: [258 bytes global_freq_table | range-coded O1 stream]
+ */
+static int arith_enc_o1_ps(const uint16_t *syms, int nsyms, uint8_t *out) {
+    /* Phase 1: build global frequency table */
+    int count[ZRLE_ALPHA];
+    memset(count, 0, sizeof(count));
+    for (int i = 0; i < nsyms; i++) count[syms[i]]++;
+
+    int maxcount = 0;
+    for (int i = 0; i < ZRLE_ALPHA; i++)
+        if (count[i] > maxcount) maxcount = count[i];
+
+    uint8_t *header = out;
+    if (maxcount == 0) {
+        /* empty stream — write zero header */
+        memset(header, 0, ZRLE_ALPHA);
+    } else {
+        for (int i = 0; i < ZRLE_ALPHA; i++) {
+            header[i] = (count[i] == 0) ? 0
+                        : (uint8_t)((int64_t)count[i] * 254 / maxcount + 1);
+        }
+    }
+
+    /* Phase 2: init all 258 O1 models from the global table */
+    Model *models = (Model*)malloc(ZRLE_ALPHA * sizeof(Model));
+    for (int ctx = 0; ctx < ZRLE_ALPHA; ctx++) {
+        Model *m = &models[ctx];
+        memset(m, 0, sizeof(Model));
+        for (int i = 0; i < ZRLE_ALPHA; i++) {
+            m->freq[i] = header[i];
+            m->total  += header[i];
+        }
+        /* fall back to uniform if all frequencies are zero (shouldn't happen) */
+        if (m->total == 0) {
+            for (int i = 0; i < ZRLE_ALPHA; i++) m->freq[i] = 1;
+            m->total = ZRLE_ALPHA;
+        }
+        model_build_tree(m);
+    }
+
+    /* Phase 3: encode with O1 adaptive range coding */
+    RCEnc rc; rc_enc_init(&rc, out + ZRLE_ALPHA);
+    int prev = 0;
+    for (int i = 0; i < nsyms; i++) {
+        int s = syms[i];
+        Model *m = &models[prev];
+        rc_enc(&rc, (uint32_t)model_cum(m, s), (uint32_t)model_freq_of(m, s), (uint32_t)m->total);
+        model_update(m, s);
+        prev = s;
+    }
+    free(models);
+    int arith_bytes = rc_enc_finish(&rc);
+    return ZRLE_ALPHA + arith_bytes;
+}
+
+static void arith_dec_o1_ps(const uint8_t *in, int nsyms, uint16_t *out) {
+    /* Read global freq header and warm-start all 258 O1 models */
+    Model *models = (Model*)malloc(ZRLE_ALPHA * sizeof(Model));
+    for (int ctx = 0; ctx < ZRLE_ALPHA; ctx++) {
+        Model *m = &models[ctx];
+        memset(m, 0, sizeof(Model));
+        for (int i = 0; i < ZRLE_ALPHA; i++) {
+            m->freq[i] = in[i];
+            m->total  += in[i];
+        }
+        if (m->total == 0) {
+            for (int i = 0; i < ZRLE_ALPHA; i++) m->freq[i] = 1;
+            m->total = ZRLE_ALPHA;
+        }
+        model_build_tree(m);
+    }
+
+    RCDec rc; rc_dec_init(&rc, in + ZRLE_ALPHA);
+    int prev = 0;
+    for (int i = 0; i < nsyms; i++) {
+        Model *m = &models[prev];
+        uint32_t target = rc_dec_cum(&rc, (uint32_t)m->total);
+        int s = model_find(m, (int)target);
+        rc_dec_update(&rc, (uint32_t)model_cum(m, s), (uint32_t)model_freq_of(m, s));
+        out[i] = (uint16_t)s;
+        model_update(m, s);
+        prev = s;
+    }
+    free(models);
+}
+
+/* ===== rANS O0 Entropy Coder (S_BWT_RANS) =====
+ *
+ * Streaming rANS with M=4096 normalization target.
+ * Same compression ratio as O0_PS range coder, but O(1) table-based decode.
+ *
+ * Format: [258 bytes freq_table | 4 bytes initial_state (LE) | byte stream]
+ *   freq_table[i]: 0 = symbol absent, 1..255 = proportional weight
+ *   Encoder emits bytes in reverse order, then reverses in-place.
+ *   Decoder reads bytes forward.
+ */
+#define RANS_M 4096  /* normalization target; must be power of 2 and >= ZRLE_ALPHA */
+
+typedef struct { uint16_t sym; uint16_t freq; uint16_t bias; } RansSlot;
+
+static int rans_enc_o0(const uint16_t *syms, int nsyms, uint8_t *out) {
+    /* Phase 1: count raw frequencies */
+    int count[ZRLE_ALPHA];
+    memset(count, 0, sizeof(count));
+    for (int i = 0; i < nsyms; i++) count[syms[i]]++;
+
+    int maxcount = 0;
+    for (int i = 0; i < ZRLE_ALPHA; i++) if (count[i] > maxcount) maxcount = count[i];
+
+    /* Phase 2: write 258-byte header (same scale as O0_PS: 1..255 for seen, 0 unseen) */
+    uint8_t *header = out;
+    for (int i = 0; i < ZRLE_ALPHA; i++) {
+        if (count[i] == 0) { header[i] = 0; }
+        else { header[i] = (uint8_t)((int64_t)count[i] * 254 / maxcount + 1); }
+    }
+
+    /* Phase 3: normalize to sum exactly RANS_M using largest-remainder method */
+    int raw[ZRLE_ALPHA], nseen = 0;
+    int raw_total = 0;
+    for (int i = 0; i < ZRLE_ALPHA; i++) {
+        if (header[i]) { raw[i] = header[i]; raw_total += header[i]; nseen++; }
+        else raw[i] = 0;
+    }
+    /* Scale: freq_norm[i] = max(1, round(raw[i] * RANS_M / raw_total)) */
+    int freq[ZRLE_ALPHA];
+    int fsum = 0;
+    for (int i = 0; i < ZRLE_ALPHA; i++) {
+        if (raw[i] == 0) { freq[i] = 0; continue; }
+        freq[i] = (int)((int64_t)raw[i] * RANS_M / raw_total);
+        if (freq[i] == 0) freq[i] = 1;
+        fsum += freq[i];
+    }
+    /* Adjust rounding error: add/remove from most frequent seen symbol */
+    int diff = RANS_M - fsum;
+    if (diff != 0) {
+        int best = -1;
+        for (int i = 0; i < ZRLE_ALPHA; i++)
+            if (freq[i] > 0 && (best < 0 || freq[i] > freq[best])) best = i;
+        if (best >= 0) freq[best] += diff;
+    }
+
+    /* Phase 4: compute cumulative */
+    int cum[ZRLE_ALPHA + 1];
+    cum[0] = 0;
+    for (int i = 0; i < ZRLE_ALPHA; i++) cum[i+1] = cum[i] + freq[i];
+
+    /* Phase 5: encode in reverse into a temporary buffer */
+    int cap = nsyms * 2 + 16;
+    uint8_t *tmp = (uint8_t*)malloc(cap);
+    int tlen = 0;
+
+    uint32_t x = RANS_M; /* initial state */
+    for (int i = nsyms - 1; i >= 0; i--) {
+        int s = syms[i];
+        int fs = freq[s];
+        /* renormalize: flush bytes while x >= fs * 256 */
+        while (x >= (uint32_t)fs * 256) {
+            if (tlen >= cap) { cap *= 2; tmp = (uint8_t*)realloc(tmp, cap); }
+            tmp[tlen++] = (uint8_t)(x & 0xFF);
+            x >>= 8;
+        }
+        /* rANS step: x = (x / fs) * RANS_M + cum[s] + (x % fs) */
+        x = (x / fs) * RANS_M + cum[s] + (x % fs);
+    }
+
+    /* Phase 6: write final state (LE u32) then reversed stream */
+    uint8_t *p = out + ZRLE_ALPHA;
+    p[0] = (uint8_t)(x & 0xFF); p[1] = (uint8_t)((x>>8)&0xFF);
+    p[2] = (uint8_t)((x>>16)&0xFF); p[3] = (uint8_t)((x>>24)&0xFF);
+    p += 4;
+    /* bytes in tmp are in reverse order; write them reversed = correct forward order */
+    for (int i = tlen - 1; i >= 0; i--) *p++ = tmp[i];
+    free(tmp);
+
+    return ZRLE_ALPHA + 4 + tlen;
+}
+
+static void rans_dec_o0(const uint8_t *in, int nsyms, uint16_t *out) {
+    /* Build M-normalized freq from header */
+    int raw[ZRLE_ALPHA], raw_total = 0;
+    for (int i = 0; i < ZRLE_ALPHA; i++) { raw[i] = in[i]; raw_total += in[i]; }
+
+    int freq[ZRLE_ALPHA], fsum = 0;
+    for (int i = 0; i < ZRLE_ALPHA; i++) {
+        if (raw[i] == 0) { freq[i] = 0; continue; }
+        freq[i] = (int)((int64_t)raw[i] * RANS_M / raw_total);
+        if (freq[i] == 0) freq[i] = 1;
+        fsum += freq[i];
+    }
+    int diff = RANS_M - fsum;
+    if (diff != 0) {
+        int best = -1;
+        for (int i = 0; i < ZRLE_ALPHA; i++)
+            if (freq[i] > 0 && (best < 0 || freq[i] > freq[best])) best = i;
+        if (best >= 0) freq[best] += diff;
+    }
+
+    int cum[ZRLE_ALPHA + 1];
+    cum[0] = 0;
+    for (int i = 0; i < ZRLE_ALPHA; i++) cum[i+1] = cum[i] + freq[i];
+
+    /* Build O(1) decode table: dtab[slot] = {sym, freq, bias} */
+    RansSlot *dtab = (RansSlot*)malloc(RANS_M * sizeof(RansSlot));
+    for (int s = 0; s < ZRLE_ALPHA; s++) {
+        for (int j = cum[s]; j < cum[s+1]; j++) {
+            dtab[j].sym  = (uint16_t)s;
+            dtab[j].freq = (uint16_t)freq[s];
+            dtab[j].bias = (uint16_t)cum[s];
+        }
+    }
+
+    /* Read initial state */
+    const uint8_t *p = in + ZRLE_ALPHA;
+    uint32_t x = (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
+    p += 4;
+
+    /* Decode */
+    for (int i = 0; i < nsyms; i++) {
+        uint32_t slot = x % RANS_M;
+        RansSlot sl = dtab[slot];
+        out[i] = sl.sym;
+        x = (uint32_t)sl.freq * (x / RANS_M) + slot - sl.bias;
+        /* renorm */
+        while (x < (uint32_t)RANS_M) x = (x << 8) | *p++;
+    }
+
+    free(dtab);
+}
+
+/* ===== 2-Context Range Coder (S_BWT_CTX2) =====
+ *
+ * Two independent O0 models conditioned on whether the previous symbol
+ * was a run code (RUNA/RUNB, sym < 2) or a literal (sym >= 2).
+ *
+ * Format: [258 bytes freq_ctx0 | 258 bytes freq_ctx1 | range-coded stream]
+ * Context: ctx = (prev_sym < 2) ? 0 : 1; first symbol uses ctx=1.
+ */
+static int arith_enc_ctx2(const uint16_t *syms, int nsyms, uint8_t *out) {
+    /* Phase 1: count per-context frequencies */
+    int count[2][ZRLE_ALPHA];
+    memset(count, 0, sizeof(count));
+    int prev = 2; /* first sym: ctx=1 (prev>=2) */
+    for (int i = 0; i < nsyms; i++) {
+        int ctx = (prev < 2) ? 0 : 1;
+        count[ctx][syms[i]]++;
+        prev = syms[i];
+    }
+
+    /* Phase 2: write two 258-byte headers */
+    for (int c = 0; c < 2; c++) {
+        int maxcount = 0;
+        for (int i = 0; i < ZRLE_ALPHA; i++) if (count[c][i] > maxcount) maxcount = count[c][i];
+        uint8_t *hdr = out + c * ZRLE_ALPHA;
+        for (int i = 0; i < ZRLE_ALPHA; i++) {
+            if (count[c][i] == 0) hdr[i] = 0;
+            else hdr[i] = (uint8_t)((int64_t)count[c][i] * 254 / maxcount + 1);
+        }
+    }
+
+    /* Phase 3: init two models */
+    Model m[2];
+    for (int c = 0; c < 2; c++) {
+        memset(&m[c], 0, sizeof(Model));
+        for (int i = 0; i < ZRLE_ALPHA; i++) {
+            m[c].freq[i] = out[c * ZRLE_ALPHA + i];
+            m[c].total  += out[c * ZRLE_ALPHA + i];
+        }
+        model_build_tree(&m[c]);
+    }
+
+    /* Phase 4: range-encode with 2 contexts */
+    RCEnc rc; rc_enc_init(&rc, out + 2 * ZRLE_ALPHA);
+    prev = 2;
+    for (int i = 0; i < nsyms; i++) {
+        int ctx = (prev < 2) ? 0 : 1;
+        int s = syms[i];
+        rc_enc(&rc, (uint32_t)model_cum(&m[ctx], s),
+                    (uint32_t)model_freq_of(&m[ctx], s),
+                    (uint32_t)m[ctx].total);
+        model_update(&m[ctx], s);
+        prev = s;
+    }
+    int arith_bytes = rc_enc_finish(&rc);
+    return 2 * ZRLE_ALPHA + arith_bytes;
+}
+
+static void arith_dec_ctx2(const uint8_t *in, int nsyms, uint16_t *out) {
+    Model m[2];
+    for (int c = 0; c < 2; c++) {
+        memset(&m[c], 0, sizeof(Model));
+        for (int i = 0; i < ZRLE_ALPHA; i++) {
+            m[c].freq[i] = in[c * ZRLE_ALPHA + i];
+            m[c].total  += in[c * ZRLE_ALPHA + i];
+        }
+        model_build_tree(&m[c]);
+    }
+    RCDec rc; rc_dec_init(&rc, in + 2 * ZRLE_ALPHA);
+    int prev = 2;
+    for (int i = 0; i < nsyms; i++) {
+        int ctx = (prev < 2) ? 0 : 1;
+        uint32_t target = rc_dec_cum(&rc, (uint32_t)m[ctx].total);
+        int s = model_find(&m[ctx], (int)target);
+        rc_dec_update(&rc, (uint32_t)model_cum(&m[ctx], s),
+                           (uint32_t)model_freq_of(&m[ctx], s));
+        out[i] = (uint16_t)s;
+        model_update(&m[ctx], s);
+        prev = s;
+    }
+}
 
 /* ===== LZ77 Hash-Chain Encoder/Decoder ===== */
 #define LZ_HASH_BITS  16
@@ -942,6 +1360,94 @@ static void bcj_e8e9_decode(const uint8_t *in, int n, uint8_t *out) {
             i += 4;
         }
     }
+}
+
+/* ===== IEEE 754 Float32 XOR-Delta Transform ===== */
+/*
+ * For data containing float32 values with similar magnitudes (scientific data,
+ * sensor arrays, FITS catalogs), XORing consecutive 4-byte values cancels out
+ * shared exponent bits, clustering the differences near zero and making the
+ * BWT suffix sort far more effective.
+ *
+ * Detection: if XOR-delta reduces the entropy of the high byte (exponent+sign
+ * of LE float32) by ≥15%, the data is likely float-encoded and benefits from
+ * this filter.
+ */
+static int float_xor_detect(const uint8_t *data, int n) {
+    if (n < 4096) return 0;
+    int tn = n < 65536 ? n : 65536;
+    tn &= ~3;  /* align to 4-byte boundary */
+    if (tn < 1024) return 0;
+
+    /* Full-byte entropy of raw data */
+    int freq0[256] = {0};
+    for (int i = 0; i < tn; i++) freq0[data[i]]++;
+    double ent0 = 0.0;
+    for (int i = 0; i < 256; i++) {
+        if (freq0[i] > 0) { double p = (double)freq0[i] / tn; ent0 -= p * log2(p); }
+    }
+
+    /* Full-byte entropy of XOR-delta output */
+    int freq1[256] = {0};
+    uint32_t prev = 0;
+    for (int i = 0; i < tn; i += 4) {
+        uint32_t curr = (uint32_t)data[i]          |
+                        ((uint32_t)data[i+1] <<  8) |
+                        ((uint32_t)data[i+2] << 16) |
+                        ((uint32_t)data[i+3] << 24);
+        uint32_t d = curr ^ prev;
+        freq1[ d        & 0xFF]++;
+        freq1[(d >>  8) & 0xFF]++;
+        freq1[(d >> 16) & 0xFF]++;
+        freq1[(d >> 24) & 0xFF]++;
+        prev = curr;
+    }
+    double ent1 = 0.0;
+    for (int i = 0; i < 256; i++) {
+        if (freq1[i] > 0) { double p = (double)freq1[i] / tn; ent1 -= p * log2(p); }
+    }
+
+    /* Trigger if XOR-delta reduces full entropy by ≥10%.
+       This catches both:
+       - varying-exponent floats (ent0 normal, ent1 lower)
+       - same-exponent floats (ent0 already low, ent1 even lower due to 0x00 high bytes) */
+    return (ent0 > 4.0 && ent1 < ent0 * 0.90);
+}
+
+static void float_xor_encode(const uint8_t *in, int n, uint8_t *out) {
+    uint32_t prev = 0;
+    int i;
+    for (i = 0; i + 3 < n; i += 4) {
+        uint32_t curr = (uint32_t)in[i]         |
+                        ((uint32_t)in[i+1] << 8)  |
+                        ((uint32_t)in[i+2] << 16) |
+                        ((uint32_t)in[i+3] << 24);
+        uint32_t d = curr ^ prev;
+        out[i]   = d & 0xFF;
+        out[i+1] = (d >> 8)  & 0xFF;
+        out[i+2] = (d >> 16) & 0xFF;
+        out[i+3] = (d >> 24) & 0xFF;
+        prev = curr;
+    }
+    for (; i < n; i++) out[i] = in[i];  /* tail bytes (n % 4) */
+}
+
+static void float_xor_decode(const uint8_t *in, int n, uint8_t *out) {
+    uint32_t prev = 0;
+    int i;
+    for (i = 0; i + 3 < n; i += 4) {
+        uint32_t d = (uint32_t)in[i]         |
+                     ((uint32_t)in[i+1] << 8)  |
+                     ((uint32_t)in[i+2] << 16) |
+                     ((uint32_t)in[i+3] << 24);
+        uint32_t curr = d ^ prev;
+        out[i]   = curr & 0xFF;
+        out[i+1] = (curr >> 8)  & 0xFF;
+        out[i+2] = (curr >> 16) & 0xFF;
+        out[i+3] = (curr >> 24) & 0xFF;
+        prev = curr;
+    }
+    for (; i < n; i++) out[i] = in[i];
 }
 
 /* ===== Audio Pipeline (16-bit PCM) ===== */
@@ -1985,7 +2491,7 @@ static int b64_decode_chunk(const uint8_t *in, int len, uint8_t *out) {
 
 /* Encode to base64. Returns encoded length. */
 static int b64_encode_chunk(const uint8_t *in, int len, uint8_t *out) {
-    static const char *ch = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    static const uint8_t ch[64] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     int j = 0, i;
     for (i = 0; i + 2 < len; i += 3) {
         uint32_t v = ((uint32_t)in[i] << 16) | ((uint32_t)in[i+1] << 8) | in[i+2];
@@ -2264,6 +2770,14 @@ static int compress_substream(const uint8_t *data, int n, uint8_t *out, int *sub
         put_u32be(out, pidx); put_u32be(out + 4, nz);
         memcpy(out + 8, arith_s, asize);
     }
+    /* BWT+rANS O0 (sub_order 15): same ratio as O0, O(1) table decode */
+    asize = rans_enc_o0(zrle_s, nz, arith_s);
+    total = 8 + asize;
+    if (total < best) {
+        best = total; *sub_order = 15;
+        put_u32be(out, pidx); put_u32be(out + 4, nz);
+        memcpy(out + 8, arith_s, asize);
+    }
 
     /* === Strategy B: PPM direct (sub_order 3) — only for small streams === */
     if (n <= 33554432) {  /* 32 MB */
@@ -2294,6 +2808,14 @@ static int compress_substream(const uint8_t *data, int n, uint8_t *out, int *sub
                 memcpy(out + 8, arith_s, asize);
             }
         }
+        /* Delta+BWT+rANS O0 (sub_order 17) */
+        asize = rans_enc_o0(zrle_s, nz, arith_s);
+        total = 8 + asize;
+        if (total < best) {
+            best = total; *sub_order = 17;
+            put_u32be(out, pidx); put_u32be(out + 4, nz);
+            memcpy(out + 8, arith_s, asize);
+        }
         free(delta_s);
     }
 
@@ -2323,6 +2845,18 @@ static int compress_substream(const uint8_t *data, int n, uint8_t *out, int *sub
                     fprintf(stderr, "      [Sub LZP+BWT+O%d] NEW BEST: %d -> %d (%.2fx)\n",
                             o, n, total, (double)n/total);
                 }
+            }
+            /* LZP+BWT+rANS O0 (sub_order 16) */
+            asize = rans_enc_o0(zrle_s, nz, arith_s);
+            total = 12 + asize;
+            if (total < best) {
+                best = total; *sub_order = 16;
+                put_u32be(out, lzp_size);
+                put_u32be(out + 4, pidx);
+                put_u32be(out + 8, nz);
+                memcpy(out + 12, arith_s, asize);
+                fprintf(stderr, "      [Sub LZP+BWT+rANS] NEW BEST: %d -> %d (%.2fx)\n",
+                        n, total, (double)n/total);
             }
         }
         free(lzp_s);
@@ -2379,6 +2913,18 @@ static int compress_substream(const uint8_t *data, int n, uint8_t *out, int *sub
                         fprintf(stderr, "      [Sub Word+BWT+O%d] *** NEW BEST: %d -> %d (%.2fx) ***\n",
                                 o, n, total, (double)n/total);
                     }
+                }
+                /* Word+BWT+rANS O0 (sub_order 18) */
+                asize = rans_enc_o0(wz, nz, wa);
+                total = 12 + asize;
+                if (total < best) {
+                    best = total; *sub_order = 18;
+                    put_u32be(out, wpn);
+                    put_u32be(out + 4, pidx);
+                    put_u32be(out + 8, nz);
+                    memcpy(out + 12, wa, asize);
+                    fprintf(stderr, "      [Sub Word+BWT+rANS] *** NEW BEST: %d -> %d (%.2fx) ***\n",
+                            n, total, (double)n/total);
                 }
                 free(wb); free(wm); free(wz); free(wa);
             }
@@ -2440,14 +2986,19 @@ static void decompress_substream(const uint8_t *cdata, int csize, int sub_order,
         return;
     }
 
-    /* Determine type and arith order */
-    int is_delta = (sub_order >= 4 && sub_order <= 6);
-    int is_lzp   = (sub_order >= 7 && sub_order <= 9);
-    int is_word  = (sub_order >= 11 && sub_order <= 13);
+    /* Determine type and arith order
+     * sub_order 15 = BWT+rANS O0
+     * sub_order 16 = LZP+BWT+rANS O0
+     * sub_order 17 = Delta+BWT+rANS O0
+     * sub_order 18 = Word+BWT+rANS O0 */
+    int is_rans  = (sub_order >= 15);
+    int is_delta = (sub_order >= 4 && sub_order <= 6) || sub_order == 17;
+    int is_lzp   = (sub_order >= 7 && sub_order <= 9) || sub_order == 16;
+    int is_word  = (sub_order >= 11 && sub_order <= 13) || sub_order == 18;
     int arith_order = sub_order;
-    if (is_delta) arith_order = sub_order - 4;
-    if (is_lzp)   arith_order = sub_order - 7;
-    if (is_word)  arith_order = sub_order - 11;
+    if (is_delta) arith_order = (sub_order == 17) ? 0 : sub_order - 4;
+    if (is_lzp)   arith_order = (sub_order == 16) ? 0 : sub_order - 7;
+    if (is_word)  arith_order = (sub_order == 18) ? 0 : sub_order - 11;
 
     const uint8_t *p = cdata;
     int lzp_size = 0, wp_enc_size = 0;
@@ -2467,7 +3018,8 @@ static void decompress_substream(const uint8_t *cdata, int csize, int sub_order,
     uint8_t  *mtf_s  = (uint8_t*)malloc(bwt_n);
     uint8_t  *bwt_s  = (uint8_t*)malloc(bwt_n);
 
-    if (arith_order == 2)      arith_dec_o2(p, nz, zrle_s);
+    if (is_rans)               rans_dec_o0(p, nz, zrle_s);
+    else if (arith_order == 2) arith_dec_o2(p, nz, zrle_s);
     else if (arith_order == 1) arith_dec_o1(p, nz, zrle_s);
     else                       arith_dec_o0(p, nz, zrle_s);
 
@@ -2496,6 +3048,13 @@ static void decompress_substream(const uint8_t *cdata, int csize, int sub_order,
     free(zrle_s); free(mtf_s); free(bwt_s);
 }
 
+/* Thread helper: decompress one substream in a background thread */
+typedef struct { const uint8_t *cdata; int csize, order, orig_n; uint8_t *out; } SubstreamArg;
+static void *decompress_substream_thread(void *arg) {
+    SubstreamArg *a = (SubstreamArg*)arg;
+    decompress_substream(a->cdata, a->csize, a->order, a->orig_n, a->out);
+    return NULL;
+}
 
 
 /* ===================================================================
@@ -3036,36 +3595,64 @@ static uint32_t lzma_dist_price(const LzmaProbs *p, uint32_t dist, int len) {
 }
 
 /* ===== Match Finder (Hash Chain) ===== */
+/* Hash sizes for short-length match boosting.
+ * hash2: 2^16 = 65536 entries for all 2-byte pairs (exact, no collisions for len=2)
+ * hash3: 2^16 = 65536 entries for 3-byte combinations (may collide, still helps)
+ * These let the match finder reliably find length-2 and length-3 matches that the
+ * 4-byte hash chain misses; critical for code-heavy data (C tokens, x86 opcodes). */
+#define LZMA_HASH2_SIZE  (1 << 16)
+#define LZMA_HASH2_MASK  (LZMA_HASH2_SIZE - 1)
+#define LZMA_HASH3_BITS  16
+#define LZMA_HASH3_SIZE  (1 << LZMA_HASH3_BITS)
+#define LZMA_HASH3_MASK  (LZMA_HASH3_SIZE - 1)
+
 typedef struct {
     const uint8_t *data;
     int size;
     int pos;
-    int32_t *head;    /* hash -> last position */
+    int32_t *head;    /* hash4 -> last position */
     int32_t *chain;   /* circular chain buffer */
+    int32_t *head2;   /* hash2 -> last position (2-byte matches) */
+    int32_t *head3;   /* hash3 -> last position (3-byte matches) */
     int window_size;
     int chain_max;    /* Phase 3: configurable search depth */
+    int nice_len;     /* stop chain search early when match >= nice_len */
 } LzmaMF;
 
 static inline uint32_t lzma_mf_hash4(const uint8_t *p) {
     uint32_t v = p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
     return (v * 2654435761u) >> (32 - LZMA_MF_HASH_BITS);
 }
+static inline uint32_t lzma_mf_hash2(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8);  /* exact 2-byte pair index */
+}
+static inline uint32_t lzma_mf_hash3(const uint8_t *p) {
+    uint32_t v = p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
+    return (v * 2654435761u) >> (32 - LZMA_HASH3_BITS);
+}
 
-static void lzma_mf_init(LzmaMF *mf, const uint8_t *data, int size, int window_size, int chain_max) {
+static void lzma_mf_init(LzmaMF *mf, const uint8_t *data, int size, int window_size, int chain_max, int nice_len) {
     mf->data = data;
     mf->size = size;
     mf->pos = 0;
     mf->window_size = window_size;
+    mf->nice_len = nice_len;
     mf->chain_max = chain_max;
-    mf->head = (int32_t *)malloc(LZMA_MF_HASH_SIZE * sizeof(int32_t));
+    mf->head  = (int32_t *)malloc(LZMA_MF_HASH_SIZE * sizeof(int32_t));
     mf->chain = (int32_t *)malloc(window_size * sizeof(int32_t));
-    memset(mf->head, -1, LZMA_MF_HASH_SIZE * sizeof(int32_t));
+    mf->head2 = (int32_t *)malloc(LZMA_HASH2_SIZE * sizeof(int32_t));
+    mf->head3 = (int32_t *)malloc(LZMA_HASH3_SIZE * sizeof(int32_t));
+    memset(mf->head,  -1, LZMA_MF_HASH_SIZE * sizeof(int32_t));
     memset(mf->chain, -1, window_size * sizeof(int32_t));
+    memset(mf->head2, -1, LZMA_HASH2_SIZE * sizeof(int32_t));
+    memset(mf->head3, -1, LZMA_HASH3_SIZE * sizeof(int32_t));
 }
 
 static void lzma_mf_free(LzmaMF *mf) {
     free(mf->head);
     free(mf->chain);
+    free(mf->head2);
+    free(mf->head3);
 }
 
 /* Match result: array of (dist, len) pairs. Returns count. */
@@ -3074,7 +3661,7 @@ typedef struct { uint32_t dist; int len; } MatchPair;
 /* Find ALL matches at position pos. Returns them sorted by length ascending.
    Also check rep distances. max_pairs is the capacity of pairs[]. */
 static int lzma_mf_find_all(LzmaMF *mf, int pos, uint32_t *reps,
-                             MatchPair *pairs, int max_pairs) {
+                             MatchPair *pairs, int max_pairs, int chain_limit) {
     const uint8_t *data = mf->data;
     int size = mf->size;
     int np = 0;
@@ -3099,14 +3686,53 @@ static int lzma_mf_find_all(LzmaMF *mf, int pos, uint32_t *reps,
         }
     }
 
-    /* Hash chain search — collect matches of increasing length */
+    /* Hash2 search — exact 2-byte match (single lookup, no chain) */
+    if (max_len >= 2 && pos >= 1) {
+        uint32_t h2 = lzma_mf_hash2(data + pos);
+        int ref2 = mf->head2[h2];
+        if (ref2 >= 0 && (pos - ref2) <= mf->window_size &&
+            data[ref2] == data[pos] && data[ref2 + 1] == data[pos + 1]) {
+            int len = 2;
+            while (len < max_len && data[ref2 + len] == data[pos + len]) len++;
+            if (len >= LZMA_MIN_MATCH && len > best_len) {
+                best_len = len;
+                if (np < max_pairs) {
+                    pairs[np].dist = (uint32_t)(pos - ref2 - 1);
+                    pairs[np].len = len;
+                    np++;
+                }
+            }
+        }
+    }
+
+    /* Hash3 search — 3-byte match (single lookup) */
+    if (max_len >= 3 && pos >= 2) {
+        uint32_t h3 = lzma_mf_hash3(data + pos);
+        int ref3 = mf->head3[h3];
+        if (ref3 >= 0 && (pos - ref3) <= mf->window_size &&
+            data[ref3] == data[pos] && data[ref3 + 1] == data[pos + 1] &&
+            data[ref3 + 2] == data[pos + 2]) {
+            int len = 3;
+            while (len < max_len && data[ref3 + len] == data[pos + len]) len++;
+            if (len >= LZMA_MIN_MATCH && len > best_len) {
+                best_len = len;
+                if (np < max_pairs) {
+                    pairs[np].dist = (uint32_t)(pos - ref3 - 1);
+                    pairs[np].len = len;
+                    np++;
+                }
+            }
+        }
+    }
+
+    /* Hash4 chain search — collect matches of increasing length */
     if (pos + 3 < size) {
         uint32_t h = lzma_mf_hash4(data + pos);
         int chain_pos = mf->head[h];
         int tries = 0;
         int max_dist = (pos < mf->window_size) ? pos : mf->window_size;
 
-        while (chain_pos >= 0 && (pos - chain_pos) <= max_dist && tries < mf->chain_max) {
+        while (chain_pos >= 0 && (pos - chain_pos) <= max_dist && tries < chain_limit) {
             if (data[chain_pos + best_len] == data[pos + best_len]) {
                 int len = 0;
                 while (len < max_len && data[chain_pos + len] == data[pos + len]) len++;
@@ -3118,6 +3744,7 @@ static int lzma_mf_find_all(LzmaMF *mf, int pos, uint32_t *reps,
                         np++;
                     }
                     if (len >= max_len) break;
+                    if (len >= mf->nice_len) break; /* good enough — stop early */
                 }
             }
             chain_pos = mf->chain[chain_pos % mf->window_size];
@@ -3130,8 +3757,15 @@ static int lzma_mf_find_all(LzmaMF *mf, int pos, uint32_t *reps,
 
 /* Update hash chain for position pos */
 static void lzma_mf_update(LzmaMF *mf, int pos) {
+    const uint8_t *p = mf->data + pos;
+    if (pos + 1 < mf->size) {
+        mf->head2[lzma_mf_hash2(p)] = pos;
+    }
+    if (pos + 2 < mf->size) {
+        mf->head3[lzma_mf_hash3(p)] = pos;
+    }
     if (pos + 3 < mf->size) {
-        uint32_t h = lzma_mf_hash4(mf->data + pos);
+        uint32_t h = lzma_mf_hash4(p);
         mf->chain[pos % mf->window_size] = mf->head[h];
         mf->head[h] = pos;
     }
@@ -3149,6 +3783,132 @@ typedef struct {
     int back_dist;   /* -1=literal/shortrep, 0-3=rep_idx (for rep match), >=4=dist+4 (normal match) */
     int back_rep;    /* 1 if this is a rep/shortrep, 0 if normal match or literal */
 } OptNode;
+
+/* ===== SA-LZMA: Suffix Array long-match supplement =====
+ *
+ * For blocks <= SA_LZMA_THRESHOLD (8MB), builds a suffix array + ISA + LCP
+ * using the existing sais_core(). During LZMA DP, supplements hash chain by
+ * finding the globally best long match via SA neighborhood scan.
+ *
+ * Only adds a match to pairs[] if it is strictly longer than the best
+ * match the hash chain already found.
+ *
+ * Memory: 3 * n * 4 bytes (SA + ISA + LCP). For n=8MB: 96MB.
+ */
+#define SA_LZMA_THRESHOLD (8 * 1024 * 1024)
+#define SA_SCAN_LIMIT 64  /* max neighbors to scan left/right in SA */
+
+typedef struct {
+    int32_t *sa;
+    int32_t *isa;
+    int32_t *lcp;
+    const uint8_t *data;
+    int n;
+} SaCtx;
+
+static SaCtx *sa_ctx_build(const uint8_t *data, int n) {
+    SaCtx *ctx = (SaCtx *)malloc(sizeof(SaCtx));
+    if (!ctx) return NULL;
+    ctx->data = data;
+    ctx->n = n;
+
+    ctx->sa  = (int32_t *)malloc((size_t)(n + 1) * sizeof(int32_t));
+    ctx->isa = (int32_t *)malloc((size_t)n * sizeof(int32_t));
+    ctx->lcp = (int32_t *)malloc((size_t)(n + 1) * sizeof(int32_t));
+    if (!ctx->sa || !ctx->isa || !ctx->lcp) {
+        free(ctx->sa); free(ctx->isa); free(ctx->lcp); free(ctx);
+        return NULL;
+    }
+
+    /* Build integer array for sais_core: T[i] = data[i], T[n] = 0 (sentinel) */
+    int32_t *T = (int32_t *)malloc((size_t)(n + 1) * sizeof(int32_t));
+    if (!T) { free(ctx->sa); free(ctx->isa); free(ctx->lcp); free(ctx); return NULL; }
+    for (int i = 0; i < n; i++) T[i] = (int32_t)data[i] + 1; /* shift: 1..256 */
+    T[n] = 0; /* sentinel must be 0 and unique minimum */
+
+    sais_core(T, ctx->sa, n + 1, 257); /* alphabet: 0..256 (0=sentinel, 1..256=bytes+1) */
+    free(T);
+
+    /* Build ISA (inverse SA) */
+    for (int i = 0; i <= n; i++) {
+        if (ctx->sa[i] < n) ctx->isa[ctx->sa[i]] = i;
+    }
+
+    /* Build LCP array using Kasai's algorithm */
+    memset(ctx->lcp, 0, (size_t)(n + 1) * sizeof(int32_t));
+    int h = 0;
+    for (int i = 0; i < n; i++) {
+        int rank = ctx->isa[i];
+        if (rank > 0) {
+            int j = ctx->sa[rank - 1];
+            if (j < n) {
+                while (i + h < n && j + h < n && data[i + h] == data[j + h]) h++;
+                ctx->lcp[rank] = h;
+            }
+            if (h > 0) h--;
+        }
+    }
+    return ctx;
+}
+
+static void sa_ctx_free(SaCtx *ctx) {
+    if (!ctx) return;
+    free(ctx->sa); free(ctx->isa); free(ctx->lcp); free(ctx);
+}
+
+/* Find best match at position pos using SA neighborhood.
+ * Returns match length > min_len, or 0 if nothing better found.
+ * out_dist: distance (1-based, i.e., pos - match_start) */
+static int sa_find_best_match(const SaCtx *ctx, int pos, int max_dist,
+                               int min_len, int *out_dist) {
+    const uint8_t *data = ctx->data;
+    int n = ctx->n;
+    int remaining = n - pos;
+    if (remaining <= min_len) return 0;
+    int max_match = remaining;
+    if (max_match > LZMA_MAX_MATCH) max_match = LZMA_MAX_MATCH;
+
+    int rank = ctx->isa[pos];
+    int best_len = min_len;
+    int best_dist = 0;
+
+    /* Scan left in SA */
+    int min_lcp = max_match;
+    for (int k = rank - 1; k >= 0 && (rank - k) <= SA_SCAN_LIMIT; k--) {
+        if (ctx->lcp[k + 1] < min_lcp) min_lcp = ctx->lcp[k + 1];
+        if (min_lcp <= best_len) break;
+        int ref = ctx->sa[k];
+        if (ref >= n) continue; /* sentinel position */
+        int dist = pos - ref;
+        if (dist <= 0 || dist > max_dist) continue;
+        /* Verify actual match length (min_lcp is a lower bound) */
+        int len = min_lcp;
+        while (len < max_match && data[pos + len] == data[ref + len]) len++;
+        if (len > best_len) { best_len = len; best_dist = dist; }
+        if (best_len == max_match) break;
+    }
+
+    /* Scan right in SA */
+    min_lcp = max_match;
+    for (int k = rank + 1; k <= n && (k - rank) <= SA_SCAN_LIMIT; k++) {
+        if (ctx->lcp[k] < min_lcp) min_lcp = ctx->lcp[k];
+        if (min_lcp <= best_len) break;
+        int ref = ctx->sa[k];
+        if (ref >= n) continue;
+        int dist = pos - ref;
+        if (dist <= 0 || dist > max_dist) continue;
+        int len = min_lcp;
+        while (len < max_match && data[pos + len] == data[ref + len]) len++;
+        if (len > best_len) { best_len = len; best_dist = dist; }
+        if (best_len == max_match) break;
+    }
+
+    if (best_len > min_len && best_dist > 0) {
+        *out_dist = best_dist;
+        return best_len;
+    }
+    return 0;
+}
 
 /* ===== LZMA Encoder with Optimal Parsing ===== */
 static int lzma_compress(const uint8_t *data, int n, uint8_t *out, int size_limit) {
@@ -3169,9 +3929,10 @@ static int lzma_compress(const uint8_t *data, int n, uint8_t *out, int size_limi
     /* Phase 3: Reduce chain depth when competing against existing result.
      * Full depth (128) when no limit; fast depth (32) when speculative. */
     int chain_depth = (size_limit > 0) ? 32 : LZMA_MF_CHAIN_MAX;
+    int nice_len = LZMA_MAX_MATCH; /* no early exit by default */
 
     LzmaMF mf;
-    lzma_mf_init(&mf, data, n, window_size, chain_depth);
+    lzma_mf_init(&mf, data, n, window_size, chain_depth, nice_len);
 
     LRCEnc rc;
     lrc_enc_init(&rc, out);
@@ -3181,19 +3942,36 @@ static int lzma_compress(const uint8_t *data, int n, uint8_t *out, int size_limi
     uint8_t prev_byte = 0;
     int pos = 0;
 
+    /* Build SA for small blocks to supplement hash chain with globally best matches */
+    SaCtx *sa_ctx = NULL;
+    if (n <= SA_LZMA_THRESHOLD) sa_ctx = sa_ctx_build(data, n);
+
     /* Allocate optimal parsing array */
     OptNode *opt = (OptNode *)malloc((OPT_AHEAD + LZMA_MAX_MATCH + 1) * sizeof(OptNode));
-    MatchPair *pairs = (MatchPair *)malloc(LZMA_MAX_MATCH * sizeof(MatchPair));
+    /* +1 slot reserved for SA match supplement */
+    MatchPair *pairs = (MatchPair *)malloc((LZMA_MAX_MATCH + 1) * sizeof(MatchPair));
 
     /* Decision buffer for emitting */
     int *dec_lens = (int *)malloc((OPT_AHEAD + LZMA_MAX_MATCH + 1) * sizeof(int));
     int *dec_dists = (int *)malloc((OPT_AHEAD + LZMA_MAX_MATCH + 1) * sizeof(int));
     int *dec_reps_flag = (int *)malloc((OPT_AHEAD + LZMA_MAX_MATCH + 1) * sizeof(int));
 
+    /* Price tables: precomputed once per DP round (4×272 = ~4KB, fits in L1 cache).
+       Eliminates 2.2B repeated lzma_len_price() calls in the inner DP loops. */
+    uint32_t rep_ptable[LZMA_POS_STATES][LZMA_MAX_MATCH - LZMA_MIN_MATCH + 1];
+    uint32_t match_ptable[LZMA_POS_STATES][LZMA_MAX_MATCH - LZMA_MIN_MATCH + 1];
+
     while (pos < n) {
         /* === Phase 1: Forward DP pricing === */
         int ahead = n - pos;
         if (ahead > OPT_AHEAD) ahead = OPT_AHEAD;
+
+        /* Refresh price tables for this DP round (probabilities change as symbols are emitted) */
+        for (int ps = 0; ps < LZMA_POS_STATES; ps++)
+            for (int l = LZMA_MIN_MATCH; l <= LZMA_MAX_MATCH; l++) {
+                rep_ptable[ps][l - LZMA_MIN_MATCH]   = lzma_len_price(&probs.rep_len,   l, ps);
+                match_ptable[ps][l - LZMA_MIN_MATCH] = lzma_len_price(&probs.match_len, l, ps);
+            }
 
         /* Initialize node 0 */
         opt[0].price = 0;
@@ -3312,7 +4090,7 @@ static int lzma_compress(const uint8_t *data, int n, uint8_t *out, int size_limi
 
                     /* Try all lengths */
                     for (int l = LZMA_MIN_MATCH; l <= len; l++) {
-                        uint32_t price = rep_price + lzma_len_price(&probs.rep_len, l, pos_state);
+                        uint32_t price = rep_price + rep_ptable[pos_state][l - LZMA_MIN_MATCH];
                         int next = cur + l;
                         if (next <= (int)(n - pos) && price < opt[next].price) {
                             opt[next].price = price;
@@ -3340,7 +4118,28 @@ static int lzma_compress(const uint8_t *data, int n, uint8_t *out, int size_limi
             /* === Try normal matches from hash chain === */
             /* IMPORTANT: find matches BEFORE updating hash to avoid self-match */
             {
-                int np = lzma_mf_find_all(&mf, abs_pos, cur_reps, pairs, LZMA_MAX_MATCH);
+                /* Interior DP positions (cur > 0) use a reduced chain depth:
+                 * they only need to find matches competitive with the already-known
+                 * cur=0 path, so deep search is wasteful. cur=0 always uses full depth.
+                 * For large blocks (> 4MB), reduce to 8 to limit O(n*last_opt) cost.
+                 * Small blocks keep full depth — the extra cost is negligible. */
+                int interior_depth = (n > 4 * 1024 * 1024) ? 8 : mf.chain_max;
+                int cur_chain = (cur == 0) ? mf.chain_max : interior_depth;
+                int np = lzma_mf_find_all(&mf, abs_pos, cur_reps, pairs, LZMA_MAX_MATCH, cur_chain);
+
+                /* SA supplement: for small blocks, find globally best long match */
+                if (sa_ctx && abs_pos < sa_ctx->n) {
+                    int best_chain_len = (np > 0) ? pairs[np - 1].len : (LZMA_MIN_MATCH - 1);
+                    int sa_dist = 0;
+                    int sa_len = sa_find_best_match(sa_ctx, abs_pos,
+                                                     LZMA_MF_WINDOW, best_chain_len, &sa_dist);
+                    if (sa_len > best_chain_len) {
+                        pairs[np].len  = sa_len;
+                        /* sa_dist is 1-based (pos - ref); LZMA pairs use 0-based (pos - ref - 1) */
+                        pairs[np].dist = (uint32_t)(sa_dist - 1);
+                        np++;
+                    }
+                }
 
                 /* NOW update hash for this position (after searching) */
                 lzma_mf_update(&mf, abs_pos);
@@ -3367,7 +4166,7 @@ static int lzma_compress(const uint8_t *data, int n, uint8_t *out, int size_limi
                         if (l > 32 && l < mlen && (l & 7) != 0) continue;
 
                         uint32_t price = normal_price;
-                        price += lzma_len_price(&probs.match_len, l, pos_state);
+                        price += match_ptable[pos_state][l - LZMA_MIN_MATCH];
                         price += lzma_dist_price(&probs, dist, l);
 
                         int next = cur + l;
@@ -3385,6 +4184,7 @@ static int lzma_compress(const uint8_t *data, int n, uint8_t *out, int size_limi
                             if (next > last_opt) last_opt = next;
                         }
                     }
+
                 }
             }
         }
@@ -3526,6 +4326,7 @@ static int lzma_compress(const uint8_t *data, int n, uint8_t *out, int size_limi
                 lzma_mf_free(&mf);
                 free(opt); free(pairs);
                 free(dec_lens); free(dec_dists); free(dec_reps_flag);
+                sa_ctx_free(sa_ctx);
                 return -1;
             }
         }
@@ -3541,6 +4342,7 @@ static int lzma_compress(const uint8_t *data, int n, uint8_t *out, int size_limi
     free(dec_lens);
     free(dec_dists);
     free(dec_reps_flag);
+    sa_ctx_free(sa_ctx);
     return comp_size;
 }
 
@@ -3698,7 +4500,7 @@ static void *thread_groups_AC(void *arg) {
         int o0cmp = (total <= w->best_size * 5 / 4);
         /* v10.2: Skip higher orders if sample already determined winner */
         int skip_o1o2 = (w->hint_strat == S_BWT_O0);
-        int skip_o0o2 = (w->hint_strat == S_BWT_O1);
+        int skip_o0o2 = (w->hint_strat == S_BWT_O1 || w->hint_strat == S_BWT_O1_PS);
         if (o0cmp && !skip_o1o2) {
             /* O1 */
             asize = arith_enc_o1(zrle_buf, nz, arith_buf);
@@ -3709,8 +4511,19 @@ static void *thread_groups_AC(void *arg) {
                 put_u32be(w->out_buf + 4, nz);
                 memcpy(w->out_buf + 8, arith_buf, asize);
             }
+            /* O1_PS: O1 with global warm-start header (258 bytes overhead).
+             * Removes dead symbols from all sub-models and provides a better
+             * prior than uniform, especially for short blocks / sparse contexts. */
+            asize = arith_enc_o1_ps(zrle_buf, nz, arith_buf);
+            total = 8 + asize;
+            if (total < w->best_size) {
+                w->best_size = total; w->best_strat = S_BWT_O1_PS;
+                put_u32be(w->out_buf, pidx);
+                put_u32be(w->out_buf + 4, nz);
+                memcpy(w->out_buf + 8, arith_buf, asize);
+            }
             /* O2 */
-            if (!skip_o1o2 && !skip_o0o2) {
+            if (!skip_o0o2) {
             asize = arith_enc_o2(zrle_buf, nz, arith_buf);
             total = 8 + asize;
             if (total < w->best_size) {
@@ -3721,7 +4534,42 @@ static void *thread_groups_AC(void *arg) {
             }
             } /* end skip_o2 */
         }
-        
+
+        /* O0_PS: pre-scanned O0 — fixes cold-start and dead-symbol wasted probability.
+         * Only tried when O0 was competitive (o0cmp) and no sample hint forced O1/O2.
+         * Overhead vs plain O0: ZRLE_ALPHA (258) bytes per block.
+         * Expected gain: ~2% on small text files; neutral on large files. */
+        if (o0cmp && w->hint_strat != S_BWT_O1 && w->hint_strat != S_BWT_O2) {
+            asize = arith_enc_o0_ps(zrle_buf, nz, arith_buf);
+            total = 8 + asize;
+            if (total < w->best_size) {
+                w->best_size = total; w->best_strat = S_BWT_O0_PS;
+                put_u32be(w->out_buf, pidx);
+                put_u32be(w->out_buf + 4, nz);
+                memcpy(w->out_buf + 8, arith_buf, asize);
+            }
+
+            /* rANS O0: same ratio as O0_PS, O(1) table-based decode */
+            asize = rans_enc_o0(zrle_buf, nz, arith_buf);
+            total = 8 + asize;
+            if (total < w->best_size) {
+                w->best_size = total; w->best_strat = S_BWT_RANS;
+                put_u32be(w->out_buf, pidx);
+                put_u32be(w->out_buf + 4, nz);
+                memcpy(w->out_buf + 8, arith_buf, asize);
+            }
+
+            /* 2-context RC O0: separate run-ctx vs literal-ctx models */
+            asize = arith_enc_ctx2(zrle_buf, nz, arith_buf);
+            total = 8 + asize;
+            if (total < w->best_size) {
+                w->best_size = total; w->best_strat = S_BWT_CTX2;
+                put_u32be(w->out_buf, pidx);
+                put_u32be(w->out_buf + 4, nz);
+                memcpy(w->out_buf + 8, arith_buf, asize);
+            }
+        }
+
         /* Group C: LZP+BWT */
         if (!skip_lzp) {
             int lzp_size = lzp_encode(data, n, lzp_buf);
@@ -3873,6 +4721,31 @@ static void *thread_groups_BDE(void *arg) {
         }
     }
     
+    /* Group F32: IEEE 754 Float32 XOR-delta → BWT+RC */
+    /* Targets scientific/sensor data where consecutive floats share exponent bits.
+       Uses delta_buf (already allocated, size n) as the XOR-transformed buffer. */
+    if (w->hint_strat < 0 || w->hint_strat == S_F32_BWT) {
+        if (float_xor_detect(data, n)) {
+            float_xor_encode(data, n, delta_buf);  /* delta_buf reused */
+            pidx = bwt_encode_ws(delta_buf, n, bwt_buf, w->bwt_ws);
+            mtf_encode(bwt_buf, n, mtf_buf);
+            nz = zrle_encode(mtf_buf, n, zrle_buf);
+            asize = arith_enc_o0(zrle_buf, nz, arith_buf);
+            total = 8 + asize;
+            if (total < w->best_size) {
+                w->best_size = total; w->best_strat = S_F32_BWT;
+                put_u32be(w->out_buf, pidx);
+                put_u32be(w->out_buf + 4, nz);
+                memcpy(w->out_buf + 8, arith_buf, asize);
+                fprintf(stderr, "    [F32XOR+BWT] %d -> %d (%.2fx) *** NEW BEST ***\n",
+                        n, total, (double)n / total);
+            } else {
+                fprintf(stderr, "    [F32XOR+BWT] %d -> %d (%.2fx)\n",
+                        n, total, (double)n / total);
+            }
+        }
+    }
+
     /* Group E: LZ77+BWT */
     /* v10.2: Skip LZ77 if sample showed BWT/Delta wins */
     if (w->hint_strat < 0 || w->hint_strat == S_LZ77_O0 || w->hint_strat == S_LZ77_O1)
@@ -3942,13 +4815,15 @@ static double ascii_ratio(const uint8_t *data, int n) {
 #define SAMPLE_THRESHOLD (4*1024*1024) /* only for blocks > 4 MB */
 
 static int is_ac_strategy(int s) {
-    return s == S_BWT_O0 || s == S_BWT_O1 || s == S_BWT_O2 ||
+    return s == S_BWT_O0 || s == S_BWT_O1 || s == S_BWT_O2 || s == S_BWT_O0_PS ||
+           s == S_BWT_RANS || s == S_BWT_CTX2 || s == S_BWT_O1_PS ||
            s == S_LZP_BWT_O0 || s == S_LZP_BWT_O1 || s == S_LZP_BWT_O2;
 }
 static int is_bde_strategy(int s) {
     return s == S_DBWT_O0 || s == S_DBWT_O1 || s == S_DBWT_O2 ||
            s == S_DLZP_BWT_O0 || s == S_DLZP_BWT_O1 || s == S_DLZP_BWT_O2 ||
-           s == S_LZ77_O0 || s == S_LZ77_O1;
+           s == S_LZ77_O0 || s == S_LZ77_O1 ||
+           s == S_F32_BWT;
 }
 
 static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, BWTWorkspace *bwt_ws, CompressWorkspace *cws) {
@@ -4580,12 +5455,18 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
         b64_decode_pos(p, pos_tbl_sz, runs, n_runs);
         p += pos_tbl_sz;
 
+        /* Decompress skeleton and decoded substreams in parallel (independent) */
+        const uint8_t *sk_data  = p;
+        const uint8_t *dec_data = p + sk_comp_sz;
         uint8_t *skeleton = (uint8_t*)malloc(skel_orig > 0 ? skel_orig : 1);
-        decompress_substream(p, sk_comp_sz, sk_order, skel_orig, skeleton);
-        p += sk_comp_sz;
-
-        uint8_t *decoded = (uint8_t*)malloc(dec_orig > 0 ? dec_orig : 1);
-        decompress_substream(p, dec_comp_sz, dec_order, dec_orig, decoded);
+        uint8_t *decoded  = (uint8_t*)malloc(dec_orig > 0 ? dec_orig : 1);
+        SubstreamArg sarg = {sk_data,  sk_comp_sz,  sk_order,  skel_orig, skeleton};
+        SubstreamArg darg = {dec_data, dec_comp_sz, dec_order, dec_orig,  decoded};
+        pthread_t sth, dth;
+        pthread_create(&sth, NULL, decompress_substream_thread, &sarg);
+        pthread_create(&dth, NULL, decompress_substream_thread, &darg);
+        pthread_join(sth, NULL);
+        pthread_join(dth, NULL);
 
         /* Reconstruct: interleave skeleton and base64-re-encoded data */
         int o = 0, sk = 0, dc = 0, prev_end = 0;
@@ -4616,21 +5497,27 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
         int pos_comp_sz  = get_u32be(p); p += 4;
         int pos_order    = *p++;
 
-        /* Decompress position table */
-        uint8_t *pos_tbl = (uint8_t*)malloc(pos_tbl_orig > 0 ? pos_tbl_orig : 1);
-        decompress_substream(p, pos_comp_sz, pos_order, pos_tbl_orig, pos_tbl);
-        p += pos_comp_sz;
+        /* Decompress all 3 substreams in parallel (pos_tbl, skeleton, decoded are independent) */
+        const uint8_t *pos_data = p;
+        const uint8_t *sk_data  = p + pos_comp_sz;
+        const uint8_t *dec_data = p + pos_comp_sz + sk_comp_sz;
+        uint8_t *pos_tbl  = (uint8_t*)malloc(pos_tbl_orig > 0 ? pos_tbl_orig : 1);
+        uint8_t *skeleton = (uint8_t*)malloc(skel_orig > 0 ? skel_orig : 1);
+        uint8_t *decoded  = (uint8_t*)malloc(dec_orig > 0 ? dec_orig : 1);
+        SubstreamArg parg = {pos_data, pos_comp_sz, pos_order, pos_tbl_orig, pos_tbl};
+        SubstreamArg sarg = {sk_data,  sk_comp_sz,  sk_order,  skel_orig,    skeleton};
+        SubstreamArg darg = {dec_data, dec_comp_sz, dec_order, dec_orig,     decoded};
+        pthread_t pth, sth, dth;
+        pthread_create(&pth, NULL, decompress_substream_thread, &parg);
+        pthread_create(&sth, NULL, decompress_substream_thread, &sarg);
+        pthread_create(&dth, NULL, decompress_substream_thread, &darg);
+        pthread_join(pth, NULL);
+        pthread_join(sth, NULL);
+        pthread_join(dth, NULL);
 
         B64Run *runs = (B64Run*)malloc(n_runs * sizeof(B64Run));
         b64_decode_pos(pos_tbl, pos_tbl_orig, runs, n_runs);
         free(pos_tbl);
-
-        uint8_t *skeleton = (uint8_t*)malloc(skel_orig > 0 ? skel_orig : 1);
-        decompress_substream(p, sk_comp_sz, sk_order, skel_orig, skeleton);
-        p += sk_comp_sz;
-
-        uint8_t *decoded = (uint8_t*)malloc(dec_orig > 0 ? dec_orig : 1);
-        decompress_substream(p, dec_comp_sz, dec_order, dec_orig, decoded);
 
         /* Reconstruct */
         int o = 0, sk = 0, dc = 0, prev_end = 0;
@@ -4697,9 +5584,13 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
                  strat == S_LZP_BWT_O2 || strat == S_DLZP_BWT_O2);
     int is_o1 = (strat == S_BWT_O1 || strat == S_DBWT_O1 ||
                  strat == S_LZP_BWT_O1 || strat == S_DLZP_BWT_O1);
-    if (is_o2)      arith_dec_o2(arith_data, nz, zrle_buf);
-    else if (is_o1) arith_dec_o1(arith_data, nz, zrle_buf);
-    else            arith_dec_o0(arith_data, nz, zrle_buf);
+    if (is_o2)                        arith_dec_o2(arith_data, nz, zrle_buf);
+    else if (is_o1)                   arith_dec_o1(arith_data, nz, zrle_buf);
+    else if (strat == S_BWT_O0_PS)    arith_dec_o0_ps(arith_data, nz, zrle_buf);
+    else if (strat == S_BWT_RANS)     rans_dec_o0(arith_data, nz, zrle_buf);
+    else if (strat == S_BWT_CTX2)     arith_dec_ctx2(arith_data, nz, zrle_buf);
+    else if (strat == S_BWT_O1_PS)    arith_dec_o1_ps(arith_data, nz, zrle_buf);
+    else                              arith_dec_o0(arith_data, nz, zrle_buf);
 
     zrle_decode(zrle_buf, nz, mtf_buf, decode_size);
     mtf_decode(mtf_buf, decode_size, bwt_buf);
@@ -4721,6 +5612,13 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
         uint8_t *tmp = (uint8_t*)malloc(orig_size);
         memcpy(tmp, out, orig_size);
         delta_decode(tmp, orig_size, out);
+        free(tmp);
+    }
+
+    if (strat == S_F32_BWT) {
+        uint8_t *tmp = (uint8_t*)malloc(orig_size);
+        memcpy(tmp, out, orig_size);
+        float_xor_decode(tmp, orig_size, out);
         free(tmp);
     }
 
@@ -4979,6 +5877,41 @@ static int file_compress(const char *inpath, const char *outpath, int block_size
     return 0;
 }
 
+/* ===== Parallel Block Decompression Helpers ===== */
+#define HP_PAR_THREADS 4
+
+typedef struct {
+    int is_dup;
+    uint32_t dup_ref;
+    int strat, csz, orig_b;
+    uint32_t expected_crc;
+    uint8_t *cdata;   /* compressed data (malloced, NULL for dup) */
+    uint8_t *outbuf;  /* decompressed output (malloced, NULL for dup) */
+    int crc_ok;
+} HpParBlock;
+
+typedef struct {
+    HpParBlock *blocks;
+    int n;
+    pthread_mutex_t mu;
+    int next;
+} HpParQ;
+
+static void *hp_par_decomp_worker(void *arg) {
+    HpParQ *q = (HpParQ*)arg;
+    for (;;) {
+        pthread_mutex_lock(&q->mu);
+        int i = q->next++;
+        pthread_mutex_unlock(&q->mu);
+        if (i >= q->n) break;
+        HpParBlock *b = &q->blocks[i];
+        if (b->is_dup) continue;
+        decompress_block(b->cdata, b->csz, b->strat, b->orig_b, b->outbuf);
+        b->crc_ok = (crc32(b->outbuf, b->orig_b) == b->expected_crc);
+    }
+    return NULL;
+}
+
 /* ===== File Decompress ===== */
 static int file_decompress(const char *inpath, const char *outpath) {
     FILE *fin = fopen(inpath, "rb");
@@ -4998,47 +5931,91 @@ static int file_decompress(const char *inpath, const char *outpath) {
     FILE *fout = fopen(outpath, "wb");
     if (!fout) { fprintf(stderr, "Cannot create %s\n", outpath); fclose(fin); return 1; }
 
-    uint8_t *outbuf = (uint8_t*)malloc(block_size);
-    uint8_t *cbuf   = (uint8_t*)malloc(block_size + block_size/4 + 4096);
-
     /* Store decompressed blocks for dedup references */
     uint8_t **block_cache = (uint8_t**)calloc(nblocks, sizeof(uint8_t*));
     int *block_sizes = (int*)calloc(nblocks, sizeof(int));
 
     clock_t start = clock();
+    int error = 0;
 
-    for (uint32_t b = 0; b < nblocks; b++) {
-        int flags = fgetc(fin);
-        if (flags & 1) {
-            /* Duplicate */
-            uint32_t ref = read32(fin);
-            fwrite(block_cache[ref], 1, block_sizes[ref], fout);
-            block_cache[b] = (uint8_t*)malloc(block_sizes[ref]);
-            memcpy(block_cache[b], block_cache[ref], block_sizes[ref]);
-            block_sizes[b] = block_sizes[ref];
-            fprintf(stderr, "  Block %d/%d: DUP of %d\n", b+1, nblocks, ref+1);
-        } else {
-            int strat  = fgetc(fin);
-            int csz    = (int)read32(fin);
-            int orig_b = (int)read32(fin);
-            uint32_t expected_crc = read32(fin);
-            fread(cbuf, 1, csz, fin);
-
-            decompress_block(cbuf, csz, strat, orig_b, outbuf);
-
-            uint32_t actual_crc = crc32(outbuf, orig_b);
-            if (actual_crc != expected_crc) {
-                fprintf(stderr, "  Block %d: CRC MISMATCH! Expected %08X got %08X\n",
-                        b+1, expected_crc, actual_crc);
-                fclose(fin); fclose(fout); return 1;
+    /* Process blocks in parallel batches of HP_PAR_THREADS.
+     * Non-dup blocks within a batch are decompressed simultaneously.
+     * Dup blocks (fast memcpy) are handled after their batch's threads join. */
+    HpParBlock batch[HP_PAR_THREADS];
+    uint32_t b = 0;
+    while (b < nblocks && !error) {
+        /* Fill batch */
+        int bsz = 0;
+        while (bsz < HP_PAR_THREADS && b < nblocks) {
+            HpParBlock *pb = &batch[bsz];
+            int flags = fgetc(fin);
+            pb->is_dup = (flags & 1);
+            pb->cdata  = NULL;
+            pb->outbuf = NULL;
+            pb->crc_ok = 0;
+            if (pb->is_dup) {
+                pb->dup_ref = read32(fin);
+            } else {
+                pb->strat  = fgetc(fin);
+                pb->csz    = (int)read32(fin);
+                pb->orig_b = (int)read32(fin);
+                pb->expected_crc = read32(fin);
+                pb->cdata  = (uint8_t*)malloc(pb->csz);
+                pb->outbuf = (uint8_t*)malloc(pb->orig_b > 0 ? pb->orig_b : 1);
+                fread(pb->cdata, 1, pb->csz, fin);
             }
+            bsz++;
+            b++;
+        }
 
-            fwrite(outbuf, 1, orig_b, fout);
-            block_cache[b] = (uint8_t*)malloc(orig_b);
-            memcpy(block_cache[b], outbuf, orig_b);
-            block_sizes[b] = orig_b;
-            fprintf(stderr, "  Block %d/%d: %d -> %d [%s] CRC OK\n",
-                    b+1, nblocks, csz, orig_b, strat_names[strat]);
+        /* Launch parallel decompression for non-dup blocks in this batch */
+        HpParQ q;
+        q.blocks = batch;
+        q.n = bsz;
+        q.next = 0;
+        pthread_mutex_init(&q.mu, NULL);
+        int nt = bsz < HP_PAR_THREADS ? bsz : HP_PAR_THREADS;
+        pthread_t threads[HP_PAR_THREADS];
+        for (int t = 0; t < nt; t++)
+            pthread_create(&threads[t], NULL, hp_par_decomp_worker, &q);
+        for (int t = 0; t < nt; t++)
+            pthread_join(threads[t], NULL);
+        pthread_mutex_destroy(&q.mu);
+
+        /* Write batch output in order, handle dup blocks */
+        uint32_t base_b = b - bsz;
+        for (int i = 0; i < bsz; i++) {
+            HpParBlock *pb = &batch[i];
+            uint32_t blk_idx = base_b + (uint32_t)i;
+            if (pb->is_dup) {
+                uint32_t ref = pb->dup_ref;
+                fwrite(block_cache[ref], 1, block_sizes[ref], fout);
+                block_cache[blk_idx] = (uint8_t*)malloc(block_sizes[ref]);
+                memcpy(block_cache[blk_idx], block_cache[ref], block_sizes[ref]);
+                block_sizes[blk_idx] = block_sizes[ref];
+                fprintf(stderr, "  Block %d/%d: DUP of %d\n", blk_idx+1, nblocks, ref+1);
+            } else {
+                if (!pb->crc_ok) {
+                    fprintf(stderr, "  Block %d: CRC MISMATCH!\n", blk_idx+1);
+                    error = 1;
+                }
+                fwrite(pb->outbuf, 1, pb->orig_b, fout);
+                block_cache[blk_idx] = pb->outbuf;  /* transfer ownership */
+                pb->outbuf = NULL;
+                block_sizes[blk_idx] = pb->orig_b;
+                fprintf(stderr, "  Block %d/%d: %d -> %d [%s] CRC %s\n",
+                        blk_idx+1, nblocks, pb->csz, pb->orig_b,
+                        strat_names[pb->strat], pb->crc_ok ? "OK" : "FAIL");
+                free(pb->cdata);
+                pb->cdata = NULL;
+            }
+        }
+        /* Free any unwritten outbufs on error */
+        if (error) {
+            for (int i = 0; i < bsz; i++) {
+                if (batch[i].cdata)  free(batch[i].cdata);
+                if (batch[i].outbuf) free(batch[i].outbuf);
+            }
         }
     }
 
@@ -5046,11 +6023,10 @@ static int file_decompress(const char *inpath, const char *outpath) {
     fprintf(stderr, "[HP5] Decompressed in %.1fs (%.1f MB/s)\n",
             elapsed, orig_size / 1048576.0 / (elapsed > 0.001 ? elapsed : 0.001));
 
-    for (uint32_t b = 0; b < nblocks; b++) free(block_cache[b]);
+    for (uint32_t b2 = 0; b2 < nblocks; b2++) free(block_cache[b2]);
     free(block_cache); free(block_sizes);
-    free(outbuf); free(cbuf);
     fclose(fin); fclose(fout);
-    return 0;
+    return error;
 }
 
 /* ===== HPK6 Archive Functions ===== */
@@ -5637,7 +6613,7 @@ static int archive_list(const char *inpath) {
 }
 
 /* ===== Main ===== */
-#ifndef HYPERPACK_WASM
+#if !defined(HYPERPACK_WASM) && !defined(HYPERPACK_LIB)
 int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr,
@@ -5756,4 +6732,4 @@ int main(int argc, char **argv) {
         return 1;
     }
 }
-#endif /* HYPERPACK_WASM */
+#endif /* !HYPERPACK_WASM && !HYPERPACK_LIB */

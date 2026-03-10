@@ -1,0 +1,306 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master, 'claude/**']
+  pull_request:
+  workflow_dispatch:
+
+# Needed for deploy-pages job
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  # ─── Linux x86-64 ────────────────────────────────────────────────────────
+  build-linux:
+    name: Linux (x86-64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: gcc -O2 -Wall -o hyperpack src/hyperpack.c -lm -lpthread
+
+      - name: Smoke test
+        run: |
+          echo "HyperPack smoke test" > test.txt
+          ./hyperpack c test.txt test.hpk
+          ./hyperpack d test.hpk test_out.txt
+          diff test.txt test_out.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperpack-linux-x64
+          path: hyperpack
+
+  # ─── macOS universal (x86-64 + arm64) ────────────────────────────────────
+  build-macos:
+    name: macOS (universal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build x86-64
+        run: clang -O2 -Wall -target x86_64-apple-macos11 -o hyperpack_x64 src/hyperpack.c -lm -lpthread
+
+      - name: Build arm64
+        run: clang -O2 -Wall -target arm64-apple-macos11 -o hyperpack_arm64 src/hyperpack.c -lm -lpthread
+
+      - name: Create universal binary
+        run: lipo -create hyperpack_x64 hyperpack_arm64 -output hyperpack
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperpack-macos-universal
+          path: hyperpack
+
+  # ─── Windows x86-64 (MSYS2 / MinGW-w64) ─────────────────────────────────
+  build-windows:
+    name: Windows (x86-64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc diffutils
+
+      - name: Build
+        run: gcc -O2 -Wall -o hyperpack.exe src/hyperpack.c -lm -lpthread
+
+      - name: Smoke test
+        run: |
+          echo "HyperPack smoke test" > test.txt
+          ./hyperpack.exe c test.txt test.hpk
+          ./hyperpack.exe d test.hpk test_out.txt
+          diff test.txt test_out.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperpack-windows-x64
+          path: hyperpack.exe
+
+  # ─── WASM + Web frontend ──────────────────────────────────────────────────
+  build-wasm:
+    name: WASM + Web frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: '3.1.74'
+          actions-cache-folder: emsdk-cache
+
+      - name: Build WASM
+        run: bash build-wasm.sh
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install frontend deps
+        run: cd hyperpack-web && npm install
+
+      - name: Type-check frontend
+        run: cd hyperpack-web && npm run lint
+
+      - name: Build frontend
+        run: cd hyperpack-web && npm run build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperpack-wasm
+          path: |
+            hyperpack-web/public/hyperpack.js
+            hyperpack-web/public/hyperpack.wasm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperpack-web-dist
+          path: hyperpack-web/dist/
+
+  # ─── Tauri desktop app (Linux) ────────────────────────────────────────────
+  build-tauri-linux:
+    name: Tauri (Linux x86-64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hyperpack-web/src-tauri
+
+      - name: Install frontend deps
+        run: cd hyperpack-web && npm install
+
+      - name: Build Tauri app
+        run: cd hyperpack-web && npm run tauri build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperpack-tauri-linux
+          path: |
+            hyperpack-web/src-tauri/target/release/bundle/deb/*.deb
+            hyperpack-web/src-tauri/target/release/bundle/appimage/*.AppImage
+            hyperpack-web/src-tauri/target/release/hyperpack
+
+  # ─── Tauri desktop app (macOS) ────────────────────────────────────────────
+  build-tauri-macos:
+    name: Tauri (macOS universal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Rust (universal targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hyperpack-web/src-tauri
+
+      - name: Install frontend deps
+        run: cd hyperpack-web && npm install
+
+      - name: Build Tauri app (universal)
+        run: cd hyperpack-web && npm run tauri build -- --target universal-apple-darwin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperpack-tauri-macos
+          path: hyperpack-web/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+
+  # ─── Tauri desktop app (Windows) ──────────────────────────────────────────
+  # hyperpack.c uses POSIX APIs (pthread, dirent, unistd) that are only available
+  # via MinGW-w64. We therefore use the x86_64-pc-windows-gnu Rust toolchain so
+  # that both the C library and Rust code share the same GNU/MinGW ABI throughout.
+  # MSVC link.exe cannot link MinGW-compiled objects (unresolved pthread, dirent…).
+  build-tauri-windows:
+    name: Tauri (Windows x86-64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinGW-w64 via MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+
+      - name: Add MinGW-w64 to PATH
+        shell: pwsh
+        run: Add-Content $env:GITHUB_PATH "C:\msys64\mingw64\bin"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Use the GNU Rust toolchain so the MinGW-compiled C library links correctly.
+      # Tauri 2 supports x86_64-pc-windows-gnu and uses NSIS (not WiX) for bundling.
+      - name: Setup Rust (GNU toolchain)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-gnu
+          targets: x86_64-pc-windows-gnu
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hyperpack-web/src-tauri
+
+      - name: Install frontend deps
+        run: cd hyperpack-web && npm install
+
+      - name: Build Tauri app
+        run: cd hyperpack-web && npm run tauri build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperpack-tauri-windows
+          # GNU toolchain produces NSIS (.exe) instead of WiX (.msi)
+          path: |
+            hyperpack-web/src-tauri/target/release/bundle/nsis/*.exe
+            hyperpack-web/src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: ignore
+
+  # ─── GitHub Pages ─────────────────────────────────────────────────────────
+  deploy-pages:
+    name: Deploy to GitHub Pages
+    runs-on: ubuntu-latest
+    # Only deploy on push to main/master — not on PRs or feature branches
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    needs: [build-wasm]
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: '3.1.74'
+          actions-cache-folder: emsdk-cache
+
+      - name: Build WASM
+        run: bash build-wasm.sh
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install frontend deps
+        run: cd hyperpack-web && npm install
+
+      - name: Build frontend for GitHub Pages
+        run: cd hyperpack-web && GITHUB_PAGES=1 npm run build
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: hyperpack-web/dist/
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4

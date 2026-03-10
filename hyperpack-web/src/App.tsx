@@ -14,6 +14,7 @@ import { CompressParams, FileEntry } from './workers/bridge';
 const DEFAULT_SETTINGS: CompressParams = {
   blockSizeMB: 8,
   archiveMode: false,
+  nthreads: 0, // 0 = auto (only meaningful in native mode)
 };
 
 export default function App() {
