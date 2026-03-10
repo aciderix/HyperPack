@@ -7,7 +7,7 @@ self.onmessage = async function (e) {
   if (msg.type === 'init') {
     try {
       importScripts('hyperpack.js');
-      Module = await createHyperPackModule({
+      Module = await createHyperPack({
         print: (text) => { /* stdout — ignore */ },
         printErr: (text) => { parseProgress(text); }
       });
@@ -64,19 +64,15 @@ self.onmessage = async function (e) {
 
 /* ===== HPK5 single file compress ===== */
 function compressSingle(file, params, outName) {
-  const inPath = '/input_file';
-  const outPath = '/output.hpk';
+  const inPath = '/input';       /* C hardcodes this path */
+  const outPath = '/output.hpk'; /* C hardcodes this path */
   cleanupMemfs([inPath, outPath]);
 
   const data = new Uint8Array(file.data);
   Module.FS.writeFile(inPath, data);
 
   const start = performance.now();
-  const ret = Module._hp_compress(
-    Module.allocateUTF8(inPath),
-    Module.allocateUTF8(outPath),
-    params.blockSizeMB || 8
-  );
+  const ret = Module._hp_compress(params.blockSizeMB || 8); /* C takes only block_mb */
 
   if (ret !== 0) {
     self.postMessage({ type: 'error', message: 'Compression failed (code ' + ret + ')' });
@@ -135,9 +131,11 @@ function compressArchive(files, params, outName) {
   }
 
   const start = performance.now();
-  const dirPtr = Module.allocateUTF8(dirName);
-  const outPtr = Module.allocateUTF8(outPath);
+  const dirPtr = Module.stringToNewUTF8(dirName);
+  const outPtr = Module.stringToNewUTF8(outPath);
   const ret = Module._hp_archive_compress(dirPtr, outPtr, params.blockSizeMB || 8);
+  Module._free(dirPtr);
+  Module._free(outPtr);
 
   if (ret !== 0) {
     self.postMessage({ type: 'error', message: 'Archive compression failed (code ' + ret + ')' });
@@ -168,7 +166,7 @@ function compressArchive(files, params, outName) {
 /* ===== Decompress (auto-detect HPK5/HPK6) ===== */
 function decompressFile(fileBuffer, fileName) {
   const inPath = '/input.hpk';
-  const outPath = '/output_file';
+  const outPath = '/output';    /* C hardcodes this path for HPK5 output */
   const outDir = '/output_dir';
   cleanupMemfs([inPath, outPath]);
   removeRecursive(outDir);
@@ -177,19 +175,21 @@ function decompressFile(fileBuffer, fileName) {
   Module.FS.writeFile(inPath, data);
 
   // Detect format
-  const fmtPtr = Module.allocateUTF8(inPath);
+  const fmtPtr = Module.stringToNewUTF8(inPath);
   const fmt = Module._hp_detect_format(fmtPtr);
+  Module._free(fmtPtr);
 
   const start = performance.now();
 
   if (fmt === 6) {
     // HPK6 archive
     try { Module.FS.mkdir(outDir); } catch (e) {}
-    const outDirPtr = Module.allocateUTF8(outDir);
+    const inPtr2 = Module.stringToNewUTF8(inPath);
+    const outDirPtr = Module.stringToNewUTF8(outDir);
     const nullPtr = 0; // NULL for extract_pattern = extract all
-    const ret = Module._hp_archive_decompress(
-      Module.allocateUTF8(inPath), outDirPtr, nullPtr
-    );
+    const ret = Module._hp_archive_decompress(inPtr2, outDirPtr, nullPtr);
+    Module._free(inPtr2);
+    Module._free(outDirPtr);
 
     if (ret !== 0) {
       self.postMessage({ type: 'error', message: 'Archive decompression failed' });
@@ -234,10 +234,7 @@ function decompressFile(fileBuffer, fileName) {
     removeRecursive(outDir);
   } else {
     // HPK5 single file
-    const ret = Module._hp_decompress(
-      Module.allocateUTF8(inPath),
-      Module.allocateUTF8(outPath)
-    );
+    const ret = Module._hp_decompress(); /* C takes no args, uses hardcoded paths */
 
     if (ret !== 0) {
       self.postMessage({ type: 'error', message: 'Decompression failed' });
@@ -274,7 +271,9 @@ function listArchive(fileBuffer) {
   Module.FS.writeFile(inPath, data);
 
   listEntries = [];
-  const ret = Module._hp_archive_list(Module.allocateUTF8(inPath));
+  const inPtr = Module.stringToNewUTF8(inPath);
+  const ret = Module._hp_archive_list(inPtr);
+  Module._free(inPtr);
 
   if (ret !== 0) {
     self.postMessage({ type: 'error', message: 'List failed' });

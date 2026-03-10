@@ -1,0 +1,124 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master, 'claude/**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ─── Linux x86-64 ────────────────────────────────────────────────────────
+  build-linux:
+    name: Linux (x86-64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: gcc -O2 -Wall -o hyperpack src/hyperpack.c -lm -lpthread
+
+      - name: Smoke test
+        run: |
+          echo "HyperPack smoke test" > test.txt
+          ./hyperpack c test.txt test.hpk
+          ./hyperpack d test.hpk test_out.txt
+          diff test.txt test_out.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperpack-linux-x64
+          path: hyperpack
+
+  # ─── macOS universal (x86-64 + arm64) ────────────────────────────────────
+  build-macos:
+    name: macOS (universal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build x86-64
+        run: clang -O2 -Wall -target x86_64-apple-macos11 -o hyperpack_x64 src/hyperpack.c -lm -lpthread
+
+      - name: Build arm64
+        run: clang -O2 -Wall -target arm64-apple-macos11 -o hyperpack_arm64 src/hyperpack.c -lm -lpthread
+
+      - name: Create universal binary
+        run: lipo -create hyperpack_x64 hyperpack_arm64 -output hyperpack
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperpack-macos-universal
+          path: hyperpack
+
+  # ─── Windows x86-64 (MSYS2 / MinGW-w64) ─────────────────────────────────
+  build-windows:
+    name: Windows (x86-64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+
+      - name: Build
+        run: gcc -O2 -Wall -o hyperpack.exe src/hyperpack.c -lm -lpthread
+
+      - name: Smoke test
+        run: |
+          echo "HyperPack smoke test" > test.txt
+          ./hyperpack.exe c test.txt test.hpk
+          ./hyperpack.exe d test.hpk test_out.txt
+          diff test.txt test_out.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperpack-windows-x64
+          path: hyperpack.exe
+
+  # ─── WASM + Web frontend ──────────────────────────────────────────────────
+  build-wasm:
+    name: WASM + Web frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: '3.1.74'
+          actions-cache-folder: emsdk-cache
+
+      - name: Build WASM
+        run: bash build-wasm.sh
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install frontend deps
+        run: cd hyperpack-web && npm install
+
+      - name: Type-check frontend
+        run: cd hyperpack-web && npm run lint
+
+      - name: Build frontend
+        run: cd hyperpack-web && npm run build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperpack-wasm
+          path: |
+            hyperpack-web/public/hyperpack.js
+            hyperpack-web/public/hyperpack.wasm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperpack-web-dist
+          path: hyperpack-web/dist/
