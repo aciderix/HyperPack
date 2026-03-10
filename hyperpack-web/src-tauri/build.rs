@@ -18,15 +18,18 @@ fn main() {
 
     // Link platform-specific system libraries
     if cfg!(target_os = "windows") {
-        // With x86_64-pc-windows-gnu, MinGW pthreads must be linked explicitly.
+        // With x86_64-pc-windows-gnu, MinGW pthreads and zlib must be linked explicitly.
         println!("cargo:rustc-link-lib=pthread");
+        println!("cargo:rustc-link-lib=z");
     } else if cfg!(target_os = "macos") {
         // libm is part of libSystem; pthreads are bundled too — no explicit link.
         println!("cargo:rustc-link-lib=pthread");
+        println!("cargo:rustc-link-lib=z");
     } else {
         // Linux / other POSIX
         println!("cargo:rustc-link-lib=pthread");
         println!("cargo:rustc-link-lib=m");
+        println!("cargo:rustc-link-lib=z");
     }
 
     println!("cargo:rerun-if-changed=../../src/hyperpack.c");

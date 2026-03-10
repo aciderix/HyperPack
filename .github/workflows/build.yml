@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build
-        run: gcc -O2 -Wall -o hyperpack src/hyperpack.c -lm -lpthread
+        run: gcc -O2 -Wall -o hyperpack src/hyperpack.c -lm -lpthread -lz
 
       - name: Smoke test
         run: |
@@ -43,10 +43,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build x86-64
-        run: clang -O2 -Wall -target x86_64-apple-macos11 -o hyperpack_x64 src/hyperpack.c -lm -lpthread
+        run: clang -O2 -Wall -target x86_64-apple-macos11 -o hyperpack_x64 src/hyperpack.c -lm -lpthread -lz
 
       - name: Build arm64
-        run: clang -O2 -Wall -target arm64-apple-macos11 -o hyperpack_arm64 src/hyperpack.c -lm -lpthread
+        run: clang -O2 -Wall -target arm64-apple-macos11 -o hyperpack_arm64 src/hyperpack.c -lm -lpthread -lz
 
       - name: Create universal binary
         run: lipo -create hyperpack_x64 hyperpack_arm64 -output hyperpack
@@ -70,10 +70,10 @@ jobs:
         with:
           msystem: MINGW64
           update: false
-          install: mingw-w64-x86_64-gcc diffutils
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-zlib diffutils
 
       - name: Build
-        run: gcc -O2 -Wall -o hyperpack.exe src/hyperpack.c -lm -lpthread
+        run: gcc -O2 -Wall -o hyperpack.exe src/hyperpack.c -lm -lpthread -lz
 
       - name: Smoke test
         run: |
@@ -146,7 +146,8 @@ jobs:
             patchelf \
             libgtk-3-dev \
             libsoup-3.0-dev \
-            libjavascriptcoregtk-4.1-dev
+            libjavascriptcoregtk-4.1-dev \
+            zlib1g-dev
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -224,7 +225,7 @@ jobs:
         with:
           msystem: MINGW64
           update: false
-          install: mingw-w64-x86_64-gcc
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-zlib
 
       - name: Add MinGW-w64 to PATH
         shell: pwsh
