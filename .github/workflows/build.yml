@@ -253,8 +253,16 @@ jobs:
         run: cd hyperpack-web && npm install
 
       - name: Copy libwinpthread-1.dll for Tauri bundling
-        shell: msys2 {0}
-        run: cp /mingw64/bin/libwinpthread-1.dll hyperpack-web/src-tauri/
+        shell: pwsh
+        run: |
+          # Locate gcc.exe (MinGW bin is in PATH from the previous step) and
+          # copy the DLL from that directory into src-tauri/ so that
+          # tauri_build::build() can validate it as a bundle resource.
+          $mingwBin = Split-Path (Get-Command gcc.exe -ErrorAction Stop).Source
+          $src = Join-Path $mingwBin "libwinpthread-1.dll"
+          $dest = Join-Path $env:GITHUB_WORKSPACE "hyperpack-web\src-tauri\libwinpthread-1.dll"
+          Copy-Item $src $dest -Force
+          Write-Host "Copied $src -> $dest"
 
       - name: Build Tauri app
         run: cd hyperpack-web && npm run tauri build
