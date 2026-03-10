@@ -31,6 +31,7 @@ emcc "$SRC" \
     -s NO_EXIT_RUNTIME=1 \
     -s INVOKE_RUN=0 \
     -lm \
+    -s USE_ZLIB=1 \
     -o "$OUT_DIR/hyperpack.js"
 
 echo "[WASM] Output:"
