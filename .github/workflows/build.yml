@@ -253,22 +253,8 @@ jobs:
         run: cd hyperpack-web && npm install
 
       - name: Copy libwinpthread-1.dll for Tauri bundling
-        shell: pwsh
-        run: |
-          # Search for libwinpthread-1.dll across common MSYS2 install locations
-          $dll = Get-ChildItem -Path "C:\msys64", "C:\tools\msys64", "C:\msys2" `
-            -Recurse -Filter "libwinpthread-1.dll" -ErrorAction SilentlyContinue `
-            | Select-Object -First 1 -ExpandProperty FullName
-          if (-not $dll) {
-            # Fallback: it should be on PATH since we added MinGW64\bin to GITHUB_PATH
-            $dll = (where.exe libwinpthread-1.dll 2>$null) | Select-Object -First 1
-          }
-          if ($dll) {
-            Copy-Item $dll "hyperpack-web/src-tauri/"
-            Write-Host "Copied $dll to src-tauri/"
-          } else {
-            Write-Error "libwinpthread-1.dll not found on this runner"
-          }
+        shell: msys2 {0}
+        run: cp /mingw64/bin/libwinpthread-1.dll hyperpack-web/src-tauri/
 
       - name: Build Tauri app
         run: cd hyperpack-web && npm run tauri build
