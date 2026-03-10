@@ -2768,6 +2768,14 @@ static int compress_substream(const uint8_t *data, int n, uint8_t *out, int *sub
         put_u32be(out, pidx); put_u32be(out + 4, nz);
         memcpy(out + 8, arith_s, asize);
     }
+    /* BWT+rANS O0 (sub_order 15): same ratio as O0, O(1) table decode */
+    asize = rans_enc_o0(zrle_s, nz, arith_s);
+    total = 8 + asize;
+    if (total < best) {
+        best = total; *sub_order = 15;
+        put_u32be(out, pidx); put_u32be(out + 4, nz);
+        memcpy(out + 8, arith_s, asize);
+    }
 
     /* === Strategy B: PPM direct (sub_order 3) — only for small streams === */
     if (n <= 33554432) {  /* 32 MB */
@@ -2798,6 +2806,14 @@ static int compress_substream(const uint8_t *data, int n, uint8_t *out, int *sub
                 memcpy(out + 8, arith_s, asize);
             }
         }
+        /* Delta+BWT+rANS O0 (sub_order 17) */
+        asize = rans_enc_o0(zrle_s, nz, arith_s);
+        total = 8 + asize;
+        if (total < best) {
+            best = total; *sub_order = 17;
+            put_u32be(out, pidx); put_u32be(out + 4, nz);
+            memcpy(out + 8, arith_s, asize);
+        }
         free(delta_s);
     }
 
@@ -2827,6 +2843,18 @@ static int compress_substream(const uint8_t *data, int n, uint8_t *out, int *sub
                     fprintf(stderr, "      [Sub LZP+BWT+O%d] NEW BEST: %d -> %d (%.2fx)\n",
                             o, n, total, (double)n/total);
                 }
+            }
+            /* LZP+BWT+rANS O0 (sub_order 16) */
+            asize = rans_enc_o0(zrle_s, nz, arith_s);
+            total = 12 + asize;
+            if (total < best) {
+                best = total; *sub_order = 16;
+                put_u32be(out, lzp_size);
+                put_u32be(out + 4, pidx);
+                put_u32be(out + 8, nz);
+                memcpy(out + 12, arith_s, asize);
+                fprintf(stderr, "      [Sub LZP+BWT+rANS] NEW BEST: %d -> %d (%.2fx)\n",
+                        n, total, (double)n/total);
             }
         }
         free(lzp_s);
@@ -2883,6 +2911,18 @@ static int compress_substream(const uint8_t *data, int n, uint8_t *out, int *sub
                         fprintf(stderr, "      [Sub Word+BWT+O%d] *** NEW BEST: %d -> %d (%.2fx) ***\n",
                                 o, n, total, (double)n/total);
                     }
+                }
+                /* Word+BWT+rANS O0 (sub_order 18) */
+                asize = rans_enc_o0(wz, nz, wa);
+                total = 12 + asize;
+                if (total < best) {
+                    best = total; *sub_order = 18;
+                    put_u32be(out, wpn);
+                    put_u32be(out + 4, pidx);
+                    put_u32be(out + 8, nz);
+                    memcpy(out + 12, wa, asize);
+                    fprintf(stderr, "      [Sub Word+BWT+rANS] *** NEW BEST: %d -> %d (%.2fx) ***\n",
+                            n, total, (double)n/total);
                 }
                 free(wb); free(wm); free(wz); free(wa);
             }
@@ -2944,14 +2984,19 @@ static void decompress_substream(const uint8_t *cdata, int csize, int sub_order,
         return;
     }
 
-    /* Determine type and arith order */
-    int is_delta = (sub_order >= 4 && sub_order <= 6);
-    int is_lzp   = (sub_order >= 7 && sub_order <= 9);
-    int is_word  = (sub_order >= 11 && sub_order <= 13);
+    /* Determine type and arith order
+     * sub_order 15 = BWT+rANS O0
+     * sub_order 16 = LZP+BWT+rANS O0
+     * sub_order 17 = Delta+BWT+rANS O0
+     * sub_order 18 = Word+BWT+rANS O0 */
+    int is_rans  = (sub_order >= 15);
+    int is_delta = (sub_order >= 4 && sub_order <= 6) || sub_order == 17;
+    int is_lzp   = (sub_order >= 7 && sub_order <= 9) || sub_order == 16;
+    int is_word  = (sub_order >= 11 && sub_order <= 13) || sub_order == 18;
     int arith_order = sub_order;
-    if (is_delta) arith_order = sub_order - 4;
-    if (is_lzp)   arith_order = sub_order - 7;
-    if (is_word)  arith_order = sub_order - 11;
+    if (is_delta) arith_order = (sub_order == 17) ? 0 : sub_order - 4;
+    if (is_lzp)   arith_order = (sub_order == 16) ? 0 : sub_order - 7;
+    if (is_word)  arith_order = (sub_order == 18) ? 0 : sub_order - 11;
 
     const uint8_t *p = cdata;
     int lzp_size = 0, wp_enc_size = 0;
@@ -2971,7 +3016,8 @@ static void decompress_substream(const uint8_t *cdata, int csize, int sub_order,
     uint8_t  *mtf_s  = (uint8_t*)malloc(bwt_n);
     uint8_t  *bwt_s  = (uint8_t*)malloc(bwt_n);
 
-    if (arith_order == 2)      arith_dec_o2(p, nz, zrle_s);
+    if (is_rans)               rans_dec_o0(p, nz, zrle_s);
+    else if (arith_order == 2) arith_dec_o2(p, nz, zrle_s);
     else if (arith_order == 1) arith_dec_o1(p, nz, zrle_s);
     else                       arith_dec_o0(p, nz, zrle_s);
 
