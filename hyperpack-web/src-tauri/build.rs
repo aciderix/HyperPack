@@ -18,9 +18,10 @@ fn main() {
 
     // Link platform-specific system libraries
     if cfg!(target_os = "windows") {
-        // With x86_64-pc-windows-gnu, link winpthread statically so that the
+        // With x86_64-pc-windows-gnu, link pthread statically so that the
         // final binary does not depend on libwinpthread-1.dll at runtime.
-        println!("cargo:rustc-link-lib=static=winpthread");
+        // MinGW ships the static pthread library as libpthread.a (not libwinpthread.a).
+        println!("cargo:rustc-link-lib=static=pthread");
         println!("cargo:rustc-link-lib=z");
     } else if cfg!(target_os = "macos") {
         // libm is part of libSystem; pthreads are bundled too — no explicit link.
