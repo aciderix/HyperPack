@@ -39,7 +39,7 @@ export type ListEntry = {
 };
 
 function createWorker(): Worker {
-  return new Worker('/worker.js');
+  return new Worker(import.meta.env.BASE_URL + 'worker.js');
 }
 
 export function useHyperPack() {
