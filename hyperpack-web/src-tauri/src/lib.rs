@@ -87,7 +87,7 @@ async fn hp_compress(
     let bm = block_mb.max(1) as c_int;
 
     let start = std::time::Instant::now();
-    let ret = tokio::task::spawn_blocking(move || unsafe {
+    let ret = tauri::async_runtime::spawn_blocking(move || unsafe {
         hp_lib_compress(in_c.as_ptr(), out_c.as_ptr(), bm, threads)
     })
     .await
@@ -118,7 +118,7 @@ async fn hp_decompress(
     let out_c = to_c(&output_path)?;
 
     let start = std::time::Instant::now();
-    let ret = tokio::task::spawn_blocking(move || unsafe {
+    let ret = tauri::async_runtime::spawn_blocking(move || unsafe {
         hp_lib_decompress(in_c.as_ptr(), out_c.as_ptr())
     })
     .await
@@ -157,7 +157,7 @@ async fn hp_archive_compress(
     let npaths = c_ptrs.len() as c_int;
 
     let start = std::time::Instant::now();
-    let ret = tokio::task::spawn_blocking(move || unsafe {
+    let ret = tauri::async_runtime::spawn_blocking(move || unsafe {
         hp_lib_archive_compress(npaths, c_ptrs.as_ptr(), out_c.as_ptr(), bm, threads)
     })
     .await
@@ -189,7 +189,7 @@ async fn hp_archive_decompress(
     let pat_c = to_c("")?;
 
     let start = std::time::Instant::now();
-    let ret = tokio::task::spawn_blocking(move || unsafe {
+    let ret = tauri::async_runtime::spawn_blocking(move || unsafe {
         hp_lib_archive_decompress(in_c.as_ptr(), out_c.as_ptr(), pat_c.as_ptr())
     })
     .await
