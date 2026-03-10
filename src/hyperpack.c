@@ -9,6 +9,8 @@
  * Usage:   ./hyperpack c [-b SIZE_MB] input output.hpk
  *          ./hyperpack d input.hpk output
  */
+/* Expose fmemopen and other POSIX/GNU extensions (required on MinGW-w64) */
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
