@@ -1,7 +1,6 @@
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
-use serde::{Deserialize, Serialize};
-use tauri::Manager;
+use serde::Serialize;
 
 // ── FFI declarations ──────────────────────────────────────────────────────
 

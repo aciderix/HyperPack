@@ -230,14 +230,17 @@ jobs:
         with:
           workspaces: hyperpack-web/src-tauri
 
+      - name: Add MinGW-w64 to PATH
+        # build.rs calls .compiler("gcc") explicitly so only our C code uses MinGW.
+        # We do NOT set CC/AR env vars globally to avoid breaking other cc crates
+        # (vswhom-sys, etc.) that expect MSVC tools.
+        shell: pwsh
+        run: Add-Content $env:GITHUB_PATH "C:\msys64\mingw64\bin"
+
       - name: Install frontend deps
         run: cd hyperpack-web && npm install
 
       - name: Build Tauri app
-        env:
-          # Force cc crate to use MinGW gcc instead of MSVC cl.exe for C compilation
-          CC: C:\msys64\mingw64\bin\gcc.exe
-          AR: C:\msys64\mingw64\bin\ar.exe
         run: cd hyperpack-web && npm run tauri build
 
       - uses: actions/upload-artifact@v4
