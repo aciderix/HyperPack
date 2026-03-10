@@ -146,19 +146,22 @@ async fn hp_archive_compress(
     nthreads: u32,
 ) -> Result<CompressResult, String> {
     let in_bytes: u64 = input_paths.iter().map(|p| file_size(p)).sum();
+    // Build CStrings here; build raw pointers *inside* the closure so no
+    // non-Send *const c_char values cross the spawn_blocking thread boundary.
     let c_strings: Vec<CString> = input_paths
         .iter()
         .map(|p| to_c(p))
         .collect::<Result<_, _>>()?;
-    let c_ptrs: Vec<*const c_char> = c_strings.iter().map(|s| s.as_ptr()).collect();
     let out_c = to_c(&output_path)?;
     let threads = auto_threads(nthreads);
     let bm = block_mb.max(1) as c_int;
-    let npaths = c_ptrs.len() as c_int;
+    let npaths = c_strings.len() as c_int;
 
     let start = std::time::Instant::now();
-    let ret = tauri::async_runtime::spawn_blocking(move || unsafe {
-        hp_lib_archive_compress(npaths, c_ptrs.as_ptr(), out_c.as_ptr(), bm, threads)
+    let ret = tauri::async_runtime::spawn_blocking(move || {
+        // Raw pointers created and used entirely within this thread — safe.
+        let c_ptrs: Vec<*const c_char> = c_strings.iter().map(|s| s.as_ptr()).collect();
+        unsafe { hp_lib_archive_compress(npaths, c_ptrs.as_ptr(), out_c.as_ptr(), bm, threads) }
     })
     .await
     .map_err(|e| e.to_string())?;
