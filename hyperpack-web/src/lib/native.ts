@@ -99,6 +99,12 @@ export async function getCpuCount(): Promise<number> {
   return invoke('get_cpu_count') as Promise<number>;
 }
 
+/** Get file sizes for multiple paths. */
+export async function getFileSizes(paths: string[]): Promise<number[]> {
+  const invoke = await getInvoke();
+  return invoke('hp_file_sizes', { paths }) as Promise<number[]>;
+}
+
 /** Detect HPK format. Returns 5, 6, or 0. */
 export async function detectFormat(inputPath: string): Promise<number> {
   const invoke = await getInvoke();

@@ -45,7 +45,7 @@ export default function App() {
     downloadExtractedFile, extractAllToFolder, downloadAllAsZip
   } = useHyperPack();
 
-  const archiveMode = files.length > 1;
+  const archiveMode = files.length > 1 || files.some(f => f.isDirectory);
 
   const filesRef = useRef(files);
   const decompressFileRef = useRef(decompressFile);
@@ -91,6 +91,10 @@ export default function App() {
       const cleanName = entry.name.replace(/\.hpk\.txt$/i, '.hpk');
       const blob = new Blob([entry.data]);
       const file = new File([blob], cleanName);
+      // Preserve the native filesystem path for Tauri decompression
+      if (entry.path) {
+        Object.defineProperty(file, 'nativePath', { value: entry.path });
+      }
       setDecompressFile(file);
     }
     setIsDraggingPage(false);

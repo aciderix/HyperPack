@@ -19,6 +19,7 @@ export interface FileEntry {
   data: ArrayBuffer;
   size: number;
   path?: string;
+  isDirectory?: boolean;
 }
 
 export interface ExtractedFile {

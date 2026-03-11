@@ -64,10 +64,11 @@ export function DropZone({ onFiles }: DropZoneProps) {
   const handleNativeBrowseFiles = useCallback(async () => {
     const paths = await native.openFilePicker({ multiple: true });
     if (!paths || paths.length === 0) return;
-    const entries: FileEntry[] = paths.map((p) => ({
+    const sizes = await native.getFileSizes(paths);
+    const entries: FileEntry[] = paths.map((p, i) => ({
       name: p.split(/[\\/]/).pop() ?? p,
       data: new ArrayBuffer(0),
-      size: 0, // size not known without stat; will be reported by native engine
+      size: sizes[i] ?? 0,
       path: p,
     }));
     onFiles(entries);
@@ -81,6 +82,7 @@ export function DropZone({ onFiles }: DropZoneProps) {
       data: new ArrayBuffer(0),
       size: 0,
       path,
+      isDirectory: true,
     };
     onFiles([entry]);
   }, [onFiles]);

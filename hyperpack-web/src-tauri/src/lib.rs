@@ -276,6 +276,12 @@ fn get_cpu_count() -> u32 {
         .unwrap_or(1) as u32
 }
 
+/// Return file sizes for one or more paths (used by the UI to display sizes).
+#[tauri::command]
+async fn hp_file_sizes(paths: Vec<String>) -> Vec<u64> {
+    paths.iter().map(|p| file_size(p)).collect()
+}
+
 // ── App entry point ───────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -290,6 +296,7 @@ pub fn run() {
             hp_archive_decompress,
             hp_detect_format,
             get_cpu_count,
+            hp_file_sizes,
         ])
         .run(tauri::generate_context!())
         .expect("error while running HyperPack");
