@@ -325,24 +325,7 @@ static void build_sa(int32_t *T, int n, int32_t *SA) {
     sais_core(T, SA, n, 257);
 }
 
-/* ===== BWT encode (sentinel approach) ===== */
-static int bwt_encode(const uint8_t *in, int n, uint8_t *out) {
-    int n1 = n + 1;
-    int32_t *T  = (int32_t*)malloc(n1 * sizeof(int32_t));
-    int32_t *SA = (int32_t*)malloc(n1 * sizeof(int32_t));
-    for (int i = 0; i < n; i++) T[i] = (int32_t)in[i] + 1;
-    T[n] = 0;
-    build_sa(T, n1, SA);
-    for (int i = 0; i < n; i++) T[i] = (int32_t)in[i] + 1;
-    T[n] = 0;
-    int pidx = -1, j = 0;
-    for (int i = 0; i < n1; i++) {
-        if (SA[i] == 0) { pidx = j; continue; }
-        out[j++] = (uint8_t)(T[SA[i] - 1] - 1);
-    }
-    free(T); free(SA);
-    return pidx;
-}
+/* bwt_encode removed — superseded by bwt_encode_ws (workspace version) */
 
 
 /* ===== BWT Workspace (pre-allocated) ===== */
@@ -1992,7 +1975,7 @@ static inline void cm_ctr_up_fast(uint8_t *c, int bit, int cap) {
 }
 
 /* --- CM Encode: data[0..n-1] -> out[], returns compressed size --- */
-static int cm_encode(const uint8_t *data, int n, uint8_t *out) {
+static int cm_encode(const uint8_t *data, int n, uint8_t *out, int max_out) {
     if (n == 0) return 0;
     cm_init_lut();
 
@@ -2018,6 +2001,11 @@ static int cm_encode(const uint8_t *data, int n, uint8_t *out) {
     for (int k = 0; k < CM_NMOD; k++) w[k] = 1024 / CM_NMOD;
 
     for (int i = 0; i < n; i++) {
+        /* Bounds check: abort if output is approaching buffer limit */
+        if (rc.pos > max_out - 64) {
+            free(ct0); free(ct1); free(ct2); free(ct3); free(ct4); free(ct6); free(mht);
+            return -1;  /* output exceeded buffer — not compressible with CM */
+        }
         int byte_val = data[i];
         for (int j = 7; j >= 0; j--) {
             int bit = (byte_val >> j) & 1;
@@ -2769,17 +2757,18 @@ static int compress_substream(const uint8_t *data, int n, uint8_t *out, int *sub
 
     /* === Strategy A: BWT + O0/O1/O2 (sub_order 0-2) === */
     pidx = bwt_encode_ws(data, n, bwt_s, bwt_ws);
-    int orig_pidx = pidx;  /* save for BWT+CM strategy */
     mtf_encode(bwt_s, n, mtf_s);
     nz = zrle_encode(mtf_s, n, zrle_s);
 
     asize = arith_enc_o0(zrle_s, nz, arith_s);
     total = 8 + asize;
-    if (total < best) {
-        best = total; *sub_order = 0;
-        put_u32be(out, pidx); put_u32be(out + 4, nz);
-        memcpy(out + 8, arith_s, asize);
-    }
+    /* Always write BWT+O0 as the baseline, even if it expands data.
+     * This ensures the output buffer always has valid decompressible data,
+     * preventing corruption when no strategy beats the initial threshold. */
+    best = total; *sub_order = 0;
+    put_u32be(out, pidx); put_u32be(out + 4, nz);
+    memcpy(out + 8, arith_s, asize);
+
     asize = arith_enc_o1(zrle_s, nz, arith_s);
     total = 8 + asize;
     if (total < best) {
@@ -2889,8 +2878,9 @@ static int compress_substream(const uint8_t *data, int n, uint8_t *out, int *sub
     /* === Strategy E: Context Mixing direct (sub_order 10) === */
     /* CM is slow (bit-by-bit) — only try for streams < 24 MB */
     if (n <= 25165824) {  /* 24 MB */
-        uint8_t *cm_out = (uint8_t*)malloc(n + n/4 + 1024);
-        int cm_sz = cm_encode(data, n, cm_out);
+        int cm_alloc = n + n/4 + 1024;
+        uint8_t *cm_out = (uint8_t*)malloc(cm_alloc);
+        int cm_sz = cm_encode(data, n, cm_out, cm_alloc);
         if (cm_sz > 0 && cm_sz < best) {
             best = cm_sz; *sub_order = 10;
             memcpy(out, cm_out, cm_sz);
@@ -5045,7 +5035,7 @@ static int compress_block_forced(const uint8_t *data, int n, uint8_t *out, int *
 
     /* ---- CM (Context Mixing) ---- */
     else if (fs == S_CM) {
-        int cm_size = cm_encode(data, n, arith_buf);
+        int cm_size = cm_encode(data, n, arith_buf, cws->capacity + cws->capacity/4 + 1024);
         if (cm_size > 0 && cm_size < best_size) {
             best_size = cm_size; *strat = fs;
             memcpy(out, arith_buf, cm_size);
@@ -5055,7 +5045,7 @@ static int compress_block_forced(const uint8_t *data, int n, uint8_t *out, int *
     /* ---- BWT + CM ---- */
     else if (fs == S_BWT_CM) {
         pidx = bwt_encode_ws(data, n, bwt_buf, bwt_ws);
-        int bwt_cm_size = cm_encode(bwt_buf, n, arith_buf);
+        int bwt_cm_size = cm_encode(bwt_buf, n, arith_buf, cws->capacity + cws->capacity/4 + 1024);
         total = 4 + bwt_cm_size;
         if (bwt_cm_size > 0 && total < best_size) {
             best_size = total; *strat = fs;
@@ -5068,7 +5058,7 @@ static int compress_block_forced(const uint8_t *data, int n, uint8_t *out, int *
     else if (fs == S_BWT_MTF_CM) {
         pidx = bwt_encode_ws(data, n, bwt_buf, bwt_ws);
         mtf_encode(bwt_buf, n, mtf_buf);
-        int mtf_cm_size = cm_encode(mtf_buf, n, arith_buf);
+        int mtf_cm_size = cm_encode(mtf_buf, n, arith_buf, cws->capacity + cws->capacity/4 + 1024);
         total = 4 + mtf_cm_size;
         if (mtf_cm_size > 0 && total < best_size) {
             best_size = total; *strat = fs;
@@ -5121,7 +5111,7 @@ static int compress_block_forced(const uint8_t *data, int n, uint8_t *out, int *
             if (audio_buf) {
                 int audio_n = audio_encode(data, n, audio_buf);
                 (void)audio_n;
-                int nframes_audio = (n / 4);
+                (void)0; /* nframes_audio calculated via nf_audio below */
                 uint8_t *direct_out = (uint8_t*)malloc(n + 131072);
                 if (direct_out) {
                     int dp = 0;
@@ -5280,9 +5270,29 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
         return compress_block_forced(data, n, out, strat, bwt_ws, cws, force_strategy);
     }
 
-    /* Entropy check — skip compression for incompressible data */
+    /* Entropy check — skip compression for truly incompressible data */
     double ent = block_entropy(data, n);
-    if (ent > 7.95) return best_size;  /* only skip truly random data */
+    if (ent > 7.95) {
+        /* High byte-level entropy. But repeating patterns (e.g., all 256 byte
+         * values in a cycle) also hit entropy ~8.0 despite being highly
+         * compressible. Quick probe: check for short repeating periods. */
+        int has_pattern = 0;
+        if (n >= 512) {
+            for (int p = 1; p <= 512 && !has_pattern; p++) {
+                int check = (n < 4096) ? n : 4096;
+                int mismatches = 0;
+                for (int j = p; j < check; j++) {
+                    if (data[j] != data[j - p]) {
+                        mismatches++;
+                        if (mismatches > check / 20) break;  /* >5% mismatch = no pattern */
+                    }
+                }
+                if (mismatches <= check / 20) has_pattern = 1;
+            }
+        }
+        if (!has_pattern) return best_size;  /* truly random, skip compression */
+        fprintf(stderr, "    [Entropy %.3f but repeating pattern detected, trying compression]\n", ent);
+    }
 
     /* === SAMPLE-BASED FAST STRATEGY SELECTION (v10.2) === */
     /* For large blocks: test 1 MB sample first, then only run winning group */
@@ -5328,7 +5338,7 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
     GroupWork work_ac = {0};
     GroupWork work_bde = {0};
     pthread_t worker;
-    int worker_launched = 0;
+    int worker_launched = 0; (void)worker_launched;
     
     if (run_ac) {
         out_buf_ac = (uint8_t*)malloc(n + 262144);
@@ -5406,7 +5416,7 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
     
     /* saved_bwt/saved_mtf not needed (CM/PPM strategies are disabled) */
     uint8_t *saved_bwt = NULL, *saved_mtf = NULL;
-    int saved_pidx = 0;
+    (void)saved_bwt; (void)saved_mtf;  /* suppress warnings; used in commented-out code */
 
     /* Groups A-E handled by parallel threads above */
 
@@ -5418,9 +5428,7 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
         /* LPC headers can add ~100KB overhead (2037 blocks * ~46 bytes each) */
         int audio_alloc = n + 262144;
         uint8_t *audio_buf = (uint8_t*)malloc(audio_alloc);
-        int audio_n = audio_encode(data, n, audio_buf);
-        int audio_hdr = 5;  /* order(1) + nframes(4) */
-        int nframes_audio = (n / 4);
+        audio_encode(data, n, audio_buf);
         
         /* Audio + Direct RC — 4 streams independently */
         /* We need to find where the 4 byte-split streams are in audio_buf.
@@ -5613,7 +5621,7 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
     /* Uncomment to enable: */
     /*
     {
-        int cm_size = cm_encode(data, n, arith_buf);
+        int cm_size = cm_encode(data, n, arith_buf, cws->capacity + cws->capacity/4 + 1024);
         if (cm_size > 0 && cm_size < best_size) {
             best_size = cm_size;
             *strat = S_CM;
@@ -5625,7 +5633,7 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
     /* BWT+CM strategies disabled for speed (uncomment to enable) */
     /*
     {
-        int bwt_cm_size = cm_encode(saved_bwt, n, arith_buf);
+        int bwt_cm_size = cm_encode(saved_bwt, n, arith_buf, cws->capacity + cws->capacity/4 + 1024);
         int total = 4 + bwt_cm_size;
         if (bwt_cm_size > 0 && total < best_size) {
             best_size = total;
@@ -5635,7 +5643,7 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
         }
     }
     {
-        int mtf_cm_size = cm_encode(saved_mtf, n, arith_buf);
+        int mtf_cm_size = cm_encode(saved_mtf, n, arith_buf, cws->capacity + cws->capacity/4 + 1024);
         int total = 4 + mtf_cm_size;
         if (mtf_cm_size > 0 && total < best_size) {
             best_size = total;
@@ -6584,7 +6592,7 @@ static int file_decompress(const char *inpath, const char *outpath) {
         }
     }
 
-    uint32_t block_size = read32(fin);
+    (void)read32(fin);  /* block_size — stored for info but not needed during decompression */
     uint64_t orig_size  = read64(fin);
     uint32_t nblocks    = read32(fin);
 
@@ -7309,7 +7317,8 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--list-strategies") == 0) {
             fprintf(stdout, "Available strategies (0..%d):\n", NUM_STRATEGIES - 1);
             for (int s = 0; s < NUM_STRATEGIES; s++) {
-                fprintf(stdout, "%2d: %s\n", s, strat_names[s]);
+                fprintf(stdout, "%2d: %s%s\n", s, strat_names[s],
+                    (s == S_BASE64) ? " (deprecated — use Base64v2)" : "");
             }
             return 0;
         }
@@ -7319,11 +7328,11 @@ int main(int argc, char **argv) {
         fprintf(stderr,
             "HyperPack Quantum v11 — Ultra-High Compression Engine\n"
             "Usage:\n"
-            "  %s c [-b SIZE_MB] [-j THREADS] [-s STRATEGY] input output.hpk   Compress (HPK5)\n"
-            "  %s a [-b SIZE_MB] [-s STRATEGY] input... output.hpk             Archive (HPK6)\n"
-            "  %s d input.hpk [output]                              Decompress (auto-detect)\n"
-            "  %s l input.hpk                                       List archive contents\n"
-            "  %s x input.hpk output_dir [-e pattern]               Extract from archive\n"
+            "  %s c|compress  [-b MB] [-j N] [-s N] input output.hpk   Compress (HPK5)\n"
+            "  %s a|archive   [-b MB] [-s N] input... output.hpk      Archive (HPK6)\n"
+            "  %s d|decompress input.hpk [output]                      Decompress (auto-detect)\n"
+            "  %s l|list       input.hpk                               List archive contents\n"
+            "  %s x|extract    input.hpk output_dir [-e pattern]       Extract from archive\n"
             "  %s --list-strategies                                  List all strategies\n"
             "\n"
             "Options:\n"
@@ -7334,10 +7343,10 @@ int main(int argc, char **argv) {
             "  -X N,N,...         Exclude listed strategies from auto mode\n"
             "  --list-strategies  Show available strategies and exit\n",
             argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], NUM_STRATEGIES - 1);
-        return 1;
+        return 0;
     }
 
-    if (argv[1][0] == 'c' && argv[1][1] == '\0') {
+    if ((argv[1][0] == 'c' && argv[1][1] == '\0') || strcmp(argv[1], "compress") == 0) {
         /* Single file compress — HPK5 (backward compatible) */
         if (argc < 4) {
             fprintf(stderr, "Usage: %s c [-b SIZE_MB] [-j THREADS] input output.hpk\n", argv[0]);
@@ -7351,14 +7360,16 @@ int main(int argc, char **argv) {
         int i = 2;
         while (i < argc - 2) {
             if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
-                block_mb = atoi(argv[++i]);
-                if (block_mb < 1) block_mb = 1;
-                if (block_mb > 128) block_mb = 128;
+                int orig_b = atoi(argv[++i]);
+                block_mb = orig_b;
+                if (block_mb < 1) { block_mb = 1; fprintf(stderr, "Warning: -b %d too small, clamped to 1 MB\n", orig_b); }
+                if (block_mb > 128) { block_mb = 128; fprintf(stderr, "Warning: -b %d too large, clamped to 128 MB\n", orig_b); }
                 i++;
             } else if (strcmp(argv[i], "-j") == 0 && i + 1 < argc) {
-                nthreads = atoi(argv[++i]);
-                if (nthreads < 1) nthreads = 1;
-                if (nthreads > 16) nthreads = 16;
+                int orig_j = atoi(argv[++i]);
+                nthreads = orig_j;
+                if (nthreads < 1) { nthreads = 1; fprintf(stderr, "Warning: -j %d too small, clamped to 1\n", orig_j); }
+                if (nthreads > 16) { nthreads = 16; fprintf(stderr, "Warning: -j %d too large, clamped to 16\n", orig_j); }
                 i++;
             } else if ((strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--strategy") == 0) && i + 1 < argc) {
                 force_strategy = atoi(argv[++i]);
@@ -7424,7 +7435,7 @@ int main(int argc, char **argv) {
         }
         return file_compress(argv[i], argv[i+1], block_mb << 20, nthreads, force_strategy, allowed_mask);
 
-    } else if (argv[1][0] == 'a' && argv[1][1] == '\0') {
+    } else if ((argv[1][0] == 'a' && argv[1][1] == '\0') || strcmp(argv[1], "archive") == 0) {
         /* Archive compress — HPK6 */
         if (argc < 4) {
             fprintf(stderr, "Usage: %s a [-b SIZE_MB] input... output.hpk\n", argv[0]);
@@ -7437,9 +7448,10 @@ int main(int argc, char **argv) {
         int i = 2;
         while (i < argc - 1) {
             if (strcmp(argv[i], "-b") == 0 && i + 1 < argc - 1) {
-                block_mb = atoi(argv[++i]);
-                if (block_mb < 1) block_mb = 1;
-                if (block_mb > 128) block_mb = 128;
+                int orig_b = atoi(argv[++i]);
+                block_mb = orig_b;
+                if (block_mb < 1) { block_mb = 1; fprintf(stderr, "Warning: -b %d too small, clamped to 1 MB\n", orig_b); }
+                if (block_mb > 128) { block_mb = 128; fprintf(stderr, "Warning: -b %d too large, clamped to 128 MB\n", orig_b); }
                 i++;
             } else if ((strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--strategy") == 0) && i + 1 < argc - 1) {
                 force_strategy = atoi(argv[++i]);
@@ -7509,7 +7521,7 @@ int main(int argc, char **argv) {
         const char *outpath = argv[argc - 1];
         return archive_compress(ninputs, inputs, outpath, block_mb << 20, 1, force_strategy, allowed_mask);
 
-    } else if (argv[1][0] == 'd' && argv[1][1] == '\0') {
+    } else if ((argv[1][0] == 'd' && argv[1][1] == '\0') || strcmp(argv[1], "decompress") == 0) {
         /* Decompress — auto-detect HPK5 or HPK6 */
         if (argc < 3) {
             fprintf(stderr, "Usage: %s d input.hpk [output]\n", argv[0]);
@@ -7534,7 +7546,7 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-    } else if (argv[1][0] == 'l' && argv[1][1] == '\0') {
+    } else if ((argv[1][0] == 'l' && argv[1][1] == '\0') || strcmp(argv[1], "list") == 0) {
         /* List archive contents */
         if (argc < 3) {
             fprintf(stderr, "Usage: %s l input.hpk\n", argv[0]);
@@ -7542,7 +7554,7 @@ int main(int argc, char **argv) {
         }
         return archive_list(argv[2]);
 
-    } else if (argv[1][0] == 'x' && argv[1][1] == '\0') {
+    } else if ((argv[1][0] == 'x' && argv[1][1] == '\0') || strcmp(argv[1], "extract") == 0) {
         /* Extract from archive with optional pattern */
         if (argc < 4) {
             fprintf(stderr, "Usage: %s x input.hpk output_dir [-e pattern]\n", argv[0]);
@@ -7557,7 +7569,7 @@ int main(int argc, char **argv) {
         return archive_decompress(argv[2], argv[3], extract_pattern);
 
     } else {
-        fprintf(stderr, "Unknown mode '%s'. Use 'c', 'a', 'd', 'l', or 'x'.\n", argv[1]);
+        fprintf(stderr, "Unknown mode '%s'. Use 'c' (compress), 'a' (archive), 'd' (decompress), 'l' (list), or 'x' (extract).\n", argv[1]);
         return 1;
     }
 }

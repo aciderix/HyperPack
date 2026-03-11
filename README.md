@@ -85,16 +85,22 @@ make
 ./hyperpack decompress file.dat.hpk
 
 # Compress a directory (archive mode)
-./hyperpack compress -r my_folder/
+./hyperpack archive my_folder/
+# or: ./hyperpack a my_folder/ my_folder.hpk
 
-# Decompress an archive
-./hyperpack decompress my_folder.hpk -o output_dir/
+# Extract an archive
+./hyperpack extract my_folder.hpk output_dir/
+# or: ./hyperpack x my_folder.hpk output_dir/
 
-# Show file info
-./hyperpack info file.dat.hpk
+# List archive contents
+./hyperpack list my_folder.hpk
+# or: ./hyperpack l my_folder.hpk
 
-# Benchmark mode — try all strategies and report
-./hyperpack benchmark file.dat
+# Show file info (coming soon)
+# ./hyperpack info file.dat.hpk
+
+# Benchmark mode (coming soon)
+# ./hyperpack benchmark file.dat
 ```
 
 See [docs/TECHNICAL.md](docs/TECHNICAL.md) for the full CLI reference and advanced options.
