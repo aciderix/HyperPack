@@ -4476,6 +4476,8 @@ typedef struct {
     
     /* Strategy hint from sample (-1 = try all) */
     int hint_strat;
+    /* Bitmask of allowed strategies (0xFFFFFFFF = all) */
+    uint32_t allowed_mask;
     
     /* Working buffers (thread-private) */
     BWTWorkspace *bwt_ws;
@@ -4497,6 +4499,11 @@ static void *thread_groups_AC(void *arg) {
     /* v10.2: Skip LZP if sample showed plain BWT wins (saves 1 full BWT!) */
     if (w->hint_strat == S_BWT_O0 || w->hint_strat == S_BWT_O1 || w->hint_strat == S_BWT_O2)
         skip_lzp = 1;
+    /* Strategy mask: skip groups with no allowed strategies */
+    if (!(w->allowed_mask & ((1u<<S_BWT_O0)|(1u<<S_BWT_O1)|(1u<<S_BWT_O2)|(1u<<S_BWT_O0_PS)|(1u<<S_BWT_RANS)|(1u<<S_BWT_CTX2)|(1u<<S_BWT_O1_PS)|(1u<<S_LZP_BWT_O0)|(1u<<S_LZP_BWT_O1)|(1u<<S_LZP_BWT_O2))))
+        skip_bwt = 1;
+    if (!(w->allowed_mask & ((1u<<S_LZP_BWT_O0)|(1u<<S_LZP_BWT_O1)|(1u<<S_LZP_BWT_O2))))
+        skip_lzp = 1;
     
     uint8_t  *bwt_buf   = w->cws->bwt_buf;
     uint8_t  *mtf_buf   = w->cws->mtf_buf;
@@ -4514,7 +4521,7 @@ static void *thread_groups_AC(void *arg) {
         /* O0 */
         asize = arith_enc_o0(zrle_buf, nz, arith_buf);
         total = 8 + asize;
-        if (total < w->best_size) {
+        if ((w->allowed_mask & (1u << S_BWT_O0)) && total < w->best_size) {
             w->best_size = total; w->best_strat = S_BWT_O0;
             put_u32be(w->out_buf, pidx);
             put_u32be(w->out_buf + 4, nz);
@@ -4529,7 +4536,7 @@ static void *thread_groups_AC(void *arg) {
             /* O1 */
             asize = arith_enc_o1(zrle_buf, nz, arith_buf);
             total = 8 + asize;
-            if (total < w->best_size) {
+            if ((w->allowed_mask & (1u << S_BWT_O1)) && total < w->best_size) {
                 w->best_size = total; w->best_strat = S_BWT_O1;
                 put_u32be(w->out_buf, pidx);
                 put_u32be(w->out_buf + 4, nz);
@@ -4540,7 +4547,7 @@ static void *thread_groups_AC(void *arg) {
              * prior than uniform, especially for short blocks / sparse contexts. */
             asize = arith_enc_o1_ps(zrle_buf, nz, arith_buf);
             total = 8 + asize;
-            if (total < w->best_size) {
+            if ((w->allowed_mask & (1u << S_BWT_O1_PS)) && total < w->best_size) {
                 w->best_size = total; w->best_strat = S_BWT_O1_PS;
                 put_u32be(w->out_buf, pidx);
                 put_u32be(w->out_buf + 4, nz);
@@ -4550,7 +4557,7 @@ static void *thread_groups_AC(void *arg) {
             if (!skip_o0o2) {
             asize = arith_enc_o2(zrle_buf, nz, arith_buf);
             total = 8 + asize;
-            if (total < w->best_size) {
+            if ((w->allowed_mask & (1u << S_BWT_O2)) && total < w->best_size) {
                 w->best_size = total; w->best_strat = S_BWT_O2;
                 put_u32be(w->out_buf, pidx);
                 put_u32be(w->out_buf + 4, nz);
@@ -4566,7 +4573,7 @@ static void *thread_groups_AC(void *arg) {
         if (o0cmp && w->hint_strat != S_BWT_O1 && w->hint_strat != S_BWT_O2) {
             asize = arith_enc_o0_ps(zrle_buf, nz, arith_buf);
             total = 8 + asize;
-            if (total < w->best_size) {
+            if ((w->allowed_mask & (1u << S_BWT_O0_PS)) && total < w->best_size) {
                 w->best_size = total; w->best_strat = S_BWT_O0_PS;
                 put_u32be(w->out_buf, pidx);
                 put_u32be(w->out_buf + 4, nz);
@@ -4576,7 +4583,7 @@ static void *thread_groups_AC(void *arg) {
             /* rANS O0: same ratio as O0_PS, O(1) table-based decode */
             asize = rans_enc_o0(zrle_buf, nz, arith_buf);
             total = 8 + asize;
-            if (total < w->best_size) {
+            if ((w->allowed_mask & (1u << S_BWT_RANS)) && total < w->best_size) {
                 w->best_size = total; w->best_strat = S_BWT_RANS;
                 put_u32be(w->out_buf, pidx);
                 put_u32be(w->out_buf + 4, nz);
@@ -4586,7 +4593,7 @@ static void *thread_groups_AC(void *arg) {
             /* 2-context RC O0: separate run-ctx vs literal-ctx models */
             asize = arith_enc_ctx2(zrle_buf, nz, arith_buf);
             total = 8 + asize;
-            if (total < w->best_size) {
+            if ((w->allowed_mask & (1u << S_BWT_CTX2)) && total < w->best_size) {
                 w->best_size = total; w->best_strat = S_BWT_CTX2;
                 put_u32be(w->out_buf, pidx);
                 put_u32be(w->out_buf + 4, nz);
@@ -4604,7 +4611,7 @@ static void *thread_groups_AC(void *arg) {
                 
                 asize = arith_enc_o0(zrle_buf, nz, arith_buf);
                 total = 12 + asize;
-                if (total < w->best_size) {
+                if ((w->allowed_mask & (1u << S_LZP_BWT_O0)) && total < w->best_size) {
                     w->best_size = total; w->best_strat = S_LZP_BWT_O0;
                     put_u32be(w->out_buf, lzp_size);
                     put_u32be(w->out_buf + 4, pidx);
@@ -4615,7 +4622,7 @@ static void *thread_groups_AC(void *arg) {
                 if (o0cmp) {
                     asize = arith_enc_o1(zrle_buf, nz, arith_buf);
                     total = 12 + asize;
-                    if (total < w->best_size) {
+                    if ((w->allowed_mask & (1u << S_LZP_BWT_O1)) && total < w->best_size) {
                         w->best_size = total; w->best_strat = S_LZP_BWT_O1;
                         put_u32be(w->out_buf, lzp_size);
                         put_u32be(w->out_buf + 4, pidx);
@@ -4624,7 +4631,7 @@ static void *thread_groups_AC(void *arg) {
                     }
                     asize = arith_enc_o2(zrle_buf, nz, arith_buf);
                     total = 12 + asize;
-                    if (total < w->best_size) {
+                    if ((w->allowed_mask & (1u << S_LZP_BWT_O2)) && total < w->best_size) {
                         w->best_size = total; w->best_strat = S_LZP_BWT_O2;
                         put_u32be(w->out_buf, lzp_size);
                         put_u32be(w->out_buf + 4, pidx);
@@ -4656,6 +4663,11 @@ static void *thread_groups_BDE(void *arg) {
     /* v10.2: Skip LZP variants if hint says Delta+BWT wins */
     if (w->hint_strat == S_DBWT_O0 || w->hint_strat == S_DBWT_O1 || w->hint_strat == S_DBWT_O2)
         skip_lzp = 1;
+    /* Strategy mask: skip groups with no allowed strategies */
+    if (!(w->allowed_mask & ((1u<<S_DBWT_O0)|(1u<<S_DBWT_O1)|(1u<<S_DBWT_O2)|(1u<<S_DLZP_BWT_O0)|(1u<<S_DLZP_BWT_O1)|(1u<<S_DLZP_BWT_O2))))
+        skip_bwt = 1;
+    if (!(w->allowed_mask & ((1u<<S_DLZP_BWT_O0)|(1u<<S_DLZP_BWT_O1)|(1u<<S_DLZP_BWT_O2))))
+        skip_lzp = 1;
     
     uint8_t  *bwt_buf   = w->cws->bwt_buf;
     uint8_t  *mtf_buf   = w->cws->mtf_buf;
@@ -4676,7 +4688,7 @@ static void *thread_groups_BDE(void *arg) {
             
             asize = arith_enc_o0(zrle_buf, nz, arith_buf);
             total = 8 + asize;
-            if (total < w->best_size) {
+            if ((w->allowed_mask & (1u << S_DBWT_O0)) && total < w->best_size) {
                 w->best_size = total; w->best_strat = S_DBWT_O0;
                 put_u32be(w->out_buf, pidx);
                 put_u32be(w->out_buf + 4, nz);
@@ -4686,7 +4698,7 @@ static void *thread_groups_BDE(void *arg) {
             if (o0cmp) {
                 asize = arith_enc_o1(zrle_buf, nz, arith_buf);
                 total = 8 + asize;
-                if (total < w->best_size) {
+                if ((w->allowed_mask & (1u << S_DBWT_O1)) && total < w->best_size) {
                     w->best_size = total; w->best_strat = S_DBWT_O1;
                     put_u32be(w->out_buf, pidx);
                     put_u32be(w->out_buf + 4, nz);
@@ -4694,7 +4706,7 @@ static void *thread_groups_BDE(void *arg) {
                 }
                 asize = arith_enc_o2(zrle_buf, nz, arith_buf);
                 total = 8 + asize;
-                if (total < w->best_size) {
+                if ((w->allowed_mask & (1u << S_DBWT_O2)) && total < w->best_size) {
                     w->best_size = total; w->best_strat = S_DBWT_O2;
                     put_u32be(w->out_buf, pidx);
                     put_u32be(w->out_buf + 4, nz);
@@ -4712,7 +4724,7 @@ static void *thread_groups_BDE(void *arg) {
                     
                     asize = arith_enc_o0(zrle_buf, nz, arith_buf);
                     total = 12 + asize;
-                    if (total < w->best_size) {
+                    if ((w->allowed_mask & (1u << S_DLZP_BWT_O0)) && total < w->best_size) {
                         w->best_size = total; w->best_strat = S_DLZP_BWT_O0;
                         put_u32be(w->out_buf, dlzp_size);
                         put_u32be(w->out_buf + 4, pidx);
@@ -4723,7 +4735,7 @@ static void *thread_groups_BDE(void *arg) {
                     if (o0cmp) {
                         asize = arith_enc_o1(zrle_buf, nz, arith_buf);
                         total = 12 + asize;
-                        if (total < w->best_size) {
+                        if ((w->allowed_mask & (1u << S_DLZP_BWT_O1)) && total < w->best_size) {
                             w->best_size = total; w->best_strat = S_DLZP_BWT_O1;
                             put_u32be(w->out_buf, dlzp_size);
                             put_u32be(w->out_buf + 4, pidx);
@@ -4732,7 +4744,7 @@ static void *thread_groups_BDE(void *arg) {
                         }
                         asize = arith_enc_o2(zrle_buf, nz, arith_buf);
                         total = 12 + asize;
-                        if (total < w->best_size) {
+                        if ((w->allowed_mask & (1u << S_DLZP_BWT_O2)) && total < w->best_size) {
                             w->best_size = total; w->best_strat = S_DLZP_BWT_O2;
                             put_u32be(w->out_buf, dlzp_size);
                             put_u32be(w->out_buf + 4, pidx);
@@ -4748,7 +4760,7 @@ static void *thread_groups_BDE(void *arg) {
     /* Group F32: IEEE 754 Float32 XOR-delta → BWT+RC */
     /* Targets scientific/sensor data where consecutive floats share exponent bits.
        Uses delta_buf (already allocated, size n) as the XOR-transformed buffer. */
-    if (w->hint_strat < 0 || w->hint_strat == S_F32_BWT) {
+    if ((w->allowed_mask & (1u << S_F32_BWT)) && (w->hint_strat < 0 || w->hint_strat == S_F32_BWT)) {
         if (float_xor_detect(data, n)) {
             float_xor_encode(data, n, delta_buf);  /* delta_buf reused */
             pidx = bwt_encode_ws(delta_buf, n, bwt_buf, w->bwt_ws);
@@ -4756,7 +4768,7 @@ static void *thread_groups_BDE(void *arg) {
             nz = zrle_encode(mtf_buf, n, zrle_buf);
             asize = arith_enc_o0(zrle_buf, nz, arith_buf);
             total = 8 + asize;
-            if (total < w->best_size) {
+            if ((w->allowed_mask & (1u << S_F32_BWT)) && total < w->best_size) {
                 w->best_size = total; w->best_strat = S_F32_BWT;
                 put_u32be(w->out_buf, pidx);
                 put_u32be(w->out_buf + 4, nz);
@@ -4772,7 +4784,7 @@ static void *thread_groups_BDE(void *arg) {
 
     /* Group E: LZ77+BWT */
     /* v10.2: Skip LZ77 if sample showed BWT/Delta wins */
-    if (w->hint_strat < 0 || w->hint_strat == S_LZ77_O0 || w->hint_strat == S_LZ77_O1)
+    if ((w->allowed_mask & ((1u<<S_LZ77_O0)|(1u<<S_LZ77_O1))) && (w->hint_strat < 0 || w->hint_strat == S_LZ77_O0 || w->hint_strat == S_LZ77_O1))
     {
         int lz_cap = n + 4096;
         uint8_t *lz_packed = (uint8_t*)malloc(lz_cap);
@@ -4791,7 +4803,7 @@ static void *thread_groups_BDE(void *arg) {
                     
                     int lz_asize = arith_enc_o0(lz_zrle, lz_nz, lz_arith);
                     int lz_total = 12 + lz_asize;
-                    if (lz_total < w->best_size) {
+                    if ((w->allowed_mask & (1u << S_LZ77_O0)) && lz_total < w->best_size) {
                         w->best_size = lz_total; w->best_strat = S_LZ77_O0;
                         put_u32be(w->out_buf, lz_size);
                         put_u32be(w->out_buf + 4, lz_pidx);
@@ -4800,7 +4812,7 @@ static void *thread_groups_BDE(void *arg) {
                     }
                     lz_asize = arith_enc_o1(lz_zrle, lz_nz, lz_arith);
                     lz_total = 12 + lz_asize;
-                    if (lz_total < w->best_size) {
+                    if ((w->allowed_mask & (1u << S_LZ77_O1)) && lz_total < w->best_size) {
                         w->best_size = lz_total; w->best_strat = S_LZ77_O1;
                         put_u32be(w->out_buf, lz_size);
                         put_u32be(w->out_buf + 4, lz_pidx);
@@ -5258,7 +5270,7 @@ static int is_bde_strategy(int s) {
            s == S_F32_BWT;
 }
 
-static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, BWTWorkspace *bwt_ws, CompressWorkspace *cws, int force_strategy) {
+static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, BWTWorkspace *bwt_ws, CompressWorkspace *cws, int force_strategy, uint32_t allowed_mask) {
     int best_size = n;
     *strat = S_STORE;
     memcpy(out, data, n); /* default: store */
@@ -5283,7 +5295,7 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
         CompressWorkspace *sample_cws = cws_create(sample_n);
         if (sample_out && sample_bwt && sample_cws) {
             int sample_strat;
-            compress_block(data, sample_n, sample_out, &sample_strat, sample_bwt, sample_cws, -1);
+            compress_block(data, sample_n, sample_out, &sample_strat, sample_bwt, sample_cws, -1, allowed_mask);
             hint_strat = sample_strat;
         }
         if (sample_out) free(sample_out);
@@ -5302,6 +5314,11 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
         /* LZMA hint: both groups skipped, handled below */
         if (hint_strat == S_LZMA) { run_ac = 0; run_bde = 0; }
     }
+    /* Strategy mask: skip groups with no allowed strategies */
+    if (!(allowed_mask & ((1u<<S_BWT_O0)|(1u<<S_BWT_O1)|(1u<<S_BWT_O2)|(1u<<S_BWT_O0_PS)|(1u<<S_BWT_RANS)|(1u<<S_BWT_CTX2)|(1u<<S_BWT_O1_PS)|(1u<<S_LZP_BWT_O0)|(1u<<S_LZP_BWT_O1)|(1u<<S_LZP_BWT_O2))))
+        run_ac = 0;
+    if (!(allowed_mask & ((1u<<S_DBWT_O0)|(1u<<S_DBWT_O1)|(1u<<S_DBWT_O2)|(1u<<S_DLZP_BWT_O0)|(1u<<S_DLZP_BWT_O1)|(1u<<S_DLZP_BWT_O2)|(1u<<S_LZ77_O0)|(1u<<S_LZ77_O1)|(1u<<S_F32_BWT))))
+        run_bde = 0;
     
     /* === Parallel Groups A-E === */
     BWTWorkspace *bwt_ws2 = NULL;
@@ -5316,6 +5333,7 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
     if (run_ac) {
         out_buf_ac = (uint8_t*)malloc(n + 262144);
         work_ac.hint_strat = hint_strat;
+        work_ac.allowed_mask = allowed_mask;
         work_ac.data = data;
         work_ac.n = n;
         work_ac.entropy = ent;
@@ -5329,6 +5347,7 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
         cws2 = cws_create(n);
         out_buf_bde = (uint8_t*)malloc(n + 262144);
         work_bde.hint_strat = hint_strat;
+        work_bde.allowed_mask = allowed_mask;
         work_bde.data = data;
         work_bde.n = n;
         work_bde.entropy = ent;
@@ -5395,7 +5414,7 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
     uint8_t *arith_buf = cws->arith_buf;
 
     /* ======= Group F: Audio Pipeline ======= */
-    if (audio_detect(data, n)) {
+    if ((allowed_mask & (1u << S_AUDIO)) && audio_detect(data, n)) {
         /* LPC headers can add ~100KB overhead (2037 blocks * ~46 bytes each) */
         int audio_alloc = n + 262144;
         uint8_t *audio_buf = (uint8_t*)malloc(audio_alloc);
@@ -5470,7 +5489,7 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
 
 
     /* ======= Group G: Base64 Preprocessing (S_BASE64) ======= */
-    {
+    if (allowed_mask & (1u << S_BASE64_V2)) {
         int max_b64_runs = n / B64_MIN_RUN + 1;
         if (max_b64_runs > 1000000) max_b64_runs = 1000000;
         B64Run *b64_runs = (B64Run*)malloc(max_b64_runs * sizeof(B64Run));
@@ -5689,6 +5708,12 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
             fprintf(stderr, "    [LZMA] forced for small block (%d bytes, ent=%.2f, ascii=%.1f%%)\n", n, ent, asc*100);
         }
     }
+    /* Strategy mask: override LZMA heuristic if user explicitly selected it via -S */
+    if (!(allowed_mask & (1u << S_LZMA))) {
+        try_lzma = 0;
+    } else if (allowed_mask != 0xFFFFFFFFu) {
+        try_lzma = 1;  /* User explicitly included LZMA — skip heuristic */
+    }
     if (try_lzma) {
         uint8_t *lzma_out = (uint8_t*)malloc(n + n/4 + 65536);
         if (lzma_out) {
@@ -5709,7 +5734,7 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
 
     /* ======= Group I: BCJ+LZMA (S_BCJ_LZMA) ======= */
     /* Phase 1.3: E8/E9 transform on x86 executables, then LZMA */
-    if (bcj_is_executable(data, n) && n >= 256) {
+    if ((allowed_mask & (1u << S_BCJ_LZMA)) && bcj_is_executable(data, n) && n >= 256) {
         uint8_t *bcj_buf = (uint8_t*)malloc(n);
         uint8_t *bcj_lzma_out = (uint8_t*)malloc(n + n/4 + 65536);
         if (bcj_buf && bcj_lzma_out) {
@@ -6101,6 +6126,7 @@ typedef struct {
     BWTWorkspace *bwt_ws;
     CompressWorkspace *cws;
     int force_strategy;
+    uint32_t allowed_mask;
     volatile int done;
 } BlockJob;
 
@@ -6108,7 +6134,7 @@ static void *compress_block_worker(void *arg) {
     BlockJob *job = (BlockJob *)arg;
     job->output_size = compress_block(job->input, job->input_size, 
                                        job->output, &job->strategy, 
-                                       job->bwt_ws, job->cws, job->force_strategy);
+                                       job->bwt_ws, job->cws, job->force_strategy, job->allowed_mask);
     job->crc = hp_crc32(job->input, job->input_size);
     job->done = 1;
     return NULL;
@@ -6260,13 +6286,13 @@ static int png_reconstruct(const uint8_t *meta, uint32_t meta_size,
  *     if is_dup: DUP_REF(4)
  *     else: STRATEGY(1) COMP_SIZE(4) ORIG_BLOCK_SIZE(4) CRC32(4) DATA(comp_size)
  */
-static int file_compress_impl(const char *inpath, const char *outpath, int block_size, int nthreads, int force_no_png, int force_strategy);
+static int file_compress_impl(const char *inpath, const char *outpath, int block_size, int nthreads, int force_no_png, int force_strategy, uint32_t allowed_mask);
 
-static int file_compress(const char *inpath, const char *outpath, int block_size, int nthreads, int force_strategy) {
-    return file_compress_impl(inpath, outpath, block_size, nthreads, 0, force_strategy);
+static int file_compress(const char *inpath, const char *outpath, int block_size, int nthreads, int force_strategy, uint32_t allowed_mask) {
+    return file_compress_impl(inpath, outpath, block_size, nthreads, 0, force_strategy, allowed_mask);
 }
 
-static int file_compress_impl(const char *inpath, const char *outpath, int block_size, int nthreads, int force_no_png, int force_strategy) {
+static int file_compress_impl(const char *inpath, const char *outpath, int block_size, int nthreads, int force_no_png, int force_strategy, uint32_t allowed_mask) {
     FILE *fin = fopen(inpath, "rb");
     if (!fin) { fprintf(stderr, "Cannot open %s\n", inpath); return 1; }
     fseek(fin, 0, SEEK_END);
@@ -6349,7 +6375,7 @@ static int file_compress_impl(const char *inpath, const char *outpath, int block
                 fprintf(stderr, "  Block %d/%d: DUP of %d\n", b+1, nblocks, dup_ref+1);
             } else {
                 int strat;
-                int csz = compress_block(inbuf, bsz, outbuf, &strat, bwt_ws, cws, force_strategy);
+                int csz = compress_block(inbuf, bsz, outbuf, &strat, bwt_ws, cws, force_strategy, allowed_mask);
                 uint32_t crc = hp_crc32(inbuf, bsz);
 
                 fputc(0, fout);
@@ -6417,6 +6443,7 @@ static int file_compress_impl(const char *inpath, const char *outpath, int block
                 jobs[j].input = block_data[i];
                 jobs[j].input_size = block_sizes_arr[i];
                 jobs[j].force_strategy = force_strategy;
+                jobs[j].allowed_mask = allowed_mask;
                 jobs[j].done = 0;
                 pthread_create(&threads[launched], NULL, compress_block_worker, &jobs[j]);
                 launched++;
@@ -6493,7 +6520,7 @@ static int file_compress_impl(const char *inpath, const char *outpath, int block
         fprintf(stderr, "[HP5] PNG pre-transform increased size (%lld -> %lld bytes), retrying as raw\n",
                 (long long)original_fsize, (long long)file_total);
         remove(outpath);
-        return file_compress_impl(inpath, outpath, block_size, nthreads, 1, -1);
+        return file_compress_impl(inpath, outpath, block_size, nthreads, 1, -1, allowed_mask);
     }
 
     return 0;
@@ -6844,7 +6871,7 @@ static void mkdirs(const char *path) {
 }
 
 static int archive_compress(int npaths, const char **paths, const char *outpath,
-                            int block_size, int nthreads, int force_strategy) {
+                            int block_size, int nthreads, int force_strategy, uint32_t allowed_mask) {
     (void)nthreads;
     clock_t start = clock();
 
@@ -6998,7 +7025,7 @@ static int archive_compress(int npaths, const char **paths, const char *outpath,
                         global_block+1, entries[i].path, file_block+1, entries[i].nblocks, dup_ref+1);
             } else {
                 int strat;
-                int csz = compress_block(inbuf, bsz, outbuf, &strat, bwt_ws, cws, force_strategy);
+                int csz = compress_block(inbuf, bsz, outbuf, &strat, bwt_ws, cws, force_strategy, allowed_mask);
                 uint32_t blk_crc = hp_crc32(inbuf, bsz);
 
                 fputc(0, fout);
@@ -7303,6 +7330,8 @@ int main(int argc, char **argv) {
             "  -b SIZE_MB         Block size in MB (default: 128, max: 128)\n"
             "  -j THREADS         Number of threads (default: 1, max: 16)\n"
             "  -s N, --strategy N Force compression strategy N (0..%d, -1=auto)\n"
+            "  -S N,N,...         Only try listed strategies in auto mode\n"
+            "  -X N,N,...         Exclude listed strategies from auto mode\n"
             "  --list-strategies  Show available strategies and exit\n",
             argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], NUM_STRATEGIES - 1);
         return 1;
@@ -7317,6 +7346,8 @@ int main(int argc, char **argv) {
         int block_mb = DEFAULT_BS >> 20;
         int nthreads = 1;
         int force_strategy = -1;
+        uint32_t allowed_mask = 0xFFFFFFFFu;
+        int include_set = 0, exclude_set = 0;
         int i = 2;
         while (i < argc - 2) {
             if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
@@ -7337,6 +7368,40 @@ int main(int argc, char **argv) {
                     return 1;
                 }
                 i++;
+            } else if ((strcmp(argv[i], "-S") == 0 || strcmp(argv[i], "--strategies") == 0) && i + 1 < argc) {
+                if (exclude_set) { fprintf(stderr, "Error: cannot use -S and -X together\n"); return 1; }
+                include_set = 1;
+                allowed_mask = 0;
+                char *list = argv[++i];
+                char *tok = strtok(list, ",");
+                while (tok) {
+                    int sv = atoi(tok);
+                    if (sv < 0 || sv >= NUM_STRATEGIES) {
+                        fprintf(stderr, "Error: invalid strategy %d in -S (must be 0..%d)\n", sv, NUM_STRATEGIES - 1);
+                        fprintf(stderr, "Use --list-strategies to see available strategies.\n");
+                        return 1;
+                    }
+                    allowed_mask |= (1u << sv);
+                    tok = strtok(NULL, ",");
+                }
+                if (allowed_mask == 0) { fprintf(stderr, "Error: -S requires at least one strategy\n"); return 1; }
+                i++;
+            } else if ((strcmp(argv[i], "-X") == 0 || strcmp(argv[i], "--exclude-strategies") == 0) && i + 1 < argc) {
+                if (include_set) { fprintf(stderr, "Error: cannot use -S and -X together\n"); return 1; }
+                exclude_set = 1;
+                char *list = argv[++i];
+                char *tok = strtok(list, ",");
+                while (tok) {
+                    int sv = atoi(tok);
+                    if (sv < 0 || sv >= NUM_STRATEGIES) {
+                        fprintf(stderr, "Error: invalid strategy %d in -X (must be 0..%d)\n", sv, NUM_STRATEGIES - 1);
+                        fprintf(stderr, "Use --list-strategies to see available strategies.\n");
+                        return 1;
+                    }
+                    allowed_mask &= ~(1u << sv);
+                    tok = strtok(NULL, ",");
+                }
+                i++;
             } else break;
         }
         if (nthreads > 1) {
@@ -7345,7 +7410,19 @@ int main(int argc, char **argv) {
         if (force_strategy >= 0) {
             fprintf(stderr, "[HP5] Forcing strategy %d (%s)\n", force_strategy, strat_names[force_strategy]);
         }
-        return file_compress(argv[i], argv[i+1], block_mb << 20, nthreads, force_strategy);
+        if (allowed_mask != 0xFFFFFFFFu && force_strategy < 0) {
+            fprintf(stderr, "[HP5] Strategy filter: ");
+            int first = 1;
+            for (int s = 0; s < NUM_STRATEGIES; s++) {
+                if (allowed_mask & (1u << s)) {
+                    if (!first) fprintf(stderr, ", ");
+                    fprintf(stderr, "%d(%s)", s, strat_names[s]);
+                    first = 0;
+                }
+            }
+            fprintf(stderr, "\n");
+        }
+        return file_compress(argv[i], argv[i+1], block_mb << 20, nthreads, force_strategy, allowed_mask);
 
     } else if (argv[1][0] == 'a' && argv[1][1] == '\0') {
         /* Archive compress — HPK6 */
@@ -7355,6 +7432,8 @@ int main(int argc, char **argv) {
         }
         int block_mb = DEFAULT_BS >> 20;
         int force_strategy = -1;
+        uint32_t allowed_mask = 0xFFFFFFFFu;
+        int include_set = 0, exclude_set = 0;
         int i = 2;
         while (i < argc - 1) {
             if (strcmp(argv[i], "-b") == 0 && i + 1 < argc - 1) {
@@ -7370,6 +7449,40 @@ int main(int argc, char **argv) {
                     return 1;
                 }
                 i++;
+            } else if ((strcmp(argv[i], "-S") == 0 || strcmp(argv[i], "--strategies") == 0) && i + 1 < argc - 1) {
+                if (exclude_set) { fprintf(stderr, "Error: cannot use -S and -X together\n"); return 1; }
+                include_set = 1;
+                allowed_mask = 0;
+                char *list = argv[++i];
+                char *tok = strtok(list, ",");
+                while (tok) {
+                    int sv = atoi(tok);
+                    if (sv < 0 || sv >= NUM_STRATEGIES) {
+                        fprintf(stderr, "Error: invalid strategy %d in -S (must be 0..%d)\n", sv, NUM_STRATEGIES - 1);
+                        fprintf(stderr, "Use --list-strategies to see available strategies.\n");
+                        return 1;
+                    }
+                    allowed_mask |= (1u << sv);
+                    tok = strtok(NULL, ",");
+                }
+                if (allowed_mask == 0) { fprintf(stderr, "Error: -S requires at least one strategy\n"); return 1; }
+                i++;
+            } else if ((strcmp(argv[i], "-X") == 0 || strcmp(argv[i], "--exclude-strategies") == 0) && i + 1 < argc - 1) {
+                if (include_set) { fprintf(stderr, "Error: cannot use -S and -X together\n"); return 1; }
+                exclude_set = 1;
+                char *list = argv[++i];
+                char *tok = strtok(list, ",");
+                while (tok) {
+                    int sv = atoi(tok);
+                    if (sv < 0 || sv >= NUM_STRATEGIES) {
+                        fprintf(stderr, "Error: invalid strategy %d in -X (must be 0..%d)\n", sv, NUM_STRATEGIES - 1);
+                        fprintf(stderr, "Use --list-strategies to see available strategies.\n");
+                        return 1;
+                    }
+                    allowed_mask &= ~(1u << sv);
+                    tok = strtok(NULL, ",");
+                }
+                i++;
             } else break;
         }
         int ninputs = argc - i - 1;
@@ -7380,9 +7493,21 @@ int main(int argc, char **argv) {
         if (force_strategy >= 0) {
             fprintf(stderr, "[HPK6] Forcing strategy %d (%s)\n", force_strategy, strat_names[force_strategy]);
         }
+        if (allowed_mask != 0xFFFFFFFFu && force_strategy < 0) {
+            fprintf(stderr, "[HPK6] Strategy filter: ");
+            int first = 1;
+            for (int s = 0; s < NUM_STRATEGIES; s++) {
+                if (allowed_mask & (1u << s)) {
+                    if (!first) fprintf(stderr, ", ");
+                    fprintf(stderr, "%d(%s)", s, strat_names[s]);
+                    first = 0;
+                }
+            }
+            fprintf(stderr, "\n");
+        }
         const char **inputs = (const char**)&argv[i];
         const char *outpath = argv[argc - 1];
-        return archive_compress(ninputs, inputs, outpath, block_mb << 20, 1, force_strategy);
+        return archive_compress(ninputs, inputs, outpath, block_mb << 20, 1, force_strategy, allowed_mask);
 
     } else if (argv[1][0] == 'd' && argv[1][1] == '\0') {
         /* Decompress — auto-detect HPK5 or HPK6 */

@@ -35,7 +35,7 @@ int hp_lib_compress(const char *inpath, const char *outpath,
                     int block_mb, int nthreads) {
     if (block_mb < 1)  block_mb = 1;
     if (nthreads < 1)  nthreads = 1;
-    return file_compress(inpath, outpath, block_mb << 20, nthreads, -1);
+    return file_compress(inpath, outpath, block_mb << 20, nthreads, -1, 0xFFFFFFFFu);
 }
 
 /* Decompress inpath → outpath. Returns 0 on success. */
@@ -51,7 +51,7 @@ int hp_lib_archive_compress(int npaths, const char **paths,
                             const char *outpath, int block_mb, int nthreads) {
     if (block_mb < 1)  block_mb = 1;
     if (nthreads < 1)  nthreads = 1;
-    return archive_compress(npaths, paths, outpath, block_mb << 20, nthreads, -1);
+    return archive_compress(npaths, paths, outpath, block_mb << 20, nthreads, -1, 0xFFFFFFFFu);
 }
 
 /* Decompress HPK6 archive inpath → outdir.
@@ -74,7 +74,7 @@ int hp_lib_compress_with_strategy(const char *inpath, const char *outpath,
                                    int block_mb, int nthreads, int force_strategy) {
     if (block_mb < 1)  block_mb = 1;
     if (nthreads < 1)  nthreads = 1;
-    return file_compress(inpath, outpath, block_mb << 20, nthreads, force_strategy);
+    return file_compress(inpath, outpath, block_mb << 20, nthreads, force_strategy, 0xFFFFFFFFu);
 }
 
 /* Archive compress with a specific strategy. force_strategy: 0..30 or -1 for auto. */
@@ -83,7 +83,7 @@ int hp_lib_archive_compress_with_strategy(int npaths, const char **paths,
                                            int nthreads, int force_strategy) {
     if (block_mb < 1)  block_mb = 1;
     if (nthreads < 1)  nthreads = 1;
-    return archive_compress(npaths, paths, outpath, block_mb << 20, nthreads, force_strategy);
+    return archive_compress(npaths, paths, outpath, block_mb << 20, nthreads, force_strategy, 0xFFFFFFFFu);
 }
 
 /* List strategy names. Returns NUM_STRATEGIES (31). */
@@ -93,4 +93,23 @@ int hp_lib_num_strategies(void) { return NUM_STRATEGIES; }
 const char *hp_lib_strategy_name(int idx) {
     if (idx < 0 || idx >= NUM_STRATEGIES) return NULL;
     return strat_names[idx];
+}
+
+/* ── Strategy-filtered variants ────────────────────────────────────────── */
+
+/* Compress with strategy filter (allowed_mask = bitmask of allowed strategies, 0xFFFFFFFF = all). */
+int hp_lib_compress_filtered(const char *inpath, const char *outpath,
+                              int block_mb, int nthreads, uint32_t allowed_mask) {
+    if (block_mb < 1)  block_mb = 1;
+    if (nthreads < 1)  nthreads = 1;
+    return file_compress(inpath, outpath, block_mb << 20, nthreads, -1, allowed_mask);
+}
+
+/* Archive compress with strategy filter. */
+int hp_lib_archive_compress_filtered(int npaths, const char **paths,
+                                      const char *outpath, int block_mb,
+                                      int nthreads, uint32_t allowed_mask) {
+    if (block_mb < 1)  block_mb = 1;
+    if (nthreads < 1)  nthreads = 1;
+    return archive_compress(npaths, paths, outpath, block_mb << 20, nthreads, -1, allowed_mask);
 }
