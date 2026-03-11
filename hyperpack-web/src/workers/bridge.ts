@@ -2,15 +2,21 @@
 
 export interface CompressParams {
   blockSizeMB: number;
-  archiveMode: boolean; // true = HPK6 multi-file, false = HPK5 single file
-  nthreads: number;     // 0 = auto (native only, ignored in WASM)
+  archiveMode: boolean;
+  nthreads: number;
 }
 
 export interface FileEntry {
-  name: string;         // relative path (e.g. "mydir/subdir/file.txt")
-  data: ArrayBuffer;    // file content (empty in native mode)
-  size: number;         // original size in bytes
-  path?: string;        // absolute filesystem path (native mode only)
+  name: string;
+  data: ArrayBuffer;
+  size: number;
+  path?: string;
+}
+
+export interface ExtractedFile {
+  name: string;
+  size: number;
+  data: ArrayBuffer;
 }
 
 export type WorkerRequest =
@@ -25,6 +31,7 @@ export type WorkerResponse =
   | { type: 'progress'; percent: number; speed?: string; eta?: string; detail?: string }
   | { type: 'done'; data: ArrayBuffer; name: string; originalSize: number; compressedSize: number;
       ratio: number; elapsed: number; strategies?: Record<string, number>;
-      fileCount?: number; dedupCount?: number; dedupSaved?: number }
+      fileCount?: number; dedupCount?: number; dedupSaved?: number;
+      extractedFiles?: ExtractedFile[] }
   | { type: 'list-result'; entries: Array<{type: string; path: string; size: number; crc: string; blocks: number; isDedup: boolean}> }
   | { type: 'error'; message: string };

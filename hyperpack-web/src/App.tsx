@@ -14,7 +14,7 @@ import { CompressParams, FileEntry } from './workers/bridge';
 const DEFAULT_SETTINGS: CompressParams = {
   blockSizeMB: 8,
   archiveMode: false,
-  nthreads: 0, // 0 = auto (only meaningful in native mode)
+  nthreads: 0,
 };
 
 export default function App() {
@@ -33,16 +33,17 @@ export default function App() {
     return DEFAULT_SETTINGS;
   });
 
-  // Page-wide drag overlay
   const [isDraggingPage, setIsDraggingPage] = useState(false);
   const dragCounterRef = useRef(0);
 
-  const { status, progress, result, error, compress, decompress, cancel, reset, download } = useHyperPack();
+  const {
+    status, progress, result, error, extractedFiles,
+    compress, decompress, cancel, reset, download,
+    downloadExtractedFile, extractAllToFolder, downloadAllAsZip
+  } = useHyperPack();
 
-  // Auto-detect archive mode based on file count
   const archiveMode = files.length > 1;
 
-  // Use refs to avoid stale closures in keyboard handler
   const filesRef = useRef(files);
   const decompressFileRef = useRef(decompressFile);
   const modeRef = useRef(mode);
@@ -60,7 +61,6 @@ export default function App() {
     localStorage.setItem('hyperpack_settings', JSON.stringify(settings));
   }, [settings]);
 
-  // Keyboard shortcuts — uses refs to avoid stale closures
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && statusRef.current === 'processing') {
@@ -81,13 +81,9 @@ export default function App() {
     setFiles(selectedFiles);
     setDecompressFile(null);
     reset();
-    // Auto-detect: if single .hpk file, switch to decompress mode
-    // Also handle .hpk.txt (browsers may add .txt on download)
     const name = selectedFiles.length === 1 ? selectedFiles[0].name : '';
     if (selectedFiles.length === 1 && (name.endsWith('.hpk') || name.endsWith('.hpk.txt'))) {
       setMode('decompress');
-      // Create a File object for the decompress path
-      // Normalize .hpk.txt → .hpk (browsers may add .txt on download)
       const entry = selectedFiles[0];
       const cleanName = entry.name.replace(/\.hpk\.txt$/i, '.hpk');
       const blob = new Blob([entry.data]);
@@ -114,7 +110,6 @@ export default function App() {
 
   const hasFiles = files.length > 0;
 
-  // Page-wide drag handlers
   const handlePageDragEnter = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     dragCounterRef.current++;
@@ -139,8 +134,6 @@ export default function App() {
     e.preventDefault();
     dragCounterRef.current = 0;
     setIsDraggingPage(false);
-    // Let the DropZone handle file processing; this is just for the overlay
-    // Files dropped on the page overlay but outside DropZone:
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
       const entries: FileEntry[] = [];
       for (let i = 0; i < e.dataTransfer.files.length; i++) {
@@ -162,7 +155,6 @@ export default function App() {
       onDragOver={handlePageDragOver}
       onDrop={handlePageDrop}
     >
-      {/* Page-wide drag overlay */}
       {isDraggingPage && (
         <div className="drag-overlay fixed inset-0 z-40 bg-hp-bg/80 backdrop-blur-sm border-4 border-dashed border-hp-accent rounded-xl flex flex-col items-center justify-center pointer-events-none">
           <UploadCloud className="w-16 h-16 text-hp-accent mb-4" />
@@ -212,7 +204,11 @@ export default function App() {
                 result={result} 
                 mode={mode} 
                 onDownload={download} 
-                onReset={handleClearFile} 
+                onReset={handleClearFile}
+                extractedFiles={extractedFiles}
+                onDownloadExtractedFile={downloadExtractedFile}
+                onExtractAll={extractAllToFolder}
+                onDownloadZip={downloadAllAsZip}
               />
             )}
 

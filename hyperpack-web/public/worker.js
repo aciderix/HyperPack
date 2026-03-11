@@ -29,10 +29,8 @@ self.onmessage = async function (e) {
       const outName = outputName || 'output.hpk';
 
       if (params.archiveMode && files.length > 0) {
-        /* HPK6 archive mode */
         compressArchive(files, params, outName);
       } else if (files.length === 1) {
-        /* HPK5 single file mode */
         compressSingle(files[0], params, outName);
       } else {
         self.postMessage({ type: 'error', message: 'No files provided' });
@@ -64,15 +62,15 @@ self.onmessage = async function (e) {
 
 /* ===== HPK5 single file compress ===== */
 function compressSingle(file, params, outName) {
-  const inPath = '/input';       /* C hardcodes this path */
-  const outPath = '/output.hpk'; /* C hardcodes this path */
+  const inPath = '/input';
+  const outPath = '/output.hpk';
   cleanupMemfs([inPath, outPath]);
 
   const data = new Uint8Array(file.data);
   Module.FS.writeFile(inPath, data);
 
   const start = performance.now();
-  const ret = Module._hp_compress(params.blockSizeMB || 8); /* C takes only block_mb */
+  const ret = Module._hp_compress(params.blockSizeMB || 8);
 
   if (ret !== 0) {
     self.postMessage({ type: 'error', message: 'Compression failed (code ' + ret + ')' });
@@ -82,9 +80,6 @@ function compressSingle(file, params, outName) {
   const compressed = Module.FS.readFile(outPath);
   const elapsed = (performance.now() - start) / 1000;
 
-  /* Copy into a correctly-sized ArrayBuffer — FS.readFile may return a view
-     of a larger internal MEMFS/heap buffer, so compressed.buffer can be
-     oversized and would corrupt the downloaded file. */
   var outBuf = new Uint8Array(compressed).buffer;
 
   self.postMessage({
@@ -110,19 +105,16 @@ function compressArchive(files, params, outName) {
   const outPath = '/output.hpk';
   cleanupMemfs([outPath]);
 
-  // Remove old input dir and recreate it fresh
   try { Module.FS.rmdir(dirName); } catch (e) {}
   removeRecursive(dirName);
   try { Module.FS.mkdir(dirName); } catch (e) {}
 
-  // Write all files to MEMFS directory structure
   let totalSize = 0;
   const dirs = new Set();
   dirs.add(dirName);
 
   for (const file of files) {
     const fullPath = dirName + '/' + file.name;
-    // Ensure parent directories exist
     const parts = fullPath.split('/');
     for (let i = 2; i < parts.length; i++) {
       const dir = parts.slice(0, i).join('/');
@@ -151,7 +143,6 @@ function compressArchive(files, params, outName) {
   const compressed = Module.FS.readFile(outPath);
   const elapsed = (performance.now() - start) / 1000;
 
-  /* Copy into a correctly-sized ArrayBuffer (see compressSingle comment) */
   var outBuf = new Uint8Array(compressed).buffer;
 
   self.postMessage({
@@ -175,7 +166,7 @@ function compressArchive(files, params, outName) {
 /* ===== Decompress (auto-detect HPK5/HPK6) ===== */
 function decompressFile(fileBuffer, fileName) {
   const inPath = '/input.hpk';
-  const outPath = '/output';    /* C hardcodes this path for HPK5 output */
+  const outPath = '/output';
   const outDir = '/output_dir';
   cleanupMemfs([inPath, outPath]);
   removeRecursive(outDir);
@@ -183,7 +174,6 @@ function decompressFile(fileBuffer, fileName) {
   const data = new Uint8Array(fileBuffer);
   Module.FS.writeFile(inPath, data);
 
-  // Detect format
   const fmtPtr = Module.stringToNewUTF8(inPath);
   const fmt = Module._hp_detect_format(fmtPtr);
   Module._free(fmtPtr);
@@ -191,11 +181,11 @@ function decompressFile(fileBuffer, fileName) {
   const start = performance.now();
 
   if (fmt === 6) {
-    // HPK6 archive
+    /* HPK6 archive */
     try { Module.FS.mkdir(outDir); } catch (e) {}
     const inPtr2 = Module.stringToNewUTF8(inPath);
     const outDirPtr = Module.stringToNewUTF8(outDir);
-    const nullPtr = 0; // NULL for extract_pattern = extract all
+    const nullPtr = 0;
     const ret = Module._hp_archive_decompress(inPtr2, outDirPtr, nullPtr);
     Module._free(inPtr2);
     Module._free(outDirPtr);
@@ -205,15 +195,12 @@ function decompressFile(fileBuffer, fileName) {
       return;
     }
 
-    // Collect all extracted files
     const extractedFiles = collectFiles(outDir, '');
-    const totalSize = extractedFiles.reduce((sum, f) => sum + f.size, 0);
+    const totalSize = extractedFiles.reduce(function(sum, f) { return sum + f.size; }, 0);
     const elapsed = (performance.now() - start) / 1000;
 
-    // Create a zip of extracted files for download
-    // For simplicity, if single file in archive, return it directly
-    // Otherwise, build a tar-like concatenation or return info
     if (extractedFiles.length === 1) {
+      /* Single file in archive — return directly */
       var outBuf6s = new Uint8Array(extractedFiles[0].data).buffer;
       self.postMessage({
         type: 'done',
@@ -223,29 +210,41 @@ function decompressFile(fileBuffer, fileName) {
         compressedSize: totalSize,
         ratio: 1,
         elapsed: elapsed,
-        fileCount: extractedFiles.length
+        fileCount: 1
       }, [outBuf6s]);
     } else {
-      // Return first file and metadata about all files
-      // The UI will handle multi-file display
-      var outBuf6m = new Uint8Array(extractedFiles[0].data).buffer;
+      /* ── FIX: send ALL extracted files back to the main thread ── */
+      var filesOut = [];
+      var transferables = [];
+      for (var i = 0; i < extractedFiles.length; i++) {
+        /* Copy into a clean ArrayBuffer — FS.readFile returns a view of the
+           WASM heap which cannot be transferred and may get invalidated. */
+        var cleanBuf = new Uint8Array(extractedFiles[i].data).buffer;
+        filesOut.push({
+          name: extractedFiles[i].name,
+          size: extractedFiles[i].size,
+          data: cleanBuf
+        });
+        transferables.push(cleanBuf);
+      }
+
       self.postMessage({
         type: 'done',
-        data: outBuf6m,
-        name: fileName.replace('.hpk', ''),
+        data: new ArrayBuffer(0),
+        name: fileName.replace(/\.hpk$/i, ''),
         originalSize: data.length,
         compressedSize: totalSize,
         ratio: 1,
         elapsed: elapsed,
         fileCount: extractedFiles.length,
-        extractedFiles: extractedFiles.map(f => ({ name: f.name, size: f.size }))
-      }, [outBuf6m]);
+        extractedFiles: filesOut
+      }, transferables);
     }
 
     removeRecursive(outDir);
   } else {
-    // HPK5 single file
-    const ret = Module._hp_decompress(); /* C takes no args, uses hardcoded paths */
+    /* HPK5 single file */
+    const ret = Module._hp_decompress();
 
     if (ret !== 0) {
       self.postMessage({ type: 'error', message: 'Decompression failed' });
@@ -255,7 +254,6 @@ function decompressFile(fileBuffer, fileName) {
     const output = Module.FS.readFile(outPath);
     const elapsed = (performance.now() - start) / 1000;
 
-    /* Copy into a correctly-sized ArrayBuffer */
     var outBuf5 = new Uint8Array(output).buffer;
 
     const outName = fileName.replace(/\.hpk$/i, '');
@@ -309,7 +307,7 @@ function removeRecursive(path) {
   try {
     const stat = Module.FS.stat(path);
     if (Module.FS.isDir(stat.mode)) {
-      const entries = Module.FS.readdir(path).filter(e => e !== '.' && e !== '..');
+      const entries = Module.FS.readdir(path).filter(function(e) { return e !== '.' && e !== '..'; });
       for (const entry of entries) {
         removeRecursive(path + '/' + entry);
       }
@@ -323,13 +321,13 @@ function removeRecursive(path) {
 function collectFiles(basePath, rel) {
   const files = [];
   try {
-    const entries = Module.FS.readdir(basePath).filter(e => e !== '.' && e !== '..');
+    const entries = Module.FS.readdir(basePath).filter(function(e) { return e !== '.' && e !== '..'; });
     for (const entry of entries) {
       const fullPath = basePath + '/' + entry;
       const relPath = rel ? rel + '/' + entry : entry;
       const stat = Module.FS.stat(fullPath);
       if (Module.FS.isDir(stat.mode)) {
-        files.push(...collectFiles(fullPath, relPath));
+        files.push.apply(files, collectFiles(fullPath, relPath));
       } else {
         const data = Module.FS.readFile(fullPath);
         files.push({ name: relPath, data: data, size: data.length });
@@ -346,14 +344,12 @@ let lastDedupSaved = 0;
 let listEntries = [];
 
 function parseProgress(text) {
-  // Strategy tracking
   const stratMatch = text.match(/\[([A-Za-z0-9+_]+)\]$/);
   if (stratMatch) {
     const name = stratMatch[1];
     lastStrategies[name] = (lastStrategies[name] || 0) + 1;
   }
 
-  // Block progress
   const blockMatch = text.match(/Block (\d+).*?(\d+)\/(\d+)/);
   if (blockMatch) {
     const current = parseInt(blockMatch[1]);
@@ -367,7 +363,6 @@ function parseProgress(text) {
     }
   }
 
-  // Dedup tracking
   if (text.includes('[DEDUP]')) {
     lastDedupCount++;
   }
@@ -375,7 +370,6 @@ function parseProgress(text) {
     lastDedupSaved = parseInt(text.match(/Dedup saved: (\d+)/)[1]);
   }
 
-  // List parsing
   const listMatch = text.match(/^(FILE|DIR|DEDUP)\s+(\S+)\s+(\d+)\s+([0-9A-Fa-f]+)\s+(.+)$/);
   if (listMatch) {
     listEntries.push({
@@ -388,13 +382,11 @@ function parseProgress(text) {
     });
   }
 
-  // Done message for HPK6
   const doneMatch = text.match(/\[HPK6\] Done:.*?\((\d+\.?\d*)x\)/);
   if (doneMatch) {
     self.postMessage({ type: 'progress', percent: 100, detail: text.trim() });
   }
 
-  // HPK5 done
   const done5Match = text.match(/\[HP5\] Done:.*?\((\d+\.?\d*)x\)/);
   if (done5Match) {
     self.postMessage({ type: 'progress', percent: 100, detail: text.trim() });
