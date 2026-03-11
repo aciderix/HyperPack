@@ -30,18 +30,39 @@ int hp_detect_format(const char *inpath) {
     return 0;
 }
 
+/* ---------- Strategy info ---------- */
+
+/* Returns the number of available strategies (31). */
+EMSCRIPTEN_KEEPALIVE
+int hp_num_strategies(void) {
+    return NUM_STRATEGIES;
+}
+
+/* Returns a pointer to the name of strategy idx (0..30).
+   Returns NULL if idx is out of range. */
+EMSCRIPTEN_KEEPALIVE
+const char *hp_strategy_name(int idx) {
+    if (idx < 0 || idx >= NUM_STRATEGIES) return NULL;
+    return strat_names[idx];
+}
+
 /* ---------- HPK5 single-file ---------- */
 
 /*
  * Compress a file previously written to /input via FS.writeFile().
  * Result is written to /output.hpk.
+ *
+ * block_mb:        block size in MB (1-64)
+ * force_strategy:  strategy index (0-30) to force, or -1 for auto
+ * allowed_mask:    bitmask of allowed strategies (0xFFFFFFFF = all)
+ *
  * Returns 0 on success, non-zero on error.
  */
 EMSCRIPTEN_KEEPALIVE
-int hp_compress(int block_mb) {
+int hp_compress(int block_mb, int force_strategy, unsigned int allowed_mask) {
     if (block_mb < 1) block_mb = 1;
     if (block_mb > 64) block_mb = 64;  /* WASM memory safety */
-    return file_compress("/input", "/output.hpk", block_mb << 20, 1, -1, 0xFFFFFFFFu);
+    return file_compress("/input", "/output.hpk", block_mb << 20, 1, force_strategy, (uint32_t)allowed_mask);
 }
 
 /*
@@ -62,15 +83,20 @@ int hp_decompress(void) {
 /* ---------- HPK6 multi-file archive ---------- */
 
 /* Archive compress: takes a directory path in MEMFS and output path.
-   The JS side will have written all files into MEMFS under a directory before calling this.
-   Returns 0 on success. */
+ * The JS side will have written all files into MEMFS under a directory before calling this.
+ *
+ * force_strategy:  strategy index (0-30) to force, or -1 for auto
+ * allowed_mask:    bitmask of allowed strategies (0xFFFFFFFF = all)
+ *
+ * Returns 0 on success. */
 EMSCRIPTEN_KEEPALIVE
-int hp_archive_compress(const char *dirpath, const char *outpath, int block_size_mb) {
+int hp_archive_compress(const char *dirpath, const char *outpath, int block_size_mb,
+                        int force_strategy, unsigned int allowed_mask) {
     int block_size = block_size_mb << 20;
     if (block_size < (1 << 20)) block_size = 1 << 20;
     if (block_size > (128 << 20)) block_size = 128 << 20;
     const char *paths[1] = { dirpath };
-    return archive_compress(1, paths, outpath, block_size, 1, -1, 0xFFFFFFFFu);
+    return archive_compress(1, paths, outpath, block_size, 1, force_strategy, (uint32_t)allowed_mask);
 }
 
 /* Archive decompress: reads HPK6 from MEMFS, extracts to output dir in MEMFS.

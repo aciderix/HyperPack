@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { CompressParams, FileEntry, ExtractedFile, WorkerResponse } from '../workers/bridge';
+import { CompressParams, FileEntry, ExtractedFile, WorkerResponse, computeStrategyArgs } from '../workers/bridge';
 import * as native from '../lib/native';
 
 export type { ExtractedFile } from '../workers/bridge';
@@ -247,12 +247,13 @@ export function useHyperPack() {
           ? native.defaultCompressOutput(inputPath)
           : '';
 
+        const stratArgs = computeStrategyArgs(params);
         let res: native.NativeCompressResult;
         if (isArchive) {
           const paths = files.map((f) => f.path ?? f.name).filter(Boolean);
-          res = await native.archiveCompress(paths, outputPath, params.blockSizeMB, params.nthreads);
+          res = await native.archiveCompress(paths, outputPath, params.blockSizeMB, params.nthreads, stratArgs.forceStrategy, stratArgs.allowedMask);
         } else {
-          res = await native.compress(inputPath, outputPath, params.blockSizeMB, params.nthreads);
+          res = await native.compress(inputPath, outputPath, params.blockSizeMB, params.nthreads, stratArgs.forceStrategy, stratArgs.allowedMask);
         }
 
         setStatus('complete');

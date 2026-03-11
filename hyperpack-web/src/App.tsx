@@ -15,6 +15,9 @@ const DEFAULT_SETTINGS: CompressParams = {
   blockSizeMB: 8,
   archiveMode: false,
   nthreads: 0,
+  strategyMode: 'auto',
+  forceStrategy: 0,
+  strategySet: [],
 };
 
 export default function App() {

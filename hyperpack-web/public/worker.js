@@ -61,6 +61,24 @@ self.onmessage = async function (e) {
 };
 
 /* ===== HPK5 single file compress ===== */
+function computeStrategyArgs(params) {
+  var mode = params.strategyMode || 'auto';
+  if (mode === 'force') {
+    return { forceStrategy: params.forceStrategy || 0, allowedMask: 0xFFFFFFFF };
+  } else if (mode === 'include') {
+    var mask = 0;
+    var set = params.strategySet || [];
+    for (var i = 0; i < set.length; i++) mask |= (1 << set[i]);
+    return { forceStrategy: -1, allowedMask: mask || 0xFFFFFFFF };
+  } else if (mode === 'exclude') {
+    var mask = 0xFFFFFFFF;
+    var set = params.strategySet || [];
+    for (var i = 0; i < set.length; i++) mask &= ~(1 << set[i]);
+    return { forceStrategy: -1, allowedMask: mask };
+  }
+  return { forceStrategy: -1, allowedMask: 0xFFFFFFFF };
+}
+
 function compressSingle(file, params, outName) {
   const inPath = '/input';
   const outPath = '/output.hpk';
@@ -69,8 +87,9 @@ function compressSingle(file, params, outName) {
   const data = new Uint8Array(file.data);
   Module.FS.writeFile(inPath, data);
 
+  var stratArgs = computeStrategyArgs(params);
   const start = performance.now();
-  const ret = Module._hp_compress(params.blockSizeMB || 8);
+  const ret = Module._hp_compress(params.blockSizeMB || 8, stratArgs.forceStrategy, stratArgs.allowedMask);
 
   if (ret !== 0) {
     self.postMessage({ type: 'error', message: 'Compression failed (code ' + ret + ')' });
@@ -131,10 +150,11 @@ function compressArchive(files, params, outName) {
     totalSize += data.length;
   }
 
+  var stratArgs = computeStrategyArgs(params);
   const start = performance.now();
   const dirPtr = Module.stringToNewUTF8(dirName);
   const outPtr = Module.stringToNewUTF8(outPath);
-  const ret = Module._hp_archive_compress(dirPtr, outPtr, params.blockSizeMB || 8);
+  const ret = Module._hp_archive_compress(dirPtr, outPtr, params.blockSizeMB || 8, stratArgs.forceStrategy, stratArgs.allowedMask);
   Module._free(dirPtr);
   Module._free(outPtr);
 

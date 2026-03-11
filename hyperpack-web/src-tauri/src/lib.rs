@@ -1,5 +1,5 @@
 use std::ffi::CString;
-use std::os::raw::{c_char, c_int};
+use std::os::raw::{c_char, c_int, c_uint};
 use serde::Serialize;
 
 // ── FFI declarations ──────────────────────────────────────────────────────
@@ -12,6 +12,20 @@ extern "C" {
         block_mb: c_int,
         nthreads: c_int,
     ) -> c_int;
+    fn hp_lib_compress_with_strategy(
+        inpath: *const c_char,
+        outpath: *const c_char,
+        block_mb: c_int,
+        nthreads: c_int,
+        force_strategy: c_int,
+    ) -> c_int;
+    fn hp_lib_compress_filtered(
+        inpath: *const c_char,
+        outpath: *const c_char,
+        block_mb: c_int,
+        nthreads: c_int,
+        allowed_mask: c_uint,
+    ) -> c_int;
     fn hp_lib_decompress(inpath: *const c_char, outpath: *const c_char) -> c_int;
     fn hp_lib_archive_compress(
         npaths: c_int,
@@ -20,12 +34,30 @@ extern "C" {
         block_mb: c_int,
         nthreads: c_int,
     ) -> c_int;
+    fn hp_lib_archive_compress_with_strategy(
+        npaths: c_int,
+        paths: *const *const c_char,
+        outpath: *const c_char,
+        block_mb: c_int,
+        nthreads: c_int,
+        force_strategy: c_int,
+    ) -> c_int;
+    fn hp_lib_archive_compress_filtered(
+        npaths: c_int,
+        paths: *const *const c_char,
+        outpath: *const c_char,
+        block_mb: c_int,
+        nthreads: c_int,
+        allowed_mask: c_uint,
+    ) -> c_int;
     fn hp_lib_archive_decompress(
         inpath: *const c_char,
         outdir: *const c_char,
         pattern: *const c_char,
     ) -> c_int;
     fn hp_lib_archive_list(inpath: *const c_char) -> c_int;
+    fn hp_lib_num_strategies() -> c_int;
+    fn hp_lib_strategy_name(idx: c_int) -> *const c_char;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -71,23 +103,33 @@ pub struct DecompressResult {
 
 // ── Tauri commands ────────────────────────────────────────────────────────
 
-/// Compress a single file (HPK5).
+/// Compress a single file (HPK5) with optional strategy control.
 #[tauri::command]
 async fn hp_compress(
     input_path: String,
     output_path: String,
     block_mb: u32,
     nthreads: u32,
+    force_strategy: Option<i32>,
+    allowed_mask: Option<u32>,
 ) -> Result<CompressResult, String> {
     let in_bytes = file_size(&input_path);
     let in_c = to_c(&input_path)?;
     let out_c = to_c(&output_path)?;
     let threads = auto_threads(nthreads);
     let bm = block_mb.max(1) as c_int;
+    let fs = force_strategy.unwrap_or(-1);
+    let am = allowed_mask.unwrap_or(0xFFFFFFFF);
 
     let start = std::time::Instant::now();
     let ret = tauri::async_runtime::spawn_blocking(move || unsafe {
-        hp_lib_compress(in_c.as_ptr(), out_c.as_ptr(), bm, threads)
+        if fs >= 0 {
+            hp_lib_compress_with_strategy(in_c.as_ptr(), out_c.as_ptr(), bm, threads, fs as c_int)
+        } else if am != 0xFFFFFFFF {
+            hp_lib_compress_filtered(in_c.as_ptr(), out_c.as_ptr(), bm, threads, am as c_uint)
+        } else {
+            hp_lib_compress(in_c.as_ptr(), out_c.as_ptr(), bm, threads)
+        }
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -136,17 +178,17 @@ async fn hp_decompress(
     })
 }
 
-/// Compress multiple files/folders into an HPK6 archive.
+/// Compress multiple files/folders into an HPK6 archive with optional strategy control.
 #[tauri::command]
 async fn hp_archive_compress(
     input_paths: Vec<String>,
     output_path: String,
     block_mb: u32,
     nthreads: u32,
+    force_strategy: Option<i32>,
+    allowed_mask: Option<u32>,
 ) -> Result<CompressResult, String> {
     let in_bytes: u64 = input_paths.iter().map(|p| file_size(p)).sum();
-    // Build CStrings here; build raw pointers *inside* the closure so no
-    // non-Send *const c_char values cross the spawn_blocking thread boundary.
     let c_strings: Vec<CString> = input_paths
         .iter()
         .map(|p| to_c(p))
@@ -155,12 +197,21 @@ async fn hp_archive_compress(
     let threads = auto_threads(nthreads);
     let bm = block_mb.max(1) as c_int;
     let npaths = c_strings.len() as c_int;
+    let fs = force_strategy.unwrap_or(-1);
+    let am = allowed_mask.unwrap_or(0xFFFFFFFF);
 
     let start = std::time::Instant::now();
     let ret = tauri::async_runtime::spawn_blocking(move || {
-        // Raw pointers created and used entirely within this thread — safe.
         let c_ptrs: Vec<*const c_char> = c_strings.iter().map(|s| s.as_ptr()).collect();
-        unsafe { hp_lib_archive_compress(npaths, c_ptrs.as_ptr(), out_c.as_ptr(), bm, threads) }
+        unsafe {
+            if fs >= 0 {
+                hp_lib_archive_compress_with_strategy(npaths, c_ptrs.as_ptr(), out_c.as_ptr(), bm, threads, fs as c_int)
+            } else if am != 0xFFFFFFFF {
+                hp_lib_archive_compress_filtered(npaths, c_ptrs.as_ptr(), out_c.as_ptr(), bm, threads, am as c_uint)
+            } else {
+                hp_lib_archive_compress(npaths, c_ptrs.as_ptr(), out_c.as_ptr(), bm, threads)
+            }
+        }
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -204,7 +255,7 @@ async fn hp_archive_decompress(
     Ok(DecompressResult {
         output_path: output_dir,
         input_bytes: in_bytes,
-        output_bytes: 0, // calculated by caller if needed
+        output_bytes: 0,
         elapsed_ms: start.elapsed().as_millis() as u64,
     })
 }

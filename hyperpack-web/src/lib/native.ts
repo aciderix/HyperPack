@@ -111,6 +111,8 @@ export async function compress(
   outputPath: string,
   blockMb: number,
   nthreads: number,
+  forceStrategy: number = -1,
+  allowedMask: number = 0xFFFFFFFF,
 ): Promise<NativeCompressResult> {
   const invoke = await getInvoke();
   return invoke('hp_compress', {
@@ -118,6 +120,8 @@ export async function compress(
     outputPath,
     blockMb,
     nthreads,
+    forceStrategy,
+    allowedMask,
   }) as Promise<NativeCompressResult>;
 }
 
@@ -136,6 +140,8 @@ export async function archiveCompress(
   outputPath: string,
   blockMb: number,
   nthreads: number,
+  forceStrategy: number = -1,
+  allowedMask: number = 0xFFFFFFFF,
 ): Promise<NativeCompressResult> {
   const invoke = await getInvoke();
   return invoke('hp_archive_compress', {
@@ -143,6 +149,8 @@ export async function archiveCompress(
     outputPath,
     blockMb,
     nthreads,
+    forceStrategy,
+    allowedMask,
   }) as Promise<NativeCompressResult>;
 }
 
