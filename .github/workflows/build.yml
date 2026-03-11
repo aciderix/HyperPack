@@ -201,6 +201,9 @@ jobs:
       - name: Install frontend deps
         run: cd hyperpack-web && npm install
 
+      - name: Install create-dmg for DMG bundling
+        run: brew install create-dmg
+
       - name: Build Tauri app (universal)
         run: cd hyperpack-web && npm run tauri build -- --target universal-apple-darwin
 

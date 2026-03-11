@@ -99,6 +99,8 @@ jobs:
         with:
           workspaces: hyperpack-web/src-tauri
       - run: cd hyperpack-web && npm install
+      - name: Install create-dmg for DMG bundling
+        run: brew install create-dmg
       - run: cd hyperpack-web && npm run tauri build -- --target universal-apple-darwin
       - uses: actions/upload-artifact@v4
         with:
@@ -130,11 +132,18 @@ jobs:
         with:
           workspaces: hyperpack-web/src-tauri
       - run: cd hyperpack-web && npm install
-      - name: Copy libwinpthread-1.dll for Tauri bundling
+      - name: Copy DLLs for Tauri bundling
         shell: pwsh
         run: |
-          Copy-Item "C:\msys64\mingw64\bin\libwinpthread-1.dll" "hyperpack-web\src-tauri\libwinpthread-1.dll"
-          Copy-Item "C:\msys64\mingw64\bin\zlib1.dll" "hyperpack-web\src-tauri\zlib1.dll"
+          $mingwBin = Split-Path (Get-Command gcc.exe -ErrorAction Stop).Source
+          $src1 = Join-Path $mingwBin "libwinpthread-1.dll"
+          $dst1 = Join-Path $env:GITHUB_WORKSPACE "hyperpack-web\src-tauri\libwinpthread-1.dll"
+          Copy-Item $src1 $dst1 -Force
+          Write-Host "Copied $src1 -> $dst1"
+          $src2 = Join-Path $mingwBin "zlib1.dll"
+          $dst2 = Join-Path $env:GITHUB_WORKSPACE "hyperpack-web\src-tauri\zlib1.dll"
+          Copy-Item $src2 $dst2 -Force
+          Write-Host "Copied $src2 -> $dst2"
       - run: cd hyperpack-web && npm run tauri build
       - uses: actions/upload-artifact@v4
         with:
