@@ -130,6 +130,11 @@ jobs:
         with:
           workspaces: hyperpack-web/src-tauri
       - run: cd hyperpack-web && npm install
+      - name: Copy libwinpthread-1.dll for Tauri bundling
+        shell: pwsh
+        run: |
+          Copy-Item "C:\msys64\mingw64\bin\libwinpthread-1.dll" "hyperpack-web\src-tauri\libwinpthread-1.dll"
+          Copy-Item "C:\msys64\mingw64\bin\zlib1.dll" "hyperpack-web\src-tauri\zlib1.dll"
       - run: cd hyperpack-web && npm run tauri build
       - uses: actions/upload-artifact@v4
         with:

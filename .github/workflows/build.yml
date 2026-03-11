@@ -263,6 +263,10 @@ jobs:
           $dest = Join-Path $env:GITHUB_WORKSPACE "hyperpack-web\src-tauri\libwinpthread-1.dll"
           Copy-Item $src $dest -Force
           Write-Host "Copied $src -> $dest"
+          $zlibSrc = Join-Path $mingwBin "zlib1.dll"
+          $zlibDest = Join-Path $env:GITHUB_WORKSPACE "hyperpack-web\src-tauri\zlib1.dll"
+          Copy-Item $zlibSrc $zlibDest -Force
+          Write-Host "Copied $zlibSrc -> $zlibDest"
 
       - name: Build Tauri app
         run: cd hyperpack-web && npm run tauri build

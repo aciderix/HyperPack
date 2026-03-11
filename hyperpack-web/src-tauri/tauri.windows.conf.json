@@ -1,5 +1,5 @@
 {
   "bundle": {
-    "resources": ["libwinpthread-1.dll"]
+    "resources": ["libwinpthread-1.dll", "zlib1.dll"]
   }
 }
