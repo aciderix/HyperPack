@@ -32,6 +32,7 @@ HyperPack is a lossless data compressor written in C that analyzes each data blo
 - 🏆 **Beats xz -9** on all 3 standard corpora (Calgary, Canterbury, Silesia) in aggregate
 - 🧠 **31 compression strategies** — automatic per-block selection
 - ⚡ **Parallel compression** — multi-threaded with `-j N`
+- 🎯 **Manual strategy control** — force, include, or exclude strategies
 - 📁 **Archive mode** — compress directories with metadata preservation
 - 🌐 **Web app** — runs in the browser via WebAssembly
 - 🖥️ **Desktop app** — native Tauri builds for Windows, macOS, Linux
@@ -67,6 +68,18 @@ make
 
 # Compress with parallel threads
 ./hyperpack compress -j 4 largefile.bin
+
+# Force a specific compression strategy
+./hyperpack c -s 24 file.dat out.hpk        # Force LZMA
+
+# Auto-select among a subset of strategies
+./hyperpack c -S 1,2,5,6 file.dat out.hpk   # Only try BWT variants
+
+# Auto-select excluding specific strategies
+./hyperpack c -X 24,25 file.dat out.hpk      # Skip LZMA (too slow)
+
+# List all available strategies
+./hyperpack --list-strategies
 
 # Decompress
 ./hyperpack decompress file.dat.hpk
@@ -183,6 +196,7 @@ Native builds with full performance. Download from [Releases](https://github.com
 | Max block size | 128 MB | 128 MB | 64 MB |
 | Archive mode | ✅ | ✅ | ❌ |
 | Drag & drop | — | ✅ | ✅ |
+| Strategy control | ✅ `-s`/`-S`/`-X` | ✅ | ❌ (auto only) |
 | PNG optimization | ✅ | ❌ | ❌ |
 | Offline | ✅ | ✅ | ✅ (PWA) |
 

@@ -566,10 +566,10 @@ In the WASM build (`HYPERPACK_WASM` defined), `pthread_create` is stubbed to run
 
 ```bash
 # Compress a single file (HPK5)
-hyperpack c [-b SIZE_MB] [-j THREADS] input output.hpk
+hyperpack c [-b SIZE_MB] [-j THREADS] [-s STRATEGY] [-S LIST] [-X LIST] input output.hpk
 
 # Compress into an archive (HPK6)
-hyperpack a [-b SIZE_MB] [-j THREADS] input1 input2 dir/ output.hpk
+hyperpack a [-b SIZE_MB] [-j THREADS] [-s STRATEGY] [-S LIST] [-X LIST] input1 input2 dir/ output.hpk
 
 # Decompress (auto-detects HPK5/HPK6)
 hyperpack d input.hpk [output]
@@ -579,6 +579,9 @@ hyperpack l archive.hpk
 
 # Selective extraction from archive
 hyperpack x archive.hpk output_dir [-e pattern]
+
+# List all available strategies with their IDs
+hyperpack --list-strategies
 ```
 
 ### Options
@@ -587,7 +590,13 @@ hyperpack x archive.hpk output_dir [-e pattern]
 |--------|--------|---------|-------------|
 | `-b` | 1–128 | 128 | Block size in MB |
 | `-j` | 1–16 | 1 | Number of parallel compression threads |
+| `-s N` / `--strategy N` | 0–30 | -1 (auto) | Force a single compression strategy (bypasses auto-selection entirely) |
+| `-S N,N,...` | 0–30 (comma-sep) | all | **Include filter** — auto-selects only among listed strategies |
+| `-X N,N,...` | 0–30 (comma-sep) | none | **Exclude filter** — auto-selects among all strategies except those listed |
+| `--list-strategies` | — | — | Print all 31 strategies with their IDs and exit |
 | `-e` | pattern | — | Selective extraction pattern (with `x` command) |
+
+> **Note:** `-s` (force) cannot be combined with `-S` or `-X`. `-S` and `-X` cannot be combined with each other.
 
 ### Examples
 
@@ -595,8 +604,26 @@ hyperpack x archive.hpk output_dir [-e pattern]
 # Compress a large file with 16 MB blocks and 4 threads
 hyperpack c -b 16 -j 4 database.sql database.hpk
 
-# Archive a directory
-hyperpack a -b 8 /home/user/project project.hpk
+# Force LZMA strategy on a file
+hyperpack c -s 24 binary.dat binary.hpk
+
+# Force BCJ+LZMA on an executable
+hyperpack c -s 25 program.elf program.hpk
+
+# Auto-select among BWT variants only (fast, skip LZMA)
+hyperpack c -S 1,2,5,6,12,14 data.csv data.hpk
+
+# Auto-select but exclude slow strategies (LZMA, BCJ+LZMA)
+hyperpack c -X 24,25 largefile.bin largefile.hpk
+
+# Compare just two strategies — let auto pick the best
+hyperpack c -S 1,24 file.dat file.hpk
+
+# Archive a directory with only LZP+BWT strategies
+hyperpack a -S 5,6,14 /home/user/project project.hpk
+
+# List all strategies to see IDs and names
+hyperpack --list-strategies
 
 # Decompress a single file
 hyperpack d database.hpk database_restored.sql
@@ -607,6 +634,47 @@ hyperpack d project.hpk ./output/
 # Extract a single file from an archive
 hyperpack x project.hpk ./out/ -e "src/main.c"
 ```
+
+### Strategy Control
+
+HyperPack offers three levels of strategy control for compression:
+
+#### Level 1: Fully Automatic (default)
+
+With no options, HyperPack tests all 31 strategies on each block using sample-based heuristics and selects the best one automatically. This is the recommended mode for most use cases.
+
+#### Level 2: Filtered Auto-Selection (`-S` / `-X`)
+
+Restricts which strategies the auto-selector considers:
+
+```bash
+# Only test BWT+O0, BWT+O1, and LZP+BWT+O0
+hyperpack c -S 1,2,5 file.dat file.hpk
+
+# Test everything except LZMA and BCJ+LZMA (faster)
+hyperpack c -X 24,25 file.dat file.hpk
+```
+
+When `-S` is used, strategies normally skipped by internal heuristics (e.g., LZMA on large text) will be **forced to run** — the user explicitly opted into them. Group-level optimizations still apply: if no strategies from a group (e.g., Delta, LZ77) are in the allowed set, that entire group's preprocessing is skipped, saving time.
+
+The filter is printed at startup:
+```
+[HP5] Strategy filter: 1(BWT+O0), 2(BWT+O1), 5(LZP+BWT+O0)
+```
+
+#### Level 3: Forced Single Strategy (`-s`)
+
+Bypasses all auto-selection logic entirely — no sampling, no trial compression:
+
+```bash
+# Force LZMA
+hyperpack c -s 24 file.dat file.hpk
+
+# Force BWT+O1
+hyperpack c -s 2 file.dat file.hpk
+```
+
+Useful for benchmarking individual strategies or when you know which algorithm works best for your data.
 
 ### Diagnostic Output (stderr)
 

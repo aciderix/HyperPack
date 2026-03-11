@@ -21,6 +21,18 @@
 | CI/CD | GitHub Actions: build, test, deploy to Pages, release binaries |
 | PWA | Offline-capable web app with service worker |
 
+### v12.1 — Manual Strategy Control
+
+| Feature | Details |
+|---------|---------|
+| Force strategy (`-s N`) | Bypass auto-selection, compress directly with strategy N |
+| Include filter (`-S N,N,...`) | Auto-select only among listed strategies |
+| Exclude filter (`-X N,N,...`) | Auto-select among all except listed strategies |
+| List strategies (`--list-strategies`) | Display all 31 strategies with IDs |
+| LZMA heuristic override | `-S` bypasses internal skip heuristics |
+| Group-level skipping | Skip entire BWT/Delta/LZ77 groups when unused |
+| Library API | New filtered/forced compression functions |
+
 ## Future Opportunities
 
 ### Neural Context Mixer + Word Model

@@ -3,6 +3,33 @@
 All notable changes to HyperPack are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [v12.1] — 2026-03-11
+
+### Added — Manual Strategy Selection
+
+- **`-s N` / `--strategy N`**: Force a single compression strategy, bypassing all auto-selection (no sampling, no trial compression). N = 0..30.
+- **`-S N,N,...`**: Include filter — restrict auto-selection to only the listed strategies. The auto-selector still picks the best among them.
+- **`-X N,N,...`**: Exclude filter — auto-select among all strategies except those listed.
+- **`--list-strategies`**: Print all 31 strategies with their IDs and names.
+- **LZMA heuristic override**: When LZMA is explicitly included via `-S`, internal heuristics (skip on large text, entropy checks) are bypassed.
+- **Group-level skip optimization**: When no strategies from a group (BWT, Delta, LZ77) are in the allowed set, the entire group's preprocessing is skipped.
+- **Library API**: New `hp_lib_compress_with_strategy()`, `hp_lib_compress_filtered()`, `hp_lib_archive_compress_with_strategy()`, `hp_lib_archive_compress_filtered()`, `hp_lib_num_strategies()`, `hp_lib_strategy_name()`.
+- WASM builds unchanged (always auto, all strategies).
+
+### Implementation Details
+
+- `force_strategy` (`int`, -1 = auto) propagated through `compress_block()`, `file_compress()`, `archive_compress()`, and parallel workers.
+- `allowed_mask` (`uint32_t`, bitmask) propagated through the same path. Default `0xFFFFFFFF` = all strategies.
+- New `compress_block_forced()` function for single-strategy compression.
+- Validation: out-of-range values produce clear error messages with `--list-strategies` hint.
+- `-s`, `-S`, and `-X` are mutually compatible only as: `-s` alone, `-S` alone, `-X` alone. Combinations produce errors.
+
+### Regressions
+
+None. All existing behavior unchanged when no new options are used.
+
+---
+
 ## [v12] — 2026-03-10
 
 ### Added — Parallel Decompression
