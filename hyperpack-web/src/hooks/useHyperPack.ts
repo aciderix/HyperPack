@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { CompressParams, FileEntry, WorkerResponse } from '../workers/bridge';
+import { CompressParams, FileEntry, ExtractedFile, WorkerResponse } from '../workers/bridge';
 import * as native from '../lib/native';
 
 export type HyperPackStatus = 'idle' | 'processing' | 'complete' | 'error';
@@ -38,6 +38,8 @@ export type ListEntry = {
   isDedup: boolean;
 };
 
+export { ExtractedFile };
+
 function createWorker(): Worker {
   return new Worker(import.meta.env.BASE_URL + 'worker.js');
 }
@@ -48,6 +50,7 @@ export function useHyperPack() {
   const [result, setResult] = useState<HyperPackResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [listEntries, setListEntries] = useState<ListEntry[] | null>(null);
+  const [extractedFiles, setExtractedFiles] = useState<ExtractedFile[] | null>(null);
   
   const workerRef = useRef<Worker | null>(null);
   const startTimeRef = useRef<number>(0);
@@ -81,6 +84,7 @@ export function useHyperPack() {
       } else if (msg.type === 'done') {
         setStatus('complete');
         setProgress(null);
+        setExtractedFiles(null);
 
         // Build blocks array from strategies map
         const blocks: Array<{ strategy: string; inputSize: number; outputSize: number }> = [];
@@ -103,6 +107,23 @@ export function useHyperPack() {
           fileCount: msg.fileCount,
           dedupCount: msg.dedupCount,
           dedupSaved: msg.dedupSaved,
+        });
+      } else if (msg.type === 'done-multi') {
+        setStatus('complete');
+        setProgress(null);
+
+        // Store all extracted files for File System Access API
+        setExtractedFiles(msg.files);
+
+        setResult({
+          inputSize: msg.originalSize,
+          outputSize: msg.decompressedSize,
+          ratio: msg.originalSize / Math.max(msg.decompressedSize, 1),
+          totalMs: msg.elapsed * 1000,
+          blocks: [],
+          outputBuffer: new ArrayBuffer(0),
+          outputFileName: msg.name,
+          fileCount: msg.fileCount,
         });
       } else if (msg.type === 'list-result') {
         setListEntries(msg.entries);
@@ -279,10 +300,11 @@ export function useHyperPack() {
     setResult(null);
     setError(null);
     setListEntries(null);
+    setExtractedFiles(null);
   }, []);
 
   const download = useCallback(() => {
-    if (result && result.outputBuffer) {
+    if (result && result.outputBuffer && result.outputBuffer.byteLength > 0) {
       // Explicit MIME type prevents browsers from appending .txt to .hpk files
       const blob = new Blob([result.outputBuffer], { type: 'application/octet-stream' });
       const url = URL.createObjectURL(blob);
@@ -297,5 +319,63 @@ export function useHyperPack() {
     }
   }, [result]);
 
-  return { status, progress, result, error, listEntries, compress, decompress, listArchive, cancel, reset, download };
+  /** Download a single file from the extracted files list */
+  const downloadFile = useCallback((index: number) => {
+    if (!extractedFiles || !extractedFiles[index]) return;
+    const f = extractedFiles[index];
+    const blob = new Blob([f.data], { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    // Use just the filename part (strip directory path)
+    a.download = f.name.split('/').pop() || f.name;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  }, [extractedFiles]);
+
+  /** Save all extracted files to a user-picked folder (File System Access API) */
+  const saveToFolder = useCallback(async (): Promise<boolean> => {
+    if (!extractedFiles || extractedFiles.length === 0) return false;
+
+    // Check File System Access API support
+    if (!('showDirectoryPicker' in window)) return false;
+
+    try {
+      const dirHandle = await (window as any).showDirectoryPicker({ mode: 'readwrite' });
+
+      for (const file of extractedFiles) {
+        // file.name may contain subdirectories like "subdir/file.txt"
+        const parts = file.name.split('/');
+        let currentDir = dirHandle;
+
+        // Create subdirectories as needed
+        for (let i = 0; i < parts.length - 1; i++) {
+          currentDir = await currentDir.getDirectoryHandle(parts[i], { create: true });
+        }
+
+        // Write the file
+        const fileName = parts[parts.length - 1];
+        const fileHandle = await currentDir.getFileHandle(fileName, { create: true });
+        const writable = await fileHandle.createWritable();
+        await writable.write(file.data);
+        await writable.close();
+      }
+      return true;
+    } catch (err: any) {
+      // User cancelled the picker — not an error
+      if (err?.name === 'AbortError') return false;
+      throw err;
+    }
+  }, [extractedFiles]);
+
+  /** Whether File System Access API is available */
+  const hasFSAccess = 'showDirectoryPicker' in window;
+
+  return {
+    status, progress, result, error, listEntries, extractedFiles,
+    compress, decompress, listArchive, cancel, reset,
+    download, downloadFile, saveToFolder, hasFSAccess,
+  };
 }

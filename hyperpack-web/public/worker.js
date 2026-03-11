@@ -210,10 +210,8 @@ function decompressFile(fileBuffer, fileName) {
     const totalSize = extractedFiles.reduce((sum, f) => sum + f.size, 0);
     const elapsed = (performance.now() - start) / 1000;
 
-    // Create a zip of extracted files for download
-    // For simplicity, if single file in archive, return it directly
-    // Otherwise, build a tar-like concatenation or return info
     if (extractedFiles.length === 1) {
+      // Single file: return it directly
       var outBuf6s = new Uint8Array(extractedFiles[0].data).buffer;
       self.postMessage({
         type: 'done',
@@ -223,23 +221,27 @@ function decompressFile(fileBuffer, fileName) {
         compressedSize: totalSize,
         ratio: 1,
         elapsed: elapsed,
-        fileCount: extractedFiles.length
+        fileCount: 1
       }, [outBuf6s]);
     } else {
-      // Return first file and metadata about all files
-      // The UI will handle multi-file display
-      var outBuf6m = new Uint8Array(extractedFiles[0].data).buffer;
+      // Multiple files: send all files as transferable array
+      var allFiles = [];
+      var transferables = [];
+      for (var i = 0; i < extractedFiles.length; i++) {
+        var fileBuf = new Uint8Array(extractedFiles[i].data).buffer;
+        allFiles.push({ name: extractedFiles[i].name, data: fileBuf, size: extractedFiles[i].size });
+        transferables.push(fileBuf);
+      }
+      var baseName = fileName.replace(/\.hpk(\.txt)?$/i, '');
       self.postMessage({
-        type: 'done',
-        data: outBuf6m,
-        name: fileName.replace('.hpk', ''),
+        type: 'done-multi',
+        name: baseName,
         originalSize: data.length,
-        compressedSize: totalSize,
-        ratio: 1,
+        decompressedSize: totalSize,
         elapsed: elapsed,
         fileCount: extractedFiles.length,
-        extractedFiles: extractedFiles.map(f => ({ name: f.name, size: f.size }))
-      }, [outBuf6m]);
+        files: allFiles
+      }, transferables);
     }
 
     removeRecursive(outDir);

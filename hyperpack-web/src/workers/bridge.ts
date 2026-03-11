@@ -20,11 +20,19 @@ export type WorkerRequest =
   | { type: 'list'; file: ArrayBuffer }
   | { type: 'cancel' };
 
+export interface ExtractedFile {
+  name: string;
+  data: ArrayBuffer;
+  size: number;
+}
+
 export type WorkerResponse =
   | { type: 'ready' }
   | { type: 'progress'; percent: number; speed?: string; eta?: string; detail?: string }
   | { type: 'done'; data: ArrayBuffer; name: string; originalSize: number; compressedSize: number;
       ratio: number; elapsed: number; strategies?: Record<string, number>;
       fileCount?: number; dedupCount?: number; dedupSaved?: number }
+  | { type: 'done-multi'; name: string; originalSize: number; decompressedSize: number;
+      elapsed: number; fileCount: number; files: ExtractedFile[] }
   | { type: 'list-result'; entries: Array<{type: string; path: string; size: number; crc: string; blocks: number; isDedup: boolean}> }
   | { type: 'error'; message: string };

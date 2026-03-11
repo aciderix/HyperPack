@@ -37,7 +37,7 @@ export default function App() {
   const [isDraggingPage, setIsDraggingPage] = useState(false);
   const dragCounterRef = useRef(0);
 
-  const { status, progress, result, error, compress, decompress, cancel, reset, download } = useHyperPack();
+  const { status, progress, result, error, extractedFiles, compress, decompress, cancel, reset, download, downloadFile, saveToFolder, hasFSAccess } = useHyperPack();
 
   // Auto-detect archive mode based on file count
   const archiveMode = files.length > 1;
@@ -212,7 +212,11 @@ export default function App() {
                 result={result} 
                 mode={mode} 
                 onDownload={download} 
-                onReset={handleClearFile} 
+                onReset={handleClearFile}
+                extractedFiles={extractedFiles}
+                onDownloadFile={downloadFile}
+                onSaveToFolder={saveToFolder}
+                hasFSAccess={hasFSAccess}
               />
             )}
 
