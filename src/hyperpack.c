@@ -38,7 +38,7 @@ static FILE *hp_fmemopen(void *buf, size_t size, const char *mode) {
 #ifdef HYPERPACK_WASM
 /* WASM build: prevent thread creation; mutex/join are no-ops via Emscripten stubs */
 static inline int pthread_create_stub(pthread_t *t, const void *a, void *(*f)(void*), void *arg)
-    { (void)t;(void)a;(void)f;(void)arg; return -1; }
+    { (void)t;(void)a; f(arg); return 0; }
 static inline int pthread_join_stub(pthread_t t, void **r) { (void)t;(void)r; return 0; }
 #define pthread_create pthread_create_stub
 #define pthread_join   pthread_join_stub
