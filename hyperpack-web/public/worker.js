@@ -109,11 +109,14 @@ function compressArchive(files, params, outName) {
   removeRecursive(dirName);
   try { Module.FS.mkdir(dirName); } catch (e) {}
 
+  /* Clean file names (Android SAF URIs, URL encoding, common prefix) */
+  var cleanedFiles = cleanFileNames(files);
+
   let totalSize = 0;
   const dirs = new Set();
   dirs.add(dirName);
 
-  for (const file of files) {
+  for (const file of cleanedFiles) {
     const fullPath = dirName + '/' + file.name;
     const parts = fullPath.split('/');
     for (let i = 2; i < parts.length; i++) {
@@ -195,7 +198,7 @@ function decompressFile(fileBuffer, fileName) {
       return;
     }
 
-    const extractedFiles = collectFiles(outDir, '');
+    const extractedFiles = cleanFileNames(collectFiles(outDir, ''));
     const totalSize = extractedFiles.reduce(function(sum, f) { return sum + f.size; }, 0);
     const elapsed = (performance.now() - start) / 1000;
 
@@ -335,6 +338,71 @@ function collectFiles(basePath, rel) {
     }
   } catch (e) {}
   return files;
+}
+
+/* ===== File name cleaning (Android SAF URIs, URL encoding) ===== */
+function cleanFileName(name) {
+  /* 1. URL-decode */
+  try { name = decodeURIComponent(name); } catch (e) {}
+  /* 2. Strip internal MEMFS prefix */
+  name = name.replace(/^archive_input\//, '');
+  /* 3. Android Storage Access Framework:
+         tree/<treeId>/document/<storageVolume>:<path>
+     After URL-decode treeId/docId may contain real slashes,
+     so we look for the "/document/" marker. */
+  var docIdx = name.indexOf('/document/');
+  if (docIdx !== -1 && name.indexOf('tree/') === 0) {
+    var docPath = name.substring(docIdx + 10); /* skip '/document/' */
+    var colonIdx = docPath.indexOf(':');
+    var slashIdx = docPath.indexOf('/');
+    if (colonIdx !== -1 && (slashIdx === -1 || colonIdx < slashIdx)) {
+      docPath = docPath.substring(colonIdx + 1);
+    }
+    name = docPath;
+  }
+  /* 4. Trim leading slashes */
+  name = name.replace(/^\/+/, '');
+  return name;
+}
+
+/**
+ * Clean an array of {name, data, size} file objects:
+ *  - decode / sanitise each name
+ *  - strip the longest common *directory* prefix so the tree
+ *    starts at the interesting level (e.g. drop "Download/D184MB/")
+ */
+function cleanFileNames(files) {
+  var cleaned = [];
+  for (var i = 0; i < files.length; i++) {
+    cleaned.push({
+      name: cleanFileName(files[i].name),
+      data: files[i].data,
+      size: files[i].size !== undefined
+        ? files[i].size
+        : (files[i].data ? (files[i].data.length || files[i].data.byteLength || 0) : 0)
+    });
+  }
+  if (cleaned.length <= 1) return cleaned;
+
+  /* Find common directory prefix (never strip the filename itself) */
+  var allParts = cleaned.map(function (f) { return f.name.split('/'); });
+  var minLen = Math.min.apply(null, allParts.map(function (p) { return p.length; }));
+  var prefixLen = 0;
+  for (var i = 0; i < minLen - 1; i++) {
+    var part = allParts[0][i];
+    var allMatch = true;
+    for (var j = 1; j < allParts.length; j++) {
+      if (allParts[j][i] !== part) { allMatch = false; break; }
+    }
+    if (allMatch) prefixLen++;
+    else break;
+  }
+  if (prefixLen === 0) return cleaned;
+
+  return cleaned.map(function (f) {
+    var parts = f.name.split('/');
+    return { name: parts.slice(prefixLen).join('/'), data: f.data, size: f.size };
+  });
 }
 
 /* ===== Progress parsing from stderr ===== */
