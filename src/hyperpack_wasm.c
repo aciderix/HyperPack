@@ -41,7 +41,7 @@ EMSCRIPTEN_KEEPALIVE
 int hp_compress(int block_mb) {
     if (block_mb < 1) block_mb = 1;
     if (block_mb > 64) block_mb = 64;  /* WASM memory safety */
-    return file_compress("/input", "/output.hpk", block_mb << 20, 1);
+    return file_compress("/input", "/output.hpk", block_mb << 20, 1, -1);
 }
 
 /*
@@ -70,7 +70,7 @@ int hp_archive_compress(const char *dirpath, const char *outpath, int block_size
     if (block_size < (1 << 20)) block_size = 1 << 20;
     if (block_size > (128 << 20)) block_size = 128 << 20;
     const char *paths[1] = { dirpath };
-    return archive_compress(1, paths, outpath, block_size, 1);
+    return archive_compress(1, paths, outpath, block_size, 1, -1);
 }
 
 /* Archive decompress: reads HPK6 from MEMFS, extracts to output dir in MEMFS.

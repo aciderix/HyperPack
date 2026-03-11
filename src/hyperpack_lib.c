@@ -35,7 +35,7 @@ int hp_lib_compress(const char *inpath, const char *outpath,
                     int block_mb, int nthreads) {
     if (block_mb < 1)  block_mb = 1;
     if (nthreads < 1)  nthreads = 1;
-    return file_compress(inpath, outpath, block_mb << 20, nthreads);
+    return file_compress(inpath, outpath, block_mb << 20, nthreads, -1);
 }
 
 /* Decompress inpath → outpath. Returns 0 on success. */
@@ -51,7 +51,7 @@ int hp_lib_archive_compress(int npaths, const char **paths,
                             const char *outpath, int block_mb, int nthreads) {
     if (block_mb < 1)  block_mb = 1;
     if (nthreads < 1)  nthreads = 1;
-    return archive_compress(npaths, paths, outpath, block_mb << 20, nthreads);
+    return archive_compress(npaths, paths, outpath, block_mb << 20, nthreads, -1);
 }
 
 /* Decompress HPK6 archive inpath → outdir.
@@ -65,4 +65,32 @@ int hp_lib_archive_decompress(const char *inpath, const char *outdir,
 /* List HPK6 archive contents to stdout. Returns 0 on success. */
 int hp_lib_archive_list(const char *inpath) {
     return archive_list(inpath);
+}
+
+/* ── Strategy-forced variants ──────────────────────────────────────────── */
+
+/* Compress with a specific strategy. force_strategy: 0..30 or -1 for auto. */
+int hp_lib_compress_with_strategy(const char *inpath, const char *outpath,
+                                   int block_mb, int nthreads, int force_strategy) {
+    if (block_mb < 1)  block_mb = 1;
+    if (nthreads < 1)  nthreads = 1;
+    return file_compress(inpath, outpath, block_mb << 20, nthreads, force_strategy);
+}
+
+/* Archive compress with a specific strategy. force_strategy: 0..30 or -1 for auto. */
+int hp_lib_archive_compress_with_strategy(int npaths, const char **paths,
+                                           const char *outpath, int block_mb,
+                                           int nthreads, int force_strategy) {
+    if (block_mb < 1)  block_mb = 1;
+    if (nthreads < 1)  nthreads = 1;
+    return archive_compress(npaths, paths, outpath, block_mb << 20, nthreads, force_strategy);
+}
+
+/* List strategy names. Returns NUM_STRATEGIES (31). */
+int hp_lib_num_strategies(void) { return NUM_STRATEGIES; }
+
+/* Get strategy name by index. Returns NULL if out of range. */
+const char *hp_lib_strategy_name(int idx) {
+    if (idx < 0 || idx >= NUM_STRATEGIES) return NULL;
+    return strat_names[idx];
 }

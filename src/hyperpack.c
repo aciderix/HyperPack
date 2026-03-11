@@ -101,6 +101,7 @@ static const char *strat_names[] = {
     "BWT+CTX2",
     "BWT+O1PS"
 };
+#define NUM_STRATEGIES 31
 
 /* ===== HPK6 Archive Structures ===== */
 typedef struct {
@@ -4831,6 +4832,414 @@ static double ascii_ratio(const uint8_t *data, int n) {
     return (double)count / limit;
 }
 
+
+/* ===== Forced Single-Strategy Compression ===== */
+/* When the user specifies --strategy N, bypass all auto-selection and
+   apply only the requested strategy. Falls back to STORE if result is larger. */
+static int compress_block_forced(const uint8_t *data, int n, uint8_t *out, int *strat,
+                                  BWTWorkspace *bwt_ws, CompressWorkspace *cws, int fs) {
+    *strat = S_STORE;
+    memcpy(out, data, n);  /* default: store */
+    int best_size = n;
+
+    if (fs == S_STORE) return best_size;
+
+    uint8_t  *bwt_buf   = cws->bwt_buf;
+    uint8_t  *mtf_buf   = cws->mtf_buf;
+    uint16_t *zrle_buf  = cws->zrle_buf;
+    uint8_t  *arith_buf = cws->arith_buf;
+    uint8_t  *delta_buf = cws->delta_buf;
+    uint8_t  *lzp_buf   = cws->lzp_buf;
+    int pidx, nz, asize, total;
+
+    /* ---- Plain BWT strategies ---- */
+    if (fs == S_BWT_O0 || fs == S_BWT_O1 || fs == S_BWT_O2 ||
+        fs == S_BWT_O0_PS || fs == S_BWT_O1_PS || fs == S_BWT_RANS || fs == S_BWT_CTX2) {
+        pidx = bwt_encode_ws(data, n, bwt_buf, bwt_ws);
+        mtf_encode(bwt_buf, n, mtf_buf);
+        nz = zrle_encode(mtf_buf, n, zrle_buf);
+        switch (fs) {
+            case S_BWT_O0:    asize = arith_enc_o0(zrle_buf, nz, arith_buf); break;
+            case S_BWT_O1:    asize = arith_enc_o1(zrle_buf, nz, arith_buf); break;
+            case S_BWT_O2:    asize = arith_enc_o2(zrle_buf, nz, arith_buf); break;
+            case S_BWT_O0_PS: asize = arith_enc_o0_ps(zrle_buf, nz, arith_buf); break;
+            case S_BWT_O1_PS: asize = arith_enc_o1_ps(zrle_buf, nz, arith_buf); break;
+            case S_BWT_RANS:  asize = rans_enc_o0(zrle_buf, nz, arith_buf); break;
+            case S_BWT_CTX2:  asize = arith_enc_ctx2(zrle_buf, nz, arith_buf); break;
+            default: asize = n; break;
+        }
+        total = 8 + asize;
+        if (total < best_size) {
+            best_size = total; *strat = fs;
+            put_u32be(out, pidx);
+            put_u32be(out + 4, nz);
+            memcpy(out + 8, arith_buf, asize);
+        }
+    }
+
+    /* ---- Delta + BWT strategies ---- */
+    else if (fs == S_DBWT_O0 || fs == S_DBWT_O1 || fs == S_DBWT_O2) {
+        delta_encode(data, n, delta_buf);
+        pidx = bwt_encode_ws(delta_buf, n, bwt_buf, bwt_ws);
+        mtf_encode(bwt_buf, n, mtf_buf);
+        nz = zrle_encode(mtf_buf, n, zrle_buf);
+        switch (fs) {
+            case S_DBWT_O0: asize = arith_enc_o0(zrle_buf, nz, arith_buf); break;
+            case S_DBWT_O1: asize = arith_enc_o1(zrle_buf, nz, arith_buf); break;
+            case S_DBWT_O2: asize = arith_enc_o2(zrle_buf, nz, arith_buf); break;
+            default: asize = n; break;
+        }
+        total = 8 + asize;
+        if (total < best_size) {
+            best_size = total; *strat = fs;
+            put_u32be(out, pidx);
+            put_u32be(out + 4, nz);
+            memcpy(out + 8, arith_buf, asize);
+        }
+    }
+
+    /* ---- LZP + BWT strategies ---- */
+    else if (fs == S_LZP_BWT_O0 || fs == S_LZP_BWT_O1 || fs == S_LZP_BWT_O2) {
+        int lzp_size = lzp_encode(data, n, lzp_buf);
+        if (lzp_size > 0) {
+            pidx = bwt_encode_ws(lzp_buf, lzp_size, bwt_buf, bwt_ws);
+            mtf_encode(bwt_buf, lzp_size, mtf_buf);
+            nz = zrle_encode(mtf_buf, lzp_size, zrle_buf);
+            switch (fs) {
+                case S_LZP_BWT_O0: asize = arith_enc_o0(zrle_buf, nz, arith_buf); break;
+                case S_LZP_BWT_O1: asize = arith_enc_o1(zrle_buf, nz, arith_buf); break;
+                case S_LZP_BWT_O2: asize = arith_enc_o2(zrle_buf, nz, arith_buf); break;
+                default: asize = n; break;
+            }
+            total = 12 + asize;
+            if (total < best_size) {
+                best_size = total; *strat = fs;
+                put_u32be(out, lzp_size);
+                put_u32be(out + 4, pidx);
+                put_u32be(out + 8, nz);
+                memcpy(out + 12, arith_buf, asize);
+            }
+        } else {
+            fprintf(stderr, "    [forced %s] LZP produced no output, falling back to STORE\n", strat_names[fs]);
+        }
+    }
+
+    /* ---- Delta + LZP + BWT strategies ---- */
+    else if (fs == S_DLZP_BWT_O0 || fs == S_DLZP_BWT_O1 || fs == S_DLZP_BWT_O2) {
+        delta_encode(data, n, delta_buf);
+        int dlzp_size = lzp_encode(delta_buf, n, lzp_buf);
+        if (dlzp_size > 0) {
+            pidx = bwt_encode_ws(lzp_buf, dlzp_size, bwt_buf, bwt_ws);
+            mtf_encode(bwt_buf, dlzp_size, mtf_buf);
+            nz = zrle_encode(mtf_buf, dlzp_size, zrle_buf);
+            switch (fs) {
+                case S_DLZP_BWT_O0: asize = arith_enc_o0(zrle_buf, nz, arith_buf); break;
+                case S_DLZP_BWT_O1: asize = arith_enc_o1(zrle_buf, nz, arith_buf); break;
+                case S_DLZP_BWT_O2: asize = arith_enc_o2(zrle_buf, nz, arith_buf); break;
+                default: asize = n; break;
+            }
+            total = 12 + asize;
+            if (total < best_size) {
+                best_size = total; *strat = fs;
+                put_u32be(out, dlzp_size);
+                put_u32be(out + 4, pidx);
+                put_u32be(out + 8, nz);
+                memcpy(out + 12, arith_buf, asize);
+            }
+        } else {
+            fprintf(stderr, "    [forced %s] LZP produced no output, falling back to STORE\n", strat_names[fs]);
+        }
+    }
+
+    /* ---- LZ77 + BWT strategies ---- */
+    else if (fs == S_LZ77_O0 || fs == S_LZ77_O1) {
+        int lz_cap = n + 4096;
+        uint8_t *lz_packed = (uint8_t*)malloc(lz_cap);
+        if (lz_packed) {
+            int lz_size = lz77_encode(data, n, lz_packed, lz_cap);
+            if (lz_size > 0) {
+                int alloc_lz = lz_size + 4096;
+                uint8_t  *lz_bwt   = (uint8_t*)malloc(alloc_lz);
+                uint8_t  *lz_mtf   = (uint8_t*)malloc(alloc_lz);
+                uint16_t *lz_zrle  = (uint16_t*)malloc(alloc_lz * 2 * sizeof(uint16_t));
+                uint8_t  *lz_arith = (uint8_t*)malloc(alloc_lz + alloc_lz/4 + 1024);
+                if (lz_bwt && lz_mtf && lz_zrle && lz_arith) {
+                    int lz_pidx = bwt_encode_ws(lz_packed, lz_size, lz_bwt, bwt_ws);
+                    mtf_encode(lz_bwt, lz_size, lz_mtf);
+                    int lz_nz = zrle_encode(lz_mtf, lz_size, lz_zrle);
+                    if (fs == S_LZ77_O0)
+                        asize = arith_enc_o0(lz_zrle, lz_nz, lz_arith);
+                    else
+                        asize = arith_enc_o1(lz_zrle, lz_nz, lz_arith);
+                    total = 12 + asize;
+                    if (total < best_size) {
+                        best_size = total; *strat = fs;
+                        put_u32be(out, lz_size);
+                        put_u32be(out + 4, lz_pidx);
+                        put_u32be(out + 8, lz_nz);
+                        memcpy(out + 12, lz_arith, asize);
+                    }
+                }
+                free(lz_bwt); free(lz_mtf); free(lz_zrle); free(lz_arith);
+            }
+            free(lz_packed);
+        }
+    }
+
+    /* ---- F32XOR + BWT ---- */
+    else if (fs == S_F32_BWT) {
+        float_xor_encode(data, n, delta_buf);
+        pidx = bwt_encode_ws(delta_buf, n, bwt_buf, bwt_ws);
+        mtf_encode(bwt_buf, n, mtf_buf);
+        nz = zrle_encode(mtf_buf, n, zrle_buf);
+        asize = arith_enc_o0(zrle_buf, nz, arith_buf);
+        total = 8 + asize;
+        if (total < best_size) {
+            best_size = total; *strat = fs;
+            put_u32be(out, pidx);
+            put_u32be(out + 4, nz);
+            memcpy(out + 8, arith_buf, asize);
+        }
+    }
+
+    /* ---- LZMA ---- */
+    else if (fs == S_LZMA) {
+        uint8_t *lzma_out = (uint8_t*)malloc(n + n/4 + 65536);
+        if (lzma_out) {
+            int lzma_sz = lzma_compress(data, n, lzma_out, best_size);
+            if (lzma_sz > 0 && lzma_sz < best_size) {
+                best_size = lzma_sz; *strat = fs;
+                memcpy(out, lzma_out, lzma_sz);
+            }
+            free(lzma_out);
+        }
+    }
+
+    /* ---- BCJ + LZMA ---- */
+    else if (fs == S_BCJ_LZMA) {
+        uint8_t *bcj_buf = (uint8_t*)malloc(n);
+        uint8_t *bcj_lzma_out = (uint8_t*)malloc(n + n/4 + 65536);
+        if (bcj_buf && bcj_lzma_out) {
+            bcj_e8e9_encode(data, n, bcj_buf);
+            int bcj_lzma_sz = lzma_compress(bcj_buf, n, bcj_lzma_out, best_size);
+            if (bcj_lzma_sz > 0 && bcj_lzma_sz < best_size) {
+                best_size = bcj_lzma_sz; *strat = fs;
+                memcpy(out, bcj_lzma_out, bcj_lzma_sz);
+            }
+        }
+        if (bcj_buf) free(bcj_buf);
+        if (bcj_lzma_out) free(bcj_lzma_out);
+    }
+
+    /* ---- CM (Context Mixing) ---- */
+    else if (fs == S_CM) {
+        int cm_size = cm_encode(data, n, arith_buf);
+        if (cm_size > 0 && cm_size < best_size) {
+            best_size = cm_size; *strat = fs;
+            memcpy(out, arith_buf, cm_size);
+        }
+    }
+
+    /* ---- BWT + CM ---- */
+    else if (fs == S_BWT_CM) {
+        pidx = bwt_encode_ws(data, n, bwt_buf, bwt_ws);
+        int bwt_cm_size = cm_encode(bwt_buf, n, arith_buf);
+        total = 4 + bwt_cm_size;
+        if (bwt_cm_size > 0 && total < best_size) {
+            best_size = total; *strat = fs;
+            put_u32be(out, pidx);
+            memcpy(out + 4, arith_buf, bwt_cm_size);
+        }
+    }
+
+    /* ---- BWT + MTF + CM ---- */
+    else if (fs == S_BWT_MTF_CM) {
+        pidx = bwt_encode_ws(data, n, bwt_buf, bwt_ws);
+        mtf_encode(bwt_buf, n, mtf_buf);
+        int mtf_cm_size = cm_encode(mtf_buf, n, arith_buf);
+        total = 4 + mtf_cm_size;
+        if (mtf_cm_size > 0 && total < best_size) {
+            best_size = total; *strat = fs;
+            put_u32be(out, pidx);
+            memcpy(out + 4, arith_buf, mtf_cm_size);
+        }
+    }
+
+    /* ---- PPM ---- */
+    else if (fs == S_PPM) {
+        int ppm_size = ppm_compress(data, n, arith_buf);
+        if (ppm_size > 0 && ppm_size < best_size) {
+            best_size = ppm_size; *strat = fs;
+            memcpy(out, arith_buf, ppm_size);
+        }
+    }
+
+    /* ---- BWT + PPM ---- */
+    else if (fs == S_BWT_PPM) {
+        pidx = bwt_encode_ws(data, n, bwt_buf, bwt_ws);
+        int bppm_size = ppm_compress(bwt_buf, n, arith_buf);
+        total = 4 + bppm_size;
+        if (bppm_size > 0 && total < best_size) {
+            best_size = total; *strat = fs;
+            put_u32be(out, pidx);
+            memcpy(out + 4, arith_buf, bppm_size);
+        }
+    }
+
+    /* ---- BWT + MTF + PPM ---- */
+    else if (fs == S_BWT_MTF_PPM) {
+        pidx = bwt_encode_ws(data, n, bwt_buf, bwt_ws);
+        mtf_encode(bwt_buf, n, mtf_buf);
+        int mtfppm_size = ppm_compress(mtf_buf, n, arith_buf);
+        total = 4 + mtfppm_size;
+        if (mtfppm_size > 0 && total < best_size) {
+            best_size = total; *strat = fs;
+            put_u32be(out, pidx);
+            memcpy(out + 4, arith_buf, mtfppm_size);
+        }
+    }
+
+    /* ---- Audio ---- */
+    else if (fs == S_AUDIO) {
+        if (!audio_detect(data, n)) {
+            fprintf(stderr, "    [forced Audio] data not detected as audio, falling back to STORE\n");
+        } else {
+            int audio_alloc = n + 262144;
+            uint8_t *audio_buf = (uint8_t*)malloc(audio_alloc);
+            if (audio_buf) {
+                int audio_n = audio_encode(data, n, audio_buf);
+                (void)audio_n;
+                int nframes_audio = (n / 4);
+                uint8_t *direct_out = (uint8_t*)malloc(n + 131072);
+                if (direct_out) {
+                    int dp = 0;
+                    int version = audio_buf[0];
+                    int nf_audio = (audio_buf[1]<<24)|(audio_buf[2]<<16)|(audio_buf[3]<<8)|audio_buf[4];
+                    int stream_start;
+                    if (version == 4) {
+                        int nblk = (audio_buf[5]<<24)|(audio_buf[6]<<16)|(audio_buf[7]<<8)|audio_buf[8];
+                        int p = 9;
+                        for (int b = 0; b < nblk; b++) {
+                            int oM = audio_buf[p++], oS = audio_buf[p++];
+                            p += 2 * (oM + oS);
+                        }
+                        stream_start = p;
+                    } else {
+                        stream_start = 5;
+                    }
+                    direct_out[dp++] = 0xFF;
+                    memcpy(direct_out + dp, audio_buf, stream_start); dp += stream_start;
+                    uint8_t *stream_data = audio_buf + stream_start;
+                    int stream_len = nf_audio;
+                    int tail_audio = n - nf_audio * 4;
+                    for (int s = 0; s < 4; s++) {
+                        uint16_t *s16 = (uint16_t*)malloc(stream_len * sizeof(uint16_t));
+                        for (int j = 0; j < stream_len; j++) s16[j] = stream_data[s * stream_len + j];
+                        int s_enc = arith_enc_o1(s16, stream_len, arith_buf);
+                        free(s16);
+                        put_u32be(direct_out + dp, s_enc); dp += 4;
+                        memcpy(direct_out + dp, arith_buf, s_enc); dp += s_enc;
+                    }
+                    if (tail_audio > 0) {
+                        memcpy(direct_out + dp, stream_data + 4 * stream_len, tail_audio);
+                        dp += tail_audio;
+                    }
+                    if (dp < best_size) {
+                        best_size = dp; *strat = fs;
+                        memcpy(out, direct_out, dp);
+                    }
+                    free(direct_out);
+                }
+                free(audio_buf);
+            }
+        }
+    }
+
+    /* ---- Base64 (v1) — encoder no longer available ---- */
+    else if (fs == S_BASE64) {
+        fprintf(stderr, "    [forced Base64] v1 encoder is deprecated, use strategy %d (Base64v2) instead\n", S_BASE64_V2);
+    }
+
+    /* ---- Base64 v2 ---- */
+    else if (fs == S_BASE64_V2) {
+        int max_b64_runs = n / B64_MIN_RUN + 1;
+        if (max_b64_runs > 1000000) max_b64_runs = 1000000;
+        B64Run *b64_runs = (B64Run*)malloc(max_b64_runs * sizeof(B64Run));
+        int n_b64_runs = b64_find_runs(data, n, b64_runs, max_b64_runs);
+        int total_b64 = 0;
+        for (int i = 0; i < n_b64_runs; i++) total_b64 += b64_runs[i].len;
+        if (n_b64_runs > 0 && total_b64 > 0) {
+            int skeleton_size = n - total_b64;
+            uint8_t *skeleton = (uint8_t*)malloc(skeleton_size + 1);
+            uint8_t *decoded  = (uint8_t*)malloc(total_b64);
+            int sk_pos = 0, dec_pos = 0, src_pos = 0;
+            int valid = 1;
+            for (int r = 0; r < n_b64_runs; r++) {
+                int gap = b64_runs[r].start - src_pos;
+                if (gap > 0) { memcpy(skeleton + sk_pos, data + src_pos, gap); sk_pos += gap; }
+                int dl = b64_decode_chunk(data + b64_runs[r].start, b64_runs[r].len, decoded + dec_pos);
+                if (dl < 0) { valid = 0; break; }
+                uint8_t *vbuf = (uint8_t*)malloc(b64_runs[r].len + 4);
+                int el = b64_encode_chunk(decoded + dec_pos, dl, vbuf);
+                if (el != b64_runs[r].len || memcmp(vbuf, data + b64_runs[r].start, el) != 0) {
+                    free(vbuf); valid = 0; break;
+                }
+                free(vbuf);
+                b64_runs[r].dec_len = dl;
+                dec_pos += dl;
+                src_pos = b64_runs[r].start + b64_runs[r].len;
+            }
+            if (valid && src_pos < n) {
+                memcpy(skeleton + sk_pos, data + src_pos, n - src_pos);
+                sk_pos += n - src_pos;
+            }
+            if (valid && sk_pos == skeleton_size) {
+                int decoded_size = dec_pos;
+                uint8_t *pos_tbl = (uint8_t*)malloc(n_b64_runs * 15 + 16);
+                int pos_tbl_sz = b64_encode_pos(b64_runs, n_b64_runs, pos_tbl);
+                uint8_t *sk_comp = (uint8_t*)malloc(skeleton_size + skeleton_size/4 + 1024);
+                int sk_order;
+                int sk_comp_sz = compress_substream(skeleton, skeleton_size, sk_comp, &sk_order, bwt_ws);
+                uint8_t *dec_comp = (uint8_t*)malloc(decoded_size + decoded_size/4 + 1024);
+                int dec_order;
+                int dec_comp_sz = compress_substream(decoded, decoded_size, dec_comp, &dec_order, bwt_ws);
+                uint8_t *pos_comp = (uint8_t*)malloc(pos_tbl_sz + pos_tbl_sz/4 + 1024);
+                int pos_order;
+                int pos_comp_sz = compress_substream(pos_tbl, pos_tbl_sz, pos_comp, &pos_order, bwt_ws);
+                int b64v2_total = 31 + pos_comp_sz + sk_comp_sz + dec_comp_sz;
+                if (b64v2_total < best_size) {
+                    best_size = b64v2_total; *strat = fs;
+                    uint8_t *p = out;
+                    put_u32be(p, n_b64_runs);      p += 4;
+                    put_u32be(p, skeleton_size);    p += 4;
+                    put_u32be(p, decoded_size);     p += 4;
+                    put_u32be(p, pos_tbl_sz);       p += 4;
+                    put_u32be(p, sk_comp_sz);       p += 4;
+                    *p++ = (uint8_t)sk_order;
+                    put_u32be(p, dec_comp_sz);      p += 4;
+                    *p++ = (uint8_t)dec_order;
+                    put_u32be(p, pos_comp_sz);      p += 4;
+                    *p++ = (uint8_t)pos_order;
+                    memcpy(p, pos_comp, pos_comp_sz); p += pos_comp_sz;
+                    memcpy(p, sk_comp, sk_comp_sz);   p += sk_comp_sz;
+                    memcpy(p, dec_comp, dec_comp_sz);
+                }
+                free(pos_comp); free(pos_tbl); free(sk_comp); free(dec_comp);
+            }
+            free(skeleton); free(decoded);
+        } else {
+            fprintf(stderr, "    [forced Base64v2] no base64 runs found, falling back to STORE\n");
+        }
+        free(b64_runs);
+    }
+
+    fprintf(stderr, "    [forced %s] %d -> %d (%.2fx)%s\n",
+            strat_names[fs], n, best_size, (double)n / best_size,
+            *strat == S_STORE && fs != S_STORE ? " [fallback to STORE]" : "");
+
+    return best_size;
+}
+
 /* Returns compressed size, writes strategy to *strat */
 
 /* === Sample-based fast strategy selection (HyperPack v10.2) === */
@@ -4849,10 +5258,15 @@ static int is_bde_strategy(int s) {
            s == S_F32_BWT;
 }
 
-static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, BWTWorkspace *bwt_ws, CompressWorkspace *cws) {
+static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, BWTWorkspace *bwt_ws, CompressWorkspace *cws, int force_strategy) {
     int best_size = n;
     *strat = S_STORE;
     memcpy(out, data, n); /* default: store */
+
+    /* Force single strategy if requested */
+    if (force_strategy >= 0) {
+        return compress_block_forced(data, n, out, strat, bwt_ws, cws, force_strategy);
+    }
 
     /* Entropy check — skip compression for incompressible data */
     double ent = block_entropy(data, n);
@@ -4869,7 +5283,7 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
         CompressWorkspace *sample_cws = cws_create(sample_n);
         if (sample_out && sample_bwt && sample_cws) {
             int sample_strat;
-            compress_block(data, sample_n, sample_out, &sample_strat, sample_bwt, sample_cws);
+            compress_block(data, sample_n, sample_out, &sample_strat, sample_bwt, sample_cws, -1);
             hint_strat = sample_strat;
         }
         if (sample_out) free(sample_out);
@@ -5686,6 +6100,7 @@ typedef struct {
     uint64_t hash;
     BWTWorkspace *bwt_ws;
     CompressWorkspace *cws;
+    int force_strategy;
     volatile int done;
 } BlockJob;
 
@@ -5693,7 +6108,7 @@ static void *compress_block_worker(void *arg) {
     BlockJob *job = (BlockJob *)arg;
     job->output_size = compress_block(job->input, job->input_size, 
                                        job->output, &job->strategy, 
-                                       job->bwt_ws, job->cws);
+                                       job->bwt_ws, job->cws, job->force_strategy);
     job->crc = hp_crc32(job->input, job->input_size);
     job->done = 1;
     return NULL;
@@ -5845,13 +6260,13 @@ static int png_reconstruct(const uint8_t *meta, uint32_t meta_size,
  *     if is_dup: DUP_REF(4)
  *     else: STRATEGY(1) COMP_SIZE(4) ORIG_BLOCK_SIZE(4) CRC32(4) DATA(comp_size)
  */
-static int file_compress_impl(const char *inpath, const char *outpath, int block_size, int nthreads, int force_no_png);
+static int file_compress_impl(const char *inpath, const char *outpath, int block_size, int nthreads, int force_no_png, int force_strategy);
 
-static int file_compress(const char *inpath, const char *outpath, int block_size, int nthreads) {
-    return file_compress_impl(inpath, outpath, block_size, nthreads, 0);
+static int file_compress(const char *inpath, const char *outpath, int block_size, int nthreads, int force_strategy) {
+    return file_compress_impl(inpath, outpath, block_size, nthreads, 0, force_strategy);
 }
 
-static int file_compress_impl(const char *inpath, const char *outpath, int block_size, int nthreads, int force_no_png) {
+static int file_compress_impl(const char *inpath, const char *outpath, int block_size, int nthreads, int force_no_png, int force_strategy) {
     FILE *fin = fopen(inpath, "rb");
     if (!fin) { fprintf(stderr, "Cannot open %s\n", inpath); return 1; }
     fseek(fin, 0, SEEK_END);
@@ -5934,7 +6349,7 @@ static int file_compress_impl(const char *inpath, const char *outpath, int block
                 fprintf(stderr, "  Block %d/%d: DUP of %d\n", b+1, nblocks, dup_ref+1);
             } else {
                 int strat;
-                int csz = compress_block(inbuf, bsz, outbuf, &strat, bwt_ws, cws);
+                int csz = compress_block(inbuf, bsz, outbuf, &strat, bwt_ws, cws, force_strategy);
                 uint32_t crc = hp_crc32(inbuf, bsz);
 
                 fputc(0, fout);
@@ -6001,6 +6416,7 @@ static int file_compress_impl(const char *inpath, const char *outpath, int block
                 int j = launched % jt;
                 jobs[j].input = block_data[i];
                 jobs[j].input_size = block_sizes_arr[i];
+                jobs[j].force_strategy = force_strategy;
                 jobs[j].done = 0;
                 pthread_create(&threads[launched], NULL, compress_block_worker, &jobs[j]);
                 launched++;
@@ -6077,7 +6493,7 @@ static int file_compress_impl(const char *inpath, const char *outpath, int block
         fprintf(stderr, "[HP5] PNG pre-transform increased size (%lld -> %lld bytes), retrying as raw\n",
                 (long long)original_fsize, (long long)file_total);
         remove(outpath);
-        return file_compress_impl(inpath, outpath, block_size, nthreads, 1);
+        return file_compress_impl(inpath, outpath, block_size, nthreads, 1, -1);
     }
 
     return 0;
@@ -6428,7 +6844,7 @@ static void mkdirs(const char *path) {
 }
 
 static int archive_compress(int npaths, const char **paths, const char *outpath,
-                            int block_size, int nthreads) {
+                            int block_size, int nthreads, int force_strategy) {
     (void)nthreads;
     clock_t start = clock();
 
@@ -6582,7 +6998,7 @@ static int archive_compress(int npaths, const char **paths, const char *outpath,
                         global_block+1, entries[i].path, file_block+1, entries[i].nblocks, dup_ref+1);
             } else {
                 int strat;
-                int csz = compress_block(inbuf, bsz, outbuf, &strat, bwt_ws, cws);
+                int csz = compress_block(inbuf, bsz, outbuf, &strat, bwt_ws, cws, force_strategy);
                 uint32_t blk_crc = hp_crc32(inbuf, bsz);
 
                 fputc(0, fout);
@@ -6861,16 +7277,34 @@ static int archive_list(const char *inpath) {
 /* ===== Main ===== */
 #if !defined(HYPERPACK_WASM) && !defined(HYPERPACK_LIB)
 int main(int argc, char **argv) {
+    /* Handle --list-strategies before argc check */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--list-strategies") == 0) {
+            fprintf(stdout, "Available strategies (0..%d):\n", NUM_STRATEGIES - 1);
+            for (int s = 0; s < NUM_STRATEGIES; s++) {
+                fprintf(stdout, "%2d: %s\n", s, strat_names[s]);
+            }
+            return 0;
+        }
+    }
+
     if (argc < 3) {
         fprintf(stderr,
             "HyperPack Quantum v11 — Ultra-High Compression Engine\n"
             "Usage:\n"
-            "  %s c [-b SIZE_MB] [-j THREADS] input output.hpk     Compress single file (HPK5)\n"
-            "  %s a [-b SIZE_MB] input... output.hpk                Archive compress (HPK6)\n"
+            "  %s c [-b SIZE_MB] [-j THREADS] [-s STRATEGY] input output.hpk   Compress (HPK5)\n"
+            "  %s a [-b SIZE_MB] [-s STRATEGY] input... output.hpk             Archive (HPK6)\n"
             "  %s d input.hpk [output]                              Decompress (auto-detect)\n"
             "  %s l input.hpk                                       List archive contents\n"
-            "  %s x input.hpk output_dir [-e pattern]               Extract from archive\n",
-            argv[0], argv[0], argv[0], argv[0], argv[0]);
+            "  %s x input.hpk output_dir [-e pattern]               Extract from archive\n"
+            "  %s --list-strategies                                  List all strategies\n"
+            "\n"
+            "Options:\n"
+            "  -b SIZE_MB         Block size in MB (default: 128, max: 128)\n"
+            "  -j THREADS         Number of threads (default: 1, max: 16)\n"
+            "  -s N, --strategy N Force compression strategy N (0..%d, -1=auto)\n"
+            "  --list-strategies  Show available strategies and exit\n",
+            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], NUM_STRATEGIES - 1);
         return 1;
     }
 
@@ -6882,6 +7316,7 @@ int main(int argc, char **argv) {
         }
         int block_mb = DEFAULT_BS >> 20;
         int nthreads = 1;
+        int force_strategy = -1;
         int i = 2;
         while (i < argc - 2) {
             if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
@@ -6894,12 +7329,23 @@ int main(int argc, char **argv) {
                 if (nthreads < 1) nthreads = 1;
                 if (nthreads > 16) nthreads = 16;
                 i++;
+            } else if ((strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--strategy") == 0) && i + 1 < argc) {
+                force_strategy = atoi(argv[++i]);
+                if (force_strategy != -1 && (force_strategy < 0 || force_strategy >= NUM_STRATEGIES)) {
+                    fprintf(stderr, "Error: strategy must be -1 (auto) or 0..%d\n", NUM_STRATEGIES - 1);
+                    fprintf(stderr, "Use --list-strategies to see available strategies.\n");
+                    return 1;
+                }
+                i++;
             } else break;
         }
         if (nthreads > 1) {
             fprintf(stderr, "[HP5] Using %d parallel threads\n", nthreads);
         }
-        return file_compress(argv[i], argv[i+1], block_mb << 20, nthreads);
+        if (force_strategy >= 0) {
+            fprintf(stderr, "[HP5] Forcing strategy %d (%s)\n", force_strategy, strat_names[force_strategy]);
+        }
+        return file_compress(argv[i], argv[i+1], block_mb << 20, nthreads, force_strategy);
 
     } else if (argv[1][0] == 'a' && argv[1][1] == '\0') {
         /* Archive compress — HPK6 */
@@ -6908,12 +7354,21 @@ int main(int argc, char **argv) {
             return 1;
         }
         int block_mb = DEFAULT_BS >> 20;
+        int force_strategy = -1;
         int i = 2;
         while (i < argc - 1) {
             if (strcmp(argv[i], "-b") == 0 && i + 1 < argc - 1) {
                 block_mb = atoi(argv[++i]);
                 if (block_mb < 1) block_mb = 1;
                 if (block_mb > 128) block_mb = 128;
+                i++;
+            } else if ((strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--strategy") == 0) && i + 1 < argc - 1) {
+                force_strategy = atoi(argv[++i]);
+                if (force_strategy != -1 && (force_strategy < 0 || force_strategy >= NUM_STRATEGIES)) {
+                    fprintf(stderr, "Error: strategy must be -1 (auto) or 0..%d\n", NUM_STRATEGIES - 1);
+                    fprintf(stderr, "Use --list-strategies to see available strategies.\n");
+                    return 1;
+                }
                 i++;
             } else break;
         }
@@ -6922,9 +7377,12 @@ int main(int argc, char **argv) {
             fprintf(stderr, "No input files specified\n");
             return 1;
         }
+        if (force_strategy >= 0) {
+            fprintf(stderr, "[HPK6] Forcing strategy %d (%s)\n", force_strategy, strat_names[force_strategy]);
+        }
         const char **inputs = (const char**)&argv[i];
         const char *outpath = argv[argc - 1];
-        return archive_compress(ninputs, inputs, outpath, block_mb << 20, 1);
+        return archive_compress(ninputs, inputs, outpath, block_mb << 20, 1, force_strategy);
 
     } else if (argv[1][0] == 'd' && argv[1][1] == '\0') {
         /* Decompress — auto-detect HPK5 or HPK6 */
