@@ -82,9 +82,14 @@ function compressSingle(file, params, outName) {
   const compressed = Module.FS.readFile(outPath);
   const elapsed = (performance.now() - start) / 1000;
 
+  /* Copy into a correctly-sized ArrayBuffer — FS.readFile may return a view
+     of a larger internal MEMFS/heap buffer, so compressed.buffer can be
+     oversized and would corrupt the downloaded file. */
+  var outBuf = new Uint8Array(compressed).buffer;
+
   self.postMessage({
     type: 'done',
-    data: compressed.buffer,
+    data: outBuf,
     name: outName,
     originalSize: data.length,
     compressedSize: compressed.length,
@@ -94,7 +99,7 @@ function compressSingle(file, params, outName) {
     fileCount: 1,
     dedupCount: 0,
     dedupSaved: 0
-  });
+  }, [outBuf]);
 
   cleanupMemfs([inPath, outPath]);
 }
@@ -146,9 +151,12 @@ function compressArchive(files, params, outName) {
   const compressed = Module.FS.readFile(outPath);
   const elapsed = (performance.now() - start) / 1000;
 
+  /* Copy into a correctly-sized ArrayBuffer (see compressSingle comment) */
+  var outBuf = new Uint8Array(compressed).buffer;
+
   self.postMessage({
     type: 'done',
-    data: compressed.buffer,
+    data: outBuf,
     name: outName,
     originalSize: totalSize,
     compressedSize: compressed.length,
@@ -158,7 +166,7 @@ function compressArchive(files, params, outName) {
     fileCount: files.length,
     dedupCount: lastDedupCount,
     dedupSaved: lastDedupSaved
-  });
+  }, [outBuf]);
 
   removeRecursive(dirName);
   cleanupMemfs([outPath]);
@@ -206,22 +214,24 @@ function decompressFile(fileBuffer, fileName) {
     // For simplicity, if single file in archive, return it directly
     // Otherwise, build a tar-like concatenation or return info
     if (extractedFiles.length === 1) {
+      var outBuf6s = new Uint8Array(extractedFiles[0].data).buffer;
       self.postMessage({
         type: 'done',
-        data: extractedFiles[0].data.buffer,
+        data: outBuf6s,
         name: extractedFiles[0].name,
         originalSize: data.length,
         compressedSize: totalSize,
         ratio: 1,
         elapsed: elapsed,
         fileCount: extractedFiles.length
-      });
+      }, [outBuf6s]);
     } else {
       // Return first file and metadata about all files
       // The UI will handle multi-file display
+      var outBuf6m = new Uint8Array(extractedFiles[0].data).buffer;
       self.postMessage({
         type: 'done',
-        data: extractedFiles[0].data.buffer,
+        data: outBuf6m,
         name: fileName.replace('.hpk', ''),
         originalSize: data.length,
         compressedSize: totalSize,
@@ -229,7 +239,7 @@ function decompressFile(fileBuffer, fileName) {
         elapsed: elapsed,
         fileCount: extractedFiles.length,
         extractedFiles: extractedFiles.map(f => ({ name: f.name, size: f.size }))
-      });
+      }, [outBuf6m]);
     }
 
     removeRecursive(outDir);
@@ -245,17 +255,20 @@ function decompressFile(fileBuffer, fileName) {
     const output = Module.FS.readFile(outPath);
     const elapsed = (performance.now() - start) / 1000;
 
+    /* Copy into a correctly-sized ArrayBuffer */
+    var outBuf5 = new Uint8Array(output).buffer;
+
     const outName = fileName.replace(/\.hpk$/i, '');
     self.postMessage({
       type: 'done',
-      data: output.buffer,
+      data: outBuf5,
       name: outName,
       originalSize: data.length,
       compressedSize: output.length,
       ratio: 1,
       elapsed: elapsed,
       fileCount: 1
-    });
+    }, [outBuf5]);
 
     cleanupMemfs([outPath]);
   }
