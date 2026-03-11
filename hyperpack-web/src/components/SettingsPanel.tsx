@@ -73,7 +73,7 @@ export function SettingsPanel({ isOpen, onClose, settings, onSettingsChange }: S
           {/* HPK6 Archive mode info */}
           <div className="p-4 bg-hp-bg rounded-xl border border-hp-border space-y-2">
             <div className="flex items-center gap-2">
-              <span className="text-lg">📦</span>
+              <img src={import.meta.env.BASE_URL + 'logo-32.png'} alt="" className="w-5 h-5" />
               <span className="text-sm font-medium text-hp-text">Archive Mode (HPK6)</span>
             </div>
             <p className="text-xs text-hp-muted leading-relaxed">

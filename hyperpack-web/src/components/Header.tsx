@@ -1,10 +1,10 @@
-import { Settings, Trophy } from 'lucide-react';
+import { Settings } from 'lucide-react';
 
 export function Header({ onOpenSettings }: { onOpenSettings: () => void }) {
   return (
     <header className="flex items-center justify-between p-4 bg-hp-card border-b border-hp-border rounded-t-xl">
       <div className="flex items-center gap-2">
-        <Trophy className="w-6 h-6 text-hp-accent" />
+        <img src={import.meta.env.BASE_URL + 'logo-32.png'} alt="HyperPack" className="w-7 h-7" />
         <h1 className="text-xl font-bold text-hp-text tracking-tight">HyperPack <span className="text-sm font-normal text-hp-muted ml-1">v11</span></h1>
       </div>
       <button 
