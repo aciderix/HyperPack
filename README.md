@@ -1,177 +1,233 @@
-# 🏆 HyperPack v11
+<p align="center">
+  <img src="hyperpack-web/public/icon-512.png" alt="HyperPack Logo" width="128" height="128">
+</p>
 
-**Multi-strategy compression algorithm that beats xz, bzip2, and gzip on standard benchmark corpora.**
+<h1 align="center">HyperPack</h1>
 
-HyperPack analyzes each data block and automatically selects the best compression strategy among BWT, LZMA, LZ77, LZP, Delta, Audio filters, and Context Mixing. A smart heuristic detects the optimal strategy in ~1ms, avoiding expensive brute-force trials.
+<p align="center">
+  <strong>Multi-strategy lossless data compression — beats xz on standard benchmarks.</strong>
+</p>
 
-## 📊 Results
+<p align="center">
+  <a href="https://github.com/aciderix/HyperPack/actions/workflows/build.yml"><img src="https://github.com/aciderix/HyperPack/actions/workflows/build.yml/badge.svg" alt="Build"></a>
+  <a href="https://github.com/aciderix/HyperPack/releases/latest"><img src="https://img.shields.io/github/v/release/aciderix/HyperPack?include_prereleases&label=release" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="https://aciderix.github.io/HyperPack/"><img src="https://img.shields.io/badge/Try_it-Online-brightgreen" alt="Try Online"></a>
+</p>
 
-### Global Benchmark — 3 Corpora (Silesia + Canterbury + Calgary)
+<p align="center">
+  <a href="#-quick-start">Quick Start</a> ·
+  <a href="#-benchmarks">Benchmarks</a> ·
+  <a href="#-how-it-works">How it Works</a> ·
+  <a href="#-web-app--desktop">Web & Desktop</a> ·
+  <a href="docs/">Documentation</a>
+</p>
 
-| Compressor | Avg Ratio | Wins | Status |
-|---|---|---|---|
-| 🥇 **HyperPack v11** | **4.413x** | **12/38** | Champion |
-| 🥈 xz -9 | 4.119x (-7%) | 9/38 | |
-| 🥉 bzip2 -9 | 3.967x (-10%) | 15/38 | |
-| 4 | gzip -9 | 3.063x (-31%) | 1/38 | |
+---
 
-### Silesia Corpus (212 MB, 12 files)
+HyperPack is a lossless data compressor written in C that analyzes each data block and selects the best compression strategy from 31 specialized pipelines. Instead of applying one fixed algorithm, it picks the optimal chain of transforms (BWT, LZMA, PPM, LZP, Delta, Audio PCM…) per block — achieving **best-in-class compression ratios** on standard benchmarks.
 
-| Compressor | Compressed | Ratio | Speed |
-|---|---|---|---|
-| **HyperPack v11** | **~46.5 MB** | **~4.56x** | ~1.2 MB/s |
-| xz -9 | 48.52 MB | 4.368x | 3.8 MB/s |
-| bzip2 -9 | 54.07 MB | 3.921x | 12 MB/s |
-| gzip -9 | 68.53 MB | 3.093x | 18 MB/s |
+## ✨ Highlights
 
-### Per-file comparison vs xz -9 (Silesia)
+- 🏆 **Beats xz -9** on all 3 standard corpora (Calgary, Canterbury, Silesia) in aggregate
+- 🧠 **31 compression strategies** — automatic per-block selection
+- ⚡ **Parallel compression** — multi-threaded with `-j N`
+- 📁 **Archive mode** — compress directories with metadata preservation
+- 🌐 **Web app** — runs in the browser via WebAssembly
+- 🖥️ **Desktop app** — native Tauri builds for Windows, macOS, Linux
+- 📦 **Single C file** — ~7,000 lines, zero dependencies beyond zlib
 
-| File | Type | Size | HyperPack | xz -9 | Winner |
-|---|---|---|---|---|---|
-| dickens | English text | 9.7 MB | **4.04x** | 3.84x | 🟢 HP |
-| mozilla | Binary (ELF) | 48.8 MB | **3.60x** | 3.52x | 🟢 HP |
-| mr | Medical image | 9.5 MB | **4.23x** | 3.96x | 🟢 HP |
-| nci | Chemical DB | 32.0 MB | **24.53x** | 18.44x | 🟢 HP |
-| ooffice | Binary (DLL) | 5.9 MB | **2.42x** | 2.37x | 🟢 HP |
-| osdb | Benchmark DB | 9.6 MB | **3.94x** | 3.93x | 🟢 HP |
-| reymont | Polish text | 6.3 MB | **5.87x** | 5.42x | 🟢 HP |
-| samba | Binary (ELF) | 20.6 MB | **5.12x** | 4.73x | 🟢 HP |
-| sao | Star catalog | 6.9 MB | 1.56x | **1.59x** | 🔴 xz |
-| webster | English dict | 39.5 MB | **5.74x** | 5.47x | 🟢 HP |
-| xml | XML data | 5.1 MB | **12.12x** | 11.02x | 🟢 HP |
-| x-ray | Medical image | 8.1 MB | **2.13x** | 2.06x | 🟢 HP |
+## 🚀 Quick Start
 
-**Score: HyperPack 11 — xz 1** (loses only on sao, a raw star catalog)
+### Download
 
-## ✨ What's New in v11 (vs v10.2)
+Pre-built binaries are available on the [Releases page](https://github.com/aciderix/HyperPack/releases).
 
-### Phase 1 — Small Block Compression
-- **LZMA forced on blocks < 1 MB** instead of being skipped by the heuristic
-- **BCJ E8/E9 filter** for x86 executables (ELF/PE detection)
-- Canterbury +2.1%, Calgary +1.3%, zero Silesia regressions
+| Platform | File |
+|----------|------|
+| Linux x64 | `hyperpack-linux-x64` |
+| macOS ARM | `hyperpack-macos-arm64` |
+| macOS x64 | `hyperpack-macos-x64` |
+| Windows | `hyperpack-windows-x64.exe` |
 
-### Phase 2 — Parallel Compression
-- **`-j N` flag** for parallel block compression
-- Bit-identical output with 100% roundtrip verification
-- ~1.7x speedup with `-j 4`
-
-### Phase 3 — LZMA Speed Recovery
-- **Adaptive LZMA chain depth** (128 → 32 in speculative mode)
-- **Progressive early-exit** margin (4.7x cold → 1.14x warm)
-- Recovered 80% of Phase 1 speed penalty
-
-### Phase 4 — Text Detection + Hash Tables
-- **Pure text detection**: skip LZMA on large ASCII text (>100KB, >95% ASCII, entropy < 5.5)
-- **LZMA hash table enlarged** (1M → 4M entries, fewer collisions)
-- **CM order-3 hash table enlarged** (1M → 4M entries)
-
-### Cumulative Result (v10.2 → v11)
-- **+1.4% compression ratio** globally
-- **Only 1.16x slower** (was 2x in Phase 1)
-- **Zero regressions** on any file
-
-## 🔧 Building
-
-### Requirements
-
-- GCC (any recent version)
-- POSIX threads (pthread)
-- Math library (libm)
-
-### Compile
+### Build from Source
 
 ```bash
-gcc -O2 -o hyperpack src/hyperpack.c -lm -lpthread
+# Requirements: gcc (or clang), make, zlib
+git clone https://github.com/aciderix/HyperPack.git
+cd HyperPack
+make
 ```
 
-That's it — single file, zero external dependencies.
-
-## 🚀 Usage
+### Usage
 
 ```bash
-# Compress
-./hyperpack c input_file output.hp
+# Compress a file
+./hyperpack compress file.dat
 
 # Compress with parallel threads
-./hyperpack c -j 4 input_file output.hp
+./hyperpack compress -j 4 largefile.bin
 
-# Decompress  
-./hyperpack d output.hp restored_file
+# Decompress
+./hyperpack decompress file.dat.hpk
+
+# Compress a directory (archive mode)
+./hyperpack compress -r my_folder/
+
+# Decompress an archive
+./hyperpack decompress my_folder.hpk -o output_dir/
+
+# Show file info
+./hyperpack info file.dat.hpk
+
+# Benchmark mode — try all strategies and report
+./hyperpack benchmark file.dat
 ```
 
-## 🏗️ Architecture
+See [docs/TECHNICAL.md](docs/TECHNICAL.md) for the full CLI reference and advanced options.
 
-HyperPack uses a multi-strategy approach:
+## 📊 Benchmarks
+
+Tested against gzip -9, bzip2 -9, xz -9, and zstd -19 on the three standard compression corpora.
+
+**Compressed size as % of original — lower is better:**
+
+| Corpus | Files | Size | HyperPack | gzip -9 | bzip2 -9 | xz -9 | zstd -19 |
+|--------|------:|-----:|:---------:|:-------:|:--------:|:-----:|:--------:|
+| Calgary | 18 | 3.3 MB | **26.0%** | 32.6% | 26.7% | 27.2% | 28.3% |
+| Canterbury | 11 | 2.8 MB | **16.0%** | 26.0% | 19.3% | 17.5% | 18.4% |
+| Silesia | 12 | 212 MB | **21.9%** | 31.9% | 25.7% | 23.0% | 25.0% |
+| **Overall** | **41** | **218 MB** | **21.9%** | **31.8%** | **25.7%** | **23.0%** | **24.9%** |
+
+> HyperPack achieves the **best aggregate compression on all three corpora**, reducing data ~5% more than xz -9 on Silesia — the most demanding modern benchmark (202 MB of mixed real-world data).
+
+<details>
+<summary><strong>Individual file wins (41 files)</strong></summary>
+
+| Tool | Wins | Share |
+|------|-----:|------:|
+| bzip2 -9 | 16 | 39% |
+| **HyperPack** | **12** | **29%** |
+| xz -9 | 10 | 24% |
+| zstd -19 | 3 | 7% |
+
+bzip2 wins on many small text files where BWT shines at minimal overhead.
+HyperPack dominates on larger, heterogeneous files where multi-strategy selection pays off.
+
+</details>
+
+Full results with per-file breakdowns: [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
+
+## 🧠 How it Works
+
+HyperPack's core innovation is **per-block strategy selection**:
 
 ```
-Input Block
-    ├── BCJ E8/E9 filter (x86 executables)
-    ├── BWT + MTF-2 + ZRLE + Range Coder (Order 0/1)
-    ├── LZ77
-    ├── LZP + BWT
-    ├── LZMA (adaptive chain depth + early-exit)
-    ├── Delta + BWT (for structured data)
-    └── Audio filter (for PCM data)
-         │
-         ▼
-    Keep smallest result
+Input → Block Splitter (64–128 MB)
+            ↓
+    ┌── Content Analysis ──┐
+    │  Detect type per block│
+    │  (text, binary, audio,│
+    │   base64, float32…)   │
+    └───────┬───────────────┘
+            ↓
+    ┌── Strategy Trial ────┐
+    │  Sample-based testing │
+    │  of candidate chains  │
+    └───────┬───────────────┘
+            ↓
+    Best Strategy Applied
+    (1 of 31 pipelines)
+            ↓
+    Entropy Coder
+    (Arithmetic / rANS)
+            ↓
+    .hpk output
 ```
 
-### Smart Strategy Selection
+Each strategy is a **pipeline of transforms**. For example:
 
-Instead of trying all strategies on every block (expensive), HyperPack v11 uses a multi-level heuristic:
+| Strategy | Pipeline | Best For |
+|----------|----------|----------|
+| S_BWT_ARITH_O1 | BWT → MTF → ZRLE → Arithmetic O1 | General text |
+| S_LZMA | LZMA (64 MB dict) | Executables, structured data |
+| S_PPM_O6 | PPM order-6 | High-entropy text |
+| S_DELTA_BWT | Delta → BWT → MTF → ZRLE → Arith | Time-series, sensor data |
+| S_AUDIO_PCM | PCM detect → channel split → delta → entropy | Raw audio |
+| S_BASE64V2 | Base64 decode → compress → re-encode | Base64 payloads |
 
-1. **Text detection (~0.1ms):** On blocks >100 KB, detects pure ASCII text (>95% ASCII, entropy < 5.5) → skip LZMA entirely, BWT always wins
-2. **LZMA Heuristic (~1ms):** Analyzes entropy and ASCII percentage to decide whether to try LZMA
-3. **Adaptive LZMA:** When LZMA must compete with BWT, uses shallow hash chains (32 vs 128) and progressive early-exit
-4. **BCJ filter:** Detects ELF/PE executables and applies E8/E9 x86 filter before LZMA
-5. **Sample-based selection:** Tests all remaining strategies on a 1 MB sample, then runs only the winner on the full block
+The selector uses **sample-based heuristics** (compresses a small sample with each candidate) to pick the winner without full trial compression — making it fast even on large files.
 
-## 📋 Version History
+→ Deep dive: [docs/TECHNICAL.md](docs/TECHNICAL.md) — all 31 strategies, algorithm details, format specification.
 
-See [CHANGELOG.md](CHANGELOG.md) for the complete optimization history.
+## 🌐 Web App & Desktop
+
+### Try it Online
+
+**[▶ Launch HyperPack Web](https://aciderix.github.io/HyperPack/)**
+
+The web app runs entirely in your browser via WebAssembly. No upload, no server — your files stay local.
+
+### Desktop App (Tauri)
+
+Native builds with full performance. Download from [Releases](https://github.com/aciderix/HyperPack/releases):
+- **Windows** — `.msi` installer
+- **macOS** — `.dmg` (ARM & Intel)
+- **Linux** — `.deb` / `.AppImage`
+
+### Platform Comparison
+
+| Feature | CLI | Desktop (Tauri) | Web (WASM) |
+|---------|:---:|:---------------:|:----------:|
+| Multi-threading | ✅ `-j N` | ✅ native | ❌ single thread |
+| Max block size | 128 MB | 128 MB | 64 MB |
+| Archive mode | ✅ | ✅ | ❌ |
+| Drag & drop | — | ✅ | ✅ |
+| PNG optimization | ✅ | ❌ | ❌ |
+| Offline | ✅ | ✅ | ✅ (PWA) |
+
+Full comparison: [docs/WEB_VS_NATIVE.md](docs/WEB_VS_NATIVE.md)
+
+## 📁 Project Structure
+
+```
+HyperPack/
+├── src/
+│   ├── hyperpack.c          # Main CLI — all algorithms (~7,000 lines)
+│   ├── hyperpack_lib.c      # Library wrapper (compress/decompress API)
+│   └── hyperpack_wasm.c     # WASM bindings (Emscripten)
+├── hyperpack-web/           # React + TypeScript web app
+│   ├── src-tauri/           # Tauri desktop wrapper
+│   └── public/worker.js     # WASM Web Worker
+├── docs/                    # Technical documentation
+├── benchmark/               # Benchmark scripts & results
+├── .github/workflows/       # CI/CD (build + release)
+├── Makefile                 # Build system
+└── build-wasm.sh            # WASM build script
+```
+
+## 📖 Documentation
+
+| Document | Description |
+|----------|-------------|
+| [Technical Deep Dive](docs/TECHNICAL.md) | Algorithms, strategies, format spec, CLI reference |
+| [Benchmarks](docs/BENCHMARKS.md) | Full benchmark results on standard corpora |
+| [Architecture](docs/ARCHITECTURE.md) | Build system, platforms, CI/CD |
+| [Web vs Native](docs/WEB_VS_NATIVE.md) | Platform differences and limitations |
+| [Roadmap](docs/ROADMAP.md) | Completed phases and future plans |
+| [Optimization History](docs/OPTIMIZATION_HISTORY.md) | What worked, what didn't |
+| [Changelog](CHANGELOG.md) | Version history |
+
+## 🤝 Contributing
+
+Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting a pull request.
 
 ## 📄 License
 
-See source file for license information.
+This project is licensed under the [MIT License](LICENSE).
 
-## 📋 Base64 Compression
+---
 
-HyperPack handles Base64-encoded data surprisingly well. On text data, Base64 actually
-compresses **better** than the binary original thanks to the reduced alphabet (64 chars)
-that BWT exploits more efficiently.
-
-| File | Binary → HP | Base64 → HP | Overhead |
-|------|-------------|-------------|----------|
-| xml (5.1 MB) | 441 KB (12.12×) | 433 KB (16.67×) | **−2%** 🟢 |
-| dickens (9.7 MB) | 2,524 KB (4.04×) | 2,505 KB (5.50×) | **−1%** 🟢 |
-
-See [docs/BASE64_TESTS.md](docs/BASE64_TESTS.md) for full analysis.
-
-## 🗺️ Roadmap
-
-| Priority | Improvement | Expected Gain | Status |
-|----------|------------|---------------|--------|
-| ⭐⭐⭐ | Neural context mixer + word model | +5-8% on text | Planned |
-| ⭐⭐ | ANS entropy coder (replace Range Coder) | 2× decompression speed | Planned |
-
-See [docs/ROADMAP.md](docs/ROADMAP.md) for detailed analysis.
-
-## 🖥️ Multi-Platform App (Planned)
-
-HyperPack will be available as:
-
-| Platform | Technology | Status |
-|----------|------------|--------|
-| 🌐 **Web App** | WASM (Emscripten) — runs in browser, zero install | Planned |
-| 🖥️ **Desktop** | Tauri (Rust + C FFI) — Win/Mac/Linux, ~5 MB | Planned |
-
-See [docs/MULTIPLATFORM_APP.md](docs/MULTIPLATFORM_APP.md) for full architecture and roadmap.
-
-## 🧪 Experimental Tests
-
-13 optimization techniques were tested empirically. Only 3 provided improvements
-(LZMA 64MB, MTF-2, Smart Heuristic — all already in v10.2).
-The other 10 were harmful, redundant, or neutral.
-
-See [docs/EXPERIMENTAL_TESTS.md](docs/EXPERIMENTAL_TESTS.md) for all 13 test results.
+<p align="center">
+  <sub>Made with obsessive attention to compression ratios.</sub>
+</p>

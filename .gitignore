@@ -1,10 +1,22 @@
-# Compiled binary
+# Build artifacts
 hyperpack
+hyperpack.exe
 *.o
-*.a
+*.obj
 
-# Compressed files
-*.hp
+# WASM build output
+hyperpack-web/public/hyperpack.js
+hyperpack-web/public/hyperpack.wasm
+
+# Web app
+hyperpack-web/node_modules/
+hyperpack-web/dist/
+
+# Tauri
+hyperpack-web/src-tauri/target/
+
+# Benchmark results (generated)
+benchmark/results/
 
 # OS files
 .DS_Store
@@ -13,5 +25,8 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
-gmon.out
-hyperpack_prof
+*.swp
+*.swo
+
+# Archives (don't commit zips)
+*.zip
