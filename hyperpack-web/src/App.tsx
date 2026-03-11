@@ -82,12 +82,16 @@ export default function App() {
     setDecompressFile(null);
     reset();
     // Auto-detect: if single .hpk file, switch to decompress mode
-    if (selectedFiles.length === 1 && selectedFiles[0].name.endsWith('.hpk')) {
+    // Also handle .hpk.txt (browsers may add .txt on download)
+    const name = selectedFiles.length === 1 ? selectedFiles[0].name : '';
+    if (selectedFiles.length === 1 && (name.endsWith('.hpk') || name.endsWith('.hpk.txt'))) {
       setMode('decompress');
       // Create a File object for the decompress path
+      // Normalize .hpk.txt → .hpk (browsers may add .txt on download)
       const entry = selectedFiles[0];
+      const cleanName = entry.name.replace(/\.hpk\.txt$/i, '.hpk');
       const blob = new Blob([entry.data]);
-      const file = new File([blob], entry.name);
+      const file = new File([blob], cleanName);
       setDecompressFile(file);
     }
     setIsDraggingPage(false);

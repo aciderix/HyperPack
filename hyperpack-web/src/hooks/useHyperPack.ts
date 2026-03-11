@@ -283,7 +283,8 @@ export function useHyperPack() {
 
   const download = useCallback(() => {
     if (result && result.outputBuffer) {
-      const blob = new Blob([result.outputBuffer]);
+      // Explicit MIME type prevents browsers from appending .txt to .hpk files
+      const blob = new Blob([result.outputBuffer], { type: 'application/octet-stream' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -291,7 +292,8 @@ export function useHyperPack() {
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
-      URL.revokeObjectURL(url);
+      // Delay revocation so the browser can finish the download
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
     }
   }, [result]);
 
