@@ -18,11 +18,19 @@
 #include <sys/stat.h>
 #ifdef _WIN32
 #include <direct.h>
+#include <windows.h>
 #define mkdir(path, mode) _mkdir(path)
-/* fmemopen polyfill for Windows: create a self-deleting tmpfile, write buf, rewind */
+/* fmemopen polyfill for Windows: uses a temp file.
+ * NOTE (BUG-13): This creates a real temp file per call. For high-frequency
+ * use, consider a proper in-memory implementation (e.g., open_memstream). */
 static FILE *hp_fmemopen(void *buf, size_t size, const char *mode) {
     (void)mode;
-    FILE *f = tmpfile();
+    char tmppath[MAX_PATH];
+    if (GetTempPathA(MAX_PATH, tmppath) == 0) return NULL;
+    char tmpfile_path[MAX_PATH];
+    if (GetTempFileNameA(tmppath, "hp_", 0, tmpfile_path) == 0) return NULL;
+    FILE *f = fopen(tmpfile_path, "w+bTD"); /* T=short-lived, D=delete-on-close */
+    if (!f) f = tmpfile(); /* fallback */
     if (!f) return NULL;
     if (size > 0) fwrite(buf, 1, size, f);
     rewind(f);
@@ -33,6 +41,7 @@ static FILE *hp_fmemopen(void *buf, size_t size, const char *mode) {
 #include <sys/types.h>
 #include <dirent.h>
 #include <errno.h>
+#include <signal.h>
 #include <pthread.h>
 #include <zlib.h>
 #ifdef HYPERPACK_WASM
@@ -44,8 +53,48 @@ static inline int pthread_join_stub(pthread_t t, void **r) { (void)t;(void)r; re
 #define pthread_join   pthread_join_stub
 #endif
 
+
+/* ===== Safe allocation wrappers (BUG-2 fix) ===== */
+static void *hp_malloc(size_t size) {
+    void *p = malloc(size);
+    if (!p && size > 0) { fprintf(stderr, "HyperPack: out of memory (%zu bytes)\n", size); exit(1); }
+    return p;
+}
+static void *hp_calloc(size_t count, size_t size) {
+    void *p = calloc(count, size);
+    if (!p && count > 0 && size > 0) { fprintf(stderr, "HyperPack: out of memory (%zu x %zu bytes)\n", count, size); exit(1); }
+    return p;
+}
+static void *hp_realloc(void *ptr, size_t size) {
+    void *p = realloc(ptr, size);
+    if (!p && size > 0) { fprintf(stderr, "HyperPack: out of memory (realloc %zu bytes)\n", size); exit(1); }
+    return p;
+}
+
+
+/* ===== Signal handler for clean abort (BUG-7 fix) ===== */
+static volatile int hp_interrupted = 0;
+static char hp_output_path[4096] = {0};
+
+static void hp_sigint_handler(int sig) {
+    (void)sig;
+    hp_interrupted = 1;
+    if (hp_output_path[0]) {
+        unlink(hp_output_path);
+        hp_output_path[0] = 0;
+    }
+    fprintf(stderr, "\nInterrupted — partial output removed.\n");
+    _exit(130);
+}
+
+static void hp_install_signal_handlers(void) {
+    signal(SIGINT, hp_sigint_handler);
+    signal(SIGTERM, hp_sigint_handler);
+}
+
 /* ===== Configuration ===== */
 #define DEFAULT_BS    (128 << 20)   /* 128 MB — BWT needs large blocks */
+/* Note (BUG-11): Incompressible data has ~36 bytes overhead per file (header + block metadata). */
 #define ZRLE_ALPHA    258         /* RUNA=0, RUNB=1, byte+2 */
 #define RC_TOP        (1u << 24)
 #define RC_BOT        (1u << 16)
@@ -178,7 +227,7 @@ static void sais_core(int32_t *T, int32_t *SA, int n, int K) {
 
     /* Allocate type array as bit-packed */
     int type_bytes = (n + 7) / 8;
-    uint8_t *t = (uint8_t *)calloc(type_bytes, 1);
+    uint8_t *t = (uint8_t *)hp_calloc(type_bytes, 1);
 
     #define SAIS_S(i) ((t[(i)>>3] >> ((i)&7)) & 1)
     #define SAIS_SET_S(i) (t[(i)>>3] |= (1 << ((i)&7)))
@@ -194,7 +243,7 @@ static void sais_core(int32_t *T, int32_t *SA, int n, int K) {
             SAIS_CLR_S(i);
     }
 
-    int32_t *bkt = (int32_t *)malloc(K * sizeof(int32_t));
+    int32_t *bkt = (int32_t *)hp_malloc(K * sizeof(int32_t));
 
     /* Step 2: Place LMS suffixes into bucket tails */
     sais_get_buckets(T, n, K, bkt, 1);
@@ -336,10 +385,10 @@ typedef struct {
 } BWTWorkspace;
 
 static BWTWorkspace *bwt_ws_create(int max_n) {
-    BWTWorkspace *ws = (BWTWorkspace*)malloc(sizeof(BWTWorkspace));
+    BWTWorkspace *ws = (BWTWorkspace*)hp_malloc(sizeof(BWTWorkspace));
     int n1 = max_n + 1;
-    ws->T = (int32_t*)malloc((size_t)n1 * sizeof(int32_t));
-    ws->SA = (int32_t*)malloc((size_t)n1 * sizeof(int32_t));
+    ws->T = (int32_t*)hp_malloc((size_t)n1 * sizeof(int32_t));
+    ws->SA = (int32_t*)hp_malloc((size_t)n1 * sizeof(int32_t));
     ws->capacity = n1;
     return ws;
 }
@@ -347,8 +396,8 @@ static BWTWorkspace *bwt_ws_create(int max_n) {
 static void bwt_ws_ensure(BWTWorkspace *ws, int n1) {
     if (n1 > ws->capacity) {
         free(ws->T); free(ws->SA);
-        ws->T = (int32_t*)malloc((size_t)n1 * sizeof(int32_t));
-        ws->SA = (int32_t*)malloc((size_t)n1 * sizeof(int32_t));
+        ws->T = (int32_t*)hp_malloc((size_t)n1 * sizeof(int32_t));
+        ws->SA = (int32_t*)hp_malloc((size_t)n1 * sizeof(int32_t));
         ws->capacity = n1;
     }
 }
@@ -388,14 +437,14 @@ typedef struct {
 } CompressWorkspace;
 
 static CompressWorkspace *cws_create(int max_n) {
-    CompressWorkspace *ws = (CompressWorkspace*)malloc(sizeof(CompressWorkspace));
+    CompressWorkspace *ws = (CompressWorkspace*)hp_malloc(sizeof(CompressWorkspace));
     int alloc = max_n + 262144;
-    ws->bwt_buf   = (uint8_t*)malloc(alloc);
-    ws->mtf_buf   = (uint8_t*)malloc(alloc);
-    ws->zrle_buf  = (uint16_t*)malloc((size_t)alloc * 2 * sizeof(uint16_t));
-    ws->arith_buf = (uint8_t*)malloc(alloc + alloc/4 + 1024);
-    ws->delta_buf = (uint8_t*)malloc(alloc);
-    ws->lzp_buf   = (uint8_t*)malloc(alloc + alloc/4 + 1024);
+    ws->bwt_buf   = (uint8_t*)hp_malloc(alloc);
+    ws->mtf_buf   = (uint8_t*)hp_malloc(alloc);
+    ws->zrle_buf  = (uint16_t*)hp_malloc((size_t)alloc * 2 * sizeof(uint16_t));
+    ws->arith_buf = (uint8_t*)hp_malloc(alloc + alloc/4 + 1024);
+    ws->delta_buf = (uint8_t*)hp_malloc(alloc);
+    ws->lzp_buf   = (uint8_t*)hp_malloc(alloc + alloc/4 + 1024);
     ws->capacity = alloc;
     return ws;
 }
@@ -415,7 +464,7 @@ static void bwt_decode(const uint8_t *bwt, int n, int pidx, uint8_t *out) {
     int32_t C[256]; int32_t s = 1;
     for (int c = 0; c < 256; c++) { C[c] = s; s += freq[c]; }
 
-    int32_t *LF = (int32_t*)malloc((n + 1) * sizeof(int32_t));
+    int32_t *LF = (int32_t*)hp_malloc((n + 1) * sizeof(int32_t));
     int32_t rk[256] = {0};
     for (int fi = 0; fi <= n; fi++) {
         if (fi == pidx) { LF[fi] = 0; continue; }
@@ -658,7 +707,7 @@ static void arith_dec_o0(const uint8_t *in, int nsyms, uint16_t *out) {
 /* ===== Arithmetic Coding Order-1 ===== */
 static int arith_enc_o1(const uint16_t *syms, int nsyms, uint8_t *out) {
     RCEnc rc; rc_enc_init(&rc, out);
-    Model *models = (Model*)malloc(ZRLE_ALPHA * sizeof(Model));
+    Model *models = (Model*)hp_malloc(ZRLE_ALPHA * sizeof(Model));
     for (int i = 0; i < ZRLE_ALPHA; i++) model_init(&models[i]);
     int prev = 0;
     for (int i = 0; i < nsyms; i++) {
@@ -674,7 +723,7 @@ static int arith_enc_o1(const uint16_t *syms, int nsyms, uint8_t *out) {
 
 static void arith_dec_o1(const uint8_t *in, int nsyms, uint16_t *out) {
     RCDec rc; rc_dec_init(&rc, in);
-    Model *models = (Model*)malloc(ZRLE_ALPHA * sizeof(Model));
+    Model *models = (Model*)hp_malloc(ZRLE_ALPHA * sizeof(Model));
     for (int i = 0; i < ZRLE_ALPHA; i++) model_init(&models[i]);
     int prev = 0;
     for (int i = 0; i < nsyms; i++) {
@@ -699,7 +748,7 @@ static inline int o2_hash(int prev2, int prev1) {
 
 static int arith_enc_o2(const uint16_t *syms, int nsyms, uint8_t *out) {
     RCEnc rc; rc_enc_init(&rc, out);
-    Model *models = (Model*)malloc(O2_NCTX * sizeof(Model));
+    Model *models = (Model*)hp_malloc(O2_NCTX * sizeof(Model));
     for (int i = 0; i < O2_NCTX; i++) model_init(&models[i]);
     int prev2 = 0, prev1 = 0;
     for (int i = 0; i < nsyms; i++) {
@@ -715,7 +764,7 @@ static int arith_enc_o2(const uint16_t *syms, int nsyms, uint8_t *out) {
 
 static void arith_dec_o2(const uint8_t *in, int nsyms, uint16_t *out) {
     RCDec rc; rc_dec_init(&rc, in);
-    Model *models = (Model*)malloc(O2_NCTX * sizeof(Model));
+    Model *models = (Model*)hp_malloc(O2_NCTX * sizeof(Model));
     for (int i = 0; i < O2_NCTX; i++) model_init(&models[i]);
     int prev2 = 0, prev1 = 0;
     for (int i = 0; i < nsyms; i++) {
@@ -851,7 +900,7 @@ static int arith_enc_o1_ps(const uint16_t *syms, int nsyms, uint8_t *out) {
     }
 
     /* Phase 2: init all 258 O1 models from the global table */
-    Model *models = (Model*)malloc(ZRLE_ALPHA * sizeof(Model));
+    Model *models = (Model*)hp_malloc(ZRLE_ALPHA * sizeof(Model));
     for (int ctx = 0; ctx < ZRLE_ALPHA; ctx++) {
         Model *m = &models[ctx];
         memset(m, 0, sizeof(Model));
@@ -884,7 +933,7 @@ static int arith_enc_o1_ps(const uint16_t *syms, int nsyms, uint8_t *out) {
 
 static void arith_dec_o1_ps(const uint8_t *in, int nsyms, uint16_t *out) {
     /* Read global freq header and warm-start all 258 O1 models */
-    Model *models = (Model*)malloc(ZRLE_ALPHA * sizeof(Model));
+    Model *models = (Model*)hp_malloc(ZRLE_ALPHA * sizeof(Model));
     for (int ctx = 0; ctx < ZRLE_ALPHA; ctx++) {
         Model *m = &models[ctx];
         memset(m, 0, sizeof(Model));
@@ -975,7 +1024,7 @@ static int rans_enc_o0(const uint16_t *syms, int nsyms, uint8_t *out) {
 
     /* Phase 5: encode in reverse into a temporary buffer */
     int cap = nsyms * 2 + 16;
-    uint8_t *tmp = (uint8_t*)malloc(cap);
+    uint8_t *tmp = (uint8_t*)hp_malloc(cap);
     int tlen = 0;
 
     uint32_t x = RANS_M; /* initial state */
@@ -984,7 +1033,7 @@ static int rans_enc_o0(const uint16_t *syms, int nsyms, uint8_t *out) {
         int fs = freq[s];
         /* renormalize: flush bytes while x >= fs * 256 */
         while (x >= (uint32_t)fs * 256) {
-            if (tlen >= cap) { cap *= 2; tmp = (uint8_t*)realloc(tmp, cap); }
+            if (tlen >= cap) { cap *= 2; tmp = (uint8_t*)hp_realloc(tmp, cap); }
             tmp[tlen++] = (uint8_t)(x & 0xFF);
             x >>= 8;
         }
@@ -1029,7 +1078,7 @@ static void rans_dec_o0(const uint8_t *in, int nsyms, uint16_t *out) {
     for (int i = 0; i < ZRLE_ALPHA; i++) cum[i+1] = cum[i] + freq[i];
 
     /* Build O(1) decode table: dtab[slot] = {sym, freq, bias} */
-    RansSlot *dtab = (RansSlot*)malloc(RANS_M * sizeof(RansSlot));
+    RansSlot *dtab = (RansSlot*)hp_malloc(RANS_M * sizeof(RansSlot));
     for (int s = 0; s < ZRLE_ALPHA; s++) {
         for (int j = cum[s]; j < cum[s+1]; j++) {
             dtab[j].sym  = (uint16_t)s;
@@ -1159,17 +1208,17 @@ static inline uint32_t lz_hash4(const uint8_t *p) {
 static int lz77_encode(const uint8_t *src, int n, uint8_t *out, int out_cap) {
     if (n < 64 || n > 64*1024*1024) return 0;  /* skip very small or very large blocks */
 
-    int *head = (int*)malloc(LZ_HASH_SIZE * sizeof(int));
-    int *prev = (int*)malloc(LZ_MAX_DIST * sizeof(int));  /* circular buffer */
+    int *head = (int*)hp_malloc(LZ_HASH_SIZE * sizeof(int));
+    int *prev = (int*)hp_malloc(LZ_MAX_DIST * sizeof(int));  /* circular buffer */
     if (!head || !prev) { free(head); free(prev); return 0; }
     memset(head, -1, LZ_HASH_SIZE * sizeof(int));
     memset(prev, -1, LZ_MAX_DIST * sizeof(int));
 
     int max_matches = n / LZ_MIN_MATCH + 1024;
-    uint8_t *flags_buf = (uint8_t*)calloc((n + 7) / 8, 1);
-    uint8_t *lits  = (uint8_t*)malloc(n);
-    uint8_t *dists = (uint8_t*)malloc(max_matches * 2);
-    uint8_t *lens  = (uint8_t*)malloc(max_matches);
+    uint8_t *flags_buf = (uint8_t*)hp_calloc((n + 7) / 8, 1);
+    uint8_t *lits  = (uint8_t*)hp_malloc(n);
+    uint8_t *dists = (uint8_t*)hp_malloc(max_matches * 2);
+    uint8_t *lens  = (uint8_t*)hp_malloc(max_matches);
     if (!flags_buf || !lits || !dists || !lens) {
         free(head); free(prev); free(flags_buf); free(lits); free(dists); free(lens);
         return 0;
@@ -1469,7 +1518,7 @@ static int audio_detect(const uint8_t *data, int n) {
     }
     int nf = tn / 4;
     if (nf < 256) return 0;
-    uint8_t *tb = (uint8_t*)malloc(nf * 4);
+    uint8_t *tb = (uint8_t*)hp_malloc(nf * 4);
     int16_t pl = 0, pr = 0;
     for (int i = 0; i < nf; i++) {
         int16_t l = (int16_t)((uint16_t)data[i*4] | ((uint16_t)data[i*4+1] << 8));
@@ -1535,16 +1584,16 @@ static int audio_encode(const uint8_t *in, int n, uint8_t *out) {
     int nf = n / 4, tail = n - nf * 4;
     
     /* Read samples */
-    int16_t *L = (int16_t*)malloc(nf * sizeof(int16_t));
-    int16_t *R = (int16_t*)malloc(nf * sizeof(int16_t));
+    int16_t *L = (int16_t*)hp_malloc(nf * sizeof(int16_t));
+    int16_t *R = (int16_t*)hp_malloc(nf * sizeof(int16_t));
     for (int i = 0; i < nf; i++) {
         L[i] = (int16_t)((uint16_t)in[i*4] | ((uint16_t)in[i*4+1] << 8));
         R[i] = (int16_t)((uint16_t)in[i*4+2] | ((uint16_t)in[i*4+3] << 8));
     }
     
     /* Mid/Side decorrelation */
-    int16_t *M = (int16_t*)malloc(nf * sizeof(int16_t));
-    int16_t *S = (int16_t*)malloc(nf * sizeof(int16_t));
+    int16_t *M = (int16_t*)hp_malloc(nf * sizeof(int16_t));
+    int16_t *S = (int16_t*)hp_malloc(nf * sizeof(int16_t));
     for (int i = 0; i < nf; i++) {
         S[i] = L[i] - R[i];
         M[i] = L[i] - (S[i] >> 1);
@@ -1553,8 +1602,8 @@ static int audio_encode(const uint8_t *in, int n, uint8_t *out) {
     
     /* LPC prediction per block */
     int nblocks = (nf + LPC_BLOCK_SIZE - 1) / LPC_BLOCK_SIZE;
-    int16_t *resM = (int16_t*)malloc(nf * sizeof(int16_t));
-    int16_t *resS = (int16_t*)malloc(nf * sizeof(int16_t));
+    int16_t *resM = (int16_t*)hp_malloc(nf * sizeof(int16_t));
+    int16_t *resS = (int16_t*)hp_malloc(nf * sizeof(int16_t));
     
     /* Header format: [version:1=4][nframes:4][nblocks:4] */
     /* Per block: [orderM:1][orderS:1][coeffsM:orderM*2][coeffsS:orderS*2] */
@@ -1646,10 +1695,10 @@ static void audio_decode(const uint8_t *in, int orig_size, uint8_t *out) {
         p += 4;
         
         /* Read block headers */
-        int *orderM_arr = (int*)malloc(nblocks * sizeof(int));
-        int *orderS_arr = (int*)malloc(nblocks * sizeof(int));
-        int16_t (*coeffM)[LPC_MAX_ORDER] = (int16_t(*)[LPC_MAX_ORDER])malloc(nblocks * LPC_MAX_ORDER * sizeof(int16_t));
-        int16_t (*coeffS)[LPC_MAX_ORDER] = (int16_t(*)[LPC_MAX_ORDER])malloc(nblocks * LPC_MAX_ORDER * sizeof(int16_t));
+        int *orderM_arr = (int*)hp_malloc(nblocks * sizeof(int));
+        int *orderS_arr = (int*)hp_malloc(nblocks * sizeof(int));
+        int16_t (*coeffM)[LPC_MAX_ORDER] = (int16_t(*)[LPC_MAX_ORDER])hp_malloc(nblocks * LPC_MAX_ORDER * sizeof(int16_t));
+        int16_t (*coeffS)[LPC_MAX_ORDER] = (int16_t(*)[LPC_MAX_ORDER])hp_malloc(nblocks * LPC_MAX_ORDER * sizeof(int16_t));
         
         for (int b = 0; b < nblocks; b++) {
             orderM_arr[b] = in[p++];
@@ -1665,16 +1714,16 @@ static void audio_decode(const uint8_t *in, int orig_size, uint8_t *out) {
         }
         
         /* Read byte-split residuals */
-        int16_t *resM = (int16_t*)malloc(nf * sizeof(int16_t));
-        int16_t *resS = (int16_t*)malloc(nf * sizeof(int16_t));
+        int16_t *resM = (int16_t*)hp_malloc(nf * sizeof(int16_t));
+        int16_t *resS = (int16_t*)hp_malloc(nf * sizeof(int16_t));
         for (int i = 0; i < nf; i++) resM[i] = in[p + i];
         for (int i = 0; i < nf; i++) resM[i] |= (int16_t)((uint16_t)in[p + nf + i] << 8);
         for (int i = 0; i < nf; i++) resS[i] = in[p + 2*nf + i];
         for (int i = 0; i < nf; i++) resS[i] |= (int16_t)((uint16_t)in[p + 3*nf + i] << 8);
         
         /* Reconstruct M and S from residuals */
-        int16_t *M = (int16_t*)malloc(nf * sizeof(int16_t));
-        int16_t *S = (int16_t*)malloc(nf * sizeof(int16_t));
+        int16_t *M = (int16_t*)hp_malloc(nf * sizeof(int16_t));
+        int16_t *S = (int16_t*)hp_malloc(nf * sizeof(int16_t));
         
         for (int b = 0; b < nblocks; b++) {
             int start = b * LPC_BLOCK_SIZE;
@@ -1712,15 +1761,15 @@ static void audio_decode(const uint8_t *in, int orig_size, uint8_t *out) {
         const uint8_t *dm_lo = in+p, *dm_hi = dm_lo+nf;
         const uint8_t *ds_lo = dm_hi+nf, *ds_hi = ds_lo+nf;
         
-        int16_t *dM = (int16_t*)malloc(nf * sizeof(int16_t));
-        int16_t *dS = (int16_t*)malloc(nf * sizeof(int16_t));
+        int16_t *dM = (int16_t*)hp_malloc(nf * sizeof(int16_t));
+        int16_t *dS = (int16_t*)hp_malloc(nf * sizeof(int16_t));
         for (int i = 0; i < nf; i++) {
             dM[i] = (int16_t)((uint16_t)dm_lo[i] | ((uint16_t)dm_hi[i] << 8));
             dS[i] = (int16_t)((uint16_t)ds_lo[i] | ((uint16_t)ds_hi[i] << 8));
         }
         
-        int16_t *Md = (int16_t*)malloc(nf * sizeof(int16_t));
-        int16_t *Sd = (int16_t*)malloc(nf * sizeof(int16_t));
+        int16_t *Md = (int16_t*)hp_malloc(nf * sizeof(int16_t));
+        int16_t *Sd = (int16_t*)hp_malloc(nf * sizeof(int16_t));
         Md[0] = dM[0]; Sd[0] = dS[0];
         for (int i = 1; i < nf; i++) { Md[i] = Md[i-1] + dM[i]; Sd[i] = Sd[i-1] + dS[i]; }
         free(dM); free(dS);
@@ -1787,7 +1836,7 @@ static inline uint32_t lzp_hash(const uint8_t *p) {
 static int lzp_encode(const uint8_t *in, int n, uint8_t *out) {
     if (n < LZP_CONTEXT + LZP_MIN_MATCH) return 0;
 
-    int32_t *htab = (int32_t*)malloc(LZP_HTAB_SIZE * sizeof(int32_t));
+    int32_t *htab = (int32_t*)hp_malloc(LZP_HTAB_SIZE * sizeof(int32_t));
     memset(htab, 0xFF, LZP_HTAB_SIZE * sizeof(int32_t)); /* all -1 */
 
     /* First LZP_CONTEXT bytes are always literal */
@@ -1847,7 +1896,7 @@ static int lzp_encode(const uint8_t *in, int n, uint8_t *out) {
 }
 
 static int lzp_decode(const uint8_t *in, int in_size, uint8_t *out, int orig_size) {
-    int32_t *htab = (int32_t*)malloc(LZP_HTAB_SIZE * sizeof(int32_t));
+    int32_t *htab = (int32_t*)hp_malloc(LZP_HTAB_SIZE * sizeof(int32_t));
     memset(htab, 0xFF, LZP_HTAB_SIZE * sizeof(int32_t));
 
     /* First LZP_CONTEXT bytes are literal */
@@ -1980,13 +2029,13 @@ static int cm_encode(const uint8_t *data, int n, uint8_t *out, int max_out) {
     cm_init_lut();
 
     /* Allocate counter tables (zeroed = uniform prior) */
-    uint8_t *ct0 = (uint8_t*)calloc(256, 2);
-    uint8_t *ct1 = (uint8_t*)calloc(65536, 2);
-    uint8_t *ct2 = (uint8_t*)calloc(CM_O2_SIZE, 2);
-    uint8_t *ct3 = (uint8_t*)calloc(CM_O3_SIZE, 2);
-    uint8_t *ct4 = (uint8_t*)calloc(CM_O4_SIZE, 2);
-    uint8_t *ct6 = (uint8_t*)calloc(CM_O6_SIZE, 2);
-    int32_t *mht = (int32_t*)malloc(CM_MHT_SIZE * sizeof(int32_t));
+    uint8_t *ct0 = (uint8_t*)hp_calloc(256, 2);
+    uint8_t *ct1 = (uint8_t*)hp_calloc(65536, 2);
+    uint8_t *ct2 = (uint8_t*)hp_calloc(CM_O2_SIZE, 2);
+    uint8_t *ct3 = (uint8_t*)hp_calloc(CM_O3_SIZE, 2);
+    uint8_t *ct4 = (uint8_t*)hp_calloc(CM_O4_SIZE, 2);
+    uint8_t *ct6 = (uint8_t*)hp_calloc(CM_O6_SIZE, 2);
+    int32_t *mht = (int32_t*)hp_malloc(CM_MHT_SIZE * sizeof(int32_t));
     memset(mht, 0xFF, CM_MHT_SIZE * sizeof(int32_t)); /* -1 = no entry */
 
     RCEnc rc; rc_enc_init(&rc, out);
@@ -2095,13 +2144,13 @@ static void cm_decode(const uint8_t *in, uint8_t *out, int n) {
     if (n == 0) return;
     cm_init_lut();
 
-    uint8_t *ct0 = (uint8_t*)calloc(256, 2);
-    uint8_t *ct1 = (uint8_t*)calloc(65536, 2);
-    uint8_t *ct2 = (uint8_t*)calloc(CM_O2_SIZE, 2);
-    uint8_t *ct3 = (uint8_t*)calloc(CM_O3_SIZE, 2);
-    uint8_t *ct4 = (uint8_t*)calloc(CM_O4_SIZE, 2);
-    uint8_t *ct6 = (uint8_t*)calloc(CM_O6_SIZE, 2);
-    int32_t *mht = (int32_t*)malloc(CM_MHT_SIZE * sizeof(int32_t));
+    uint8_t *ct0 = (uint8_t*)hp_calloc(256, 2);
+    uint8_t *ct1 = (uint8_t*)hp_calloc(65536, 2);
+    uint8_t *ct2 = (uint8_t*)hp_calloc(CM_O2_SIZE, 2);
+    uint8_t *ct3 = (uint8_t*)hp_calloc(CM_O3_SIZE, 2);
+    uint8_t *ct4 = (uint8_t*)hp_calloc(CM_O4_SIZE, 2);
+    uint8_t *ct6 = (uint8_t*)hp_calloc(CM_O6_SIZE, 2);
+    int32_t *mht = (int32_t*)hp_malloc(CM_MHT_SIZE * sizeof(int32_t));
     memset(mht, 0xFF, CM_MHT_SIZE * sizeof(int32_t));
 
     RCDec rc; rc_dec_init(&rc, in);
@@ -2249,9 +2298,9 @@ typedef struct {
 
 static void ppm_state_init(PPMState *s) {
     memset(&s->o0, 0, sizeof(PPMCtx));
-    s->o1 = (PPMCtx*)calloc(256, sizeof(PPMCtx));
-    s->o2 = (PPMCtx*)calloc(PPM_O2_SIZE, sizeof(PPMCtx));
-    s->o3 = (PPMCtx*)calloc(PPM_O3_SIZE, sizeof(PPMCtx));
+    s->o1 = (PPMCtx*)hp_calloc(256, sizeof(PPMCtx));
+    s->o2 = (PPMCtx*)hp_calloc(PPM_O2_SIZE, sizeof(PPMCtx));
+    s->o3 = (PPMCtx*)hp_calloc(PPM_O3_SIZE, sizeof(PPMCtx));
     memset(s->h, 0, 4);
 }
 
@@ -2594,7 +2643,7 @@ static uint32_t wp_h(const uint8_t*w,int n){uint32_t h=2166136261u;for(int i=0;i
 /* Returns encoded size (dict header + encoded body), or 0 if not beneficial. */
 static size_t wp_encode(const uint8_t *src, size_t sn, uint8_t *dst, size_t dcap) {
     if (sn < 2048 || dcap < sn) return 0;
-    WPSlot *ht = (WPSlot*)calloc(WP_HASH_SIZE, sizeof(WPSlot));
+    WPSlot *ht = (WPSlot*)hp_calloc(WP_HASH_SIZE, sizeof(WPSlot));
     if (!ht) return 0;
 
     /* --- Phase 1: count word frequencies --- */
@@ -2629,7 +2678,7 @@ static size_t wp_encode(const uint8_t *src, size_t sn, uint8_t *dst, size_t dcap
     for (uint32_t x=0; x<WP_HASH_SIZE; x++)
         if (ht[x].len>=3 && ht[x].freq>=3 && (int64_t)ht[x].freq*(ht[x].len-1)>50) nc++;
 
-    WPC *cd = (WPC*)malloc((nc ? nc : 1) * sizeof(WPC));
+    WPC *cd = (WPC*)hp_malloc((nc ? nc : 1) * sizeof(WPC));
     if (!cd) { free(ht); return 0; }
     int ci = 0;
     for (uint32_t x=0; x<WP_HASH_SIZE; x++) {
@@ -2746,10 +2795,10 @@ static int compress_substream(const uint8_t *data, int n, uint8_t *out, int *sub
     if (n == 0) { *sub_order = 0; return 0; }
 
     int alloc = n + n/4 + 4096;
-    uint8_t  *bwt_s   = (uint8_t*)malloc(n);
-    uint8_t  *mtf_s   = (uint8_t*)malloc(n);
-    uint16_t *zrle_s  = (uint16_t*)malloc((size_t)n * 2 * sizeof(uint16_t));
-    uint8_t  *arith_s = (uint8_t*)malloc(alloc);
+    uint8_t  *bwt_s   = (uint8_t*)hp_malloc(n);
+    uint8_t  *mtf_s   = (uint8_t*)hp_malloc(n);
+    uint16_t *zrle_s  = (uint16_t*)hp_malloc((size_t)n * 2 * sizeof(uint16_t));
+    uint8_t  *arith_s = (uint8_t*)hp_malloc(alloc);
 
     int best = n + 100;
     *sub_order = 0;
@@ -2804,7 +2853,7 @@ static int compress_substream(const uint8_t *data, int n, uint8_t *out, int *sub
 
     /* === Strategy C: Delta + BWT + O0/O1/O2 (sub_order 4-6) === */
     {
-        uint8_t *delta_s = (uint8_t*)malloc(n);
+        uint8_t *delta_s = (uint8_t*)hp_malloc(n);
         delta_encode(data, n, delta_s);
         pidx = bwt_encode_ws(delta_s, n, bwt_s, bwt_ws);
         mtf_encode(bwt_s, n, mtf_s);
@@ -2835,7 +2884,7 @@ static int compress_substream(const uint8_t *data, int n, uint8_t *out, int *sub
     /* === Strategy D: LZP + BWT + O0/O1/O2 (sub_order 7-9) === */
     /* Format: [lzp_out_size:4][pidx:4][nz:4][arith_data] */
     {
-        uint8_t *lzp_s = (uint8_t*)malloc(alloc);
+        uint8_t *lzp_s = (uint8_t*)hp_malloc(alloc);
         int lzp_size = lzp_encode(data, n, lzp_s);
         if (lzp_size > 0 && lzp_size < n) {
             fprintf(stderr, "      [Sub LZP] %d -> %d (%.2fx reduction)\n",
@@ -2879,7 +2928,7 @@ static int compress_substream(const uint8_t *data, int n, uint8_t *out, int *sub
     /* CM is slow (bit-by-bit) — only try for streams < 24 MB */
     if (n <= 25165824) {  /* 24 MB */
         int cm_alloc = n + n/4 + 1024;
-        uint8_t *cm_out = (uint8_t*)malloc(cm_alloc);
+        uint8_t *cm_out = (uint8_t*)hp_malloc(cm_alloc);
         int cm_sz = cm_encode(data, n, cm_out, cm_alloc);
         if (cm_sz > 0 && cm_sz < best) {
             best = cm_sz; *sub_order = 10;
@@ -2896,7 +2945,7 @@ static int compress_substream(const uint8_t *data, int n, uint8_t *out, int *sub
     /* Format: [wp_encoded_size:4][pidx:4][nz:4][arith_data] */
     if (n >= 4096) {
         size_t wp_cap = (size_t)n + n/50 + 8192;
-        uint8_t *wp_buf = (uint8_t*)malloc(wp_cap);
+        uint8_t *wp_buf = (uint8_t*)hp_malloc(wp_cap);
         if (wp_buf) {
             size_t wp_sz = wp_encode(data, n, wp_buf, wp_cap);
             if (wp_sz > 0 && (int)wp_sz < n) {
@@ -2904,10 +2953,10 @@ static int compress_substream(const uint8_t *data, int n, uint8_t *out, int *sub
                         n, (int)wp_sz, (1.0 - (double)wp_sz/n) * 100);
                 int wpn = (int)wp_sz;
                 int wpa = wpn + wpn/4 + 4096;
-                uint8_t  *wb = (uint8_t*)malloc(wpn);
-                uint8_t  *wm = (uint8_t*)malloc(wpn);
-                uint16_t *wz = (uint16_t*)malloc((size_t)wpn * 2 * sizeof(uint16_t));
-                uint8_t  *wa = (uint8_t*)malloc(wpa);
+                uint8_t  *wb = (uint8_t*)hp_malloc(wpn);
+                uint8_t  *wm = (uint8_t*)hp_malloc(wpn);
+                uint16_t *wz = (uint16_t*)hp_malloc((size_t)wpn * 2 * sizeof(uint16_t));
+                uint8_t  *wa = (uint8_t*)hp_malloc(wpa);
 
                 pidx = bwt_encode_ws(wp_buf, wpn, wb, bwt_ws);
                 mtf_encode(wb, wpn, wm);
@@ -2957,7 +3006,7 @@ static int compress_substream(const uint8_t *data, int n, uint8_t *out, int *sub
                 try_sub_lzma = 0;
         }
         if (try_sub_lzma) {
-        uint8_t *lzma_out = (uint8_t*)malloc(n + n/4 + 65536);
+        uint8_t *lzma_out = (uint8_t*)hp_malloc(n + n/4 + 65536);
         if (lzma_out) {
             int lzma_sz = lzma_compress(data, n, lzma_out, best);
             if (lzma_sz > 0 && lzma_sz < best) {
@@ -3028,9 +3077,9 @@ static void decompress_substream(const uint8_t *cdata, int csize, int sub_order,
 
     int bwt_n = is_lzp ? lzp_size : (is_word ? wp_enc_size : orig_n);
 
-    uint16_t *zrle_s = (uint16_t*)malloc(nz * sizeof(uint16_t));
-    uint8_t  *mtf_s  = (uint8_t*)malloc(bwt_n);
-    uint8_t  *bwt_s  = (uint8_t*)malloc(bwt_n);
+    uint16_t *zrle_s = (uint16_t*)hp_malloc(nz * sizeof(uint16_t));
+    uint8_t  *mtf_s  = (uint8_t*)hp_malloc(bwt_n);
+    uint8_t  *bwt_s  = (uint8_t*)hp_malloc(bwt_n);
 
     if (is_rans)               rans_dec_o0(p, nz, zrle_s);
     else if (arith_order == 2) arith_dec_o2(p, nz, zrle_s);
@@ -3041,17 +3090,17 @@ static void decompress_substream(const uint8_t *cdata, int csize, int sub_order,
     mtf_decode(mtf_s, bwt_n, bwt_s);
 
     if (is_word) {
-        uint8_t *wp_tmp = (uint8_t*)malloc(bwt_n);
+        uint8_t *wp_tmp = (uint8_t*)hp_malloc(bwt_n);
         bwt_decode(bwt_s, bwt_n, pidx, wp_tmp);
         wp_decode(wp_tmp, (size_t)bwt_n, out, (size_t)orig_n);
         free(wp_tmp);
     } else if (is_lzp) {
-        uint8_t *lzp_tmp = (uint8_t*)malloc(bwt_n);
+        uint8_t *lzp_tmp = (uint8_t*)hp_malloc(bwt_n);
         bwt_decode(bwt_s, bwt_n, pidx, lzp_tmp);
         lzp_decode(lzp_tmp, bwt_n, out, orig_n);
         free(lzp_tmp);
     } else if (is_delta) {
-        uint8_t *tmp = (uint8_t*)malloc(orig_n);
+        uint8_t *tmp = (uint8_t*)hp_malloc(orig_n);
         bwt_decode(bwt_s, orig_n, pidx, tmp);
         delta_decode(tmp, orig_n, out);
         free(tmp);
@@ -3652,10 +3701,10 @@ static void lzma_mf_init(LzmaMF *mf, const uint8_t *data, int size, int window_s
     mf->window_size = window_size;
     mf->nice_len = nice_len;
     mf->chain_max = chain_max;
-    mf->head  = (int32_t *)malloc(LZMA_MF_HASH_SIZE * sizeof(int32_t));
-    mf->chain = (int32_t *)malloc(window_size * sizeof(int32_t));
-    mf->head2 = (int32_t *)malloc(LZMA_HASH2_SIZE * sizeof(int32_t));
-    mf->head3 = (int32_t *)malloc(LZMA_HASH3_SIZE * sizeof(int32_t));
+    mf->head  = (int32_t *)hp_malloc(LZMA_MF_HASH_SIZE * sizeof(int32_t));
+    mf->chain = (int32_t *)hp_malloc(window_size * sizeof(int32_t));
+    mf->head2 = (int32_t *)hp_malloc(LZMA_HASH2_SIZE * sizeof(int32_t));
+    mf->head3 = (int32_t *)hp_malloc(LZMA_HASH3_SIZE * sizeof(int32_t));
     memset(mf->head,  -1, LZMA_MF_HASH_SIZE * sizeof(int32_t));
     memset(mf->chain, -1, window_size * sizeof(int32_t));
     memset(mf->head2, -1, LZMA_HASH2_SIZE * sizeof(int32_t));
@@ -3821,21 +3870,21 @@ typedef struct {
 } SaCtx;
 
 static SaCtx *sa_ctx_build(const uint8_t *data, int n) {
-    SaCtx *ctx = (SaCtx *)malloc(sizeof(SaCtx));
+    SaCtx *ctx = (SaCtx *)hp_malloc(sizeof(SaCtx));
     if (!ctx) return NULL;
     ctx->data = data;
     ctx->n = n;
 
-    ctx->sa  = (int32_t *)malloc((size_t)(n + 1) * sizeof(int32_t));
-    ctx->isa = (int32_t *)malloc((size_t)n * sizeof(int32_t));
-    ctx->lcp = (int32_t *)malloc((size_t)(n + 1) * sizeof(int32_t));
+    ctx->sa  = (int32_t *)hp_malloc((size_t)(n + 1) * sizeof(int32_t));
+    ctx->isa = (int32_t *)hp_malloc((size_t)n * sizeof(int32_t));
+    ctx->lcp = (int32_t *)hp_malloc((size_t)(n + 1) * sizeof(int32_t));
     if (!ctx->sa || !ctx->isa || !ctx->lcp) {
         free(ctx->sa); free(ctx->isa); free(ctx->lcp); free(ctx);
         return NULL;
     }
 
     /* Build integer array for sais_core: T[i] = data[i], T[n] = 0 (sentinel) */
-    int32_t *T = (int32_t *)malloc((size_t)(n + 1) * sizeof(int32_t));
+    int32_t *T = (int32_t *)hp_malloc((size_t)(n + 1) * sizeof(int32_t));
     if (!T) { free(ctx->sa); free(ctx->isa); free(ctx->lcp); free(ctx); return NULL; }
     for (int i = 0; i < n; i++) T[i] = (int32_t)data[i] + 1; /* shift: 1..256 */
     T[n] = 0; /* sentinel must be 0 and unique minimum */
@@ -3961,14 +4010,14 @@ static int lzma_compress(const uint8_t *data, int n, uint8_t *out, int size_limi
     if (n <= SA_LZMA_THRESHOLD) sa_ctx = sa_ctx_build(data, n);
 
     /* Allocate optimal parsing array */
-    OptNode *opt = (OptNode *)malloc((OPT_AHEAD + LZMA_MAX_MATCH + 1) * sizeof(OptNode));
+    OptNode *opt = (OptNode *)hp_malloc((OPT_AHEAD + LZMA_MAX_MATCH + 1) * sizeof(OptNode));
     /* +1 slot reserved for SA match supplement */
-    MatchPair *pairs = (MatchPair *)malloc((LZMA_MAX_MATCH + 1) * sizeof(MatchPair));
+    MatchPair *pairs = (MatchPair *)hp_malloc((LZMA_MAX_MATCH + 1) * sizeof(MatchPair));
 
     /* Decision buffer for emitting */
-    int *dec_lens = (int *)malloc((OPT_AHEAD + LZMA_MAX_MATCH + 1) * sizeof(int));
-    int *dec_dists = (int *)malloc((OPT_AHEAD + LZMA_MAX_MATCH + 1) * sizeof(int));
-    int *dec_reps_flag = (int *)malloc((OPT_AHEAD + LZMA_MAX_MATCH + 1) * sizeof(int));
+    int *dec_lens = (int *)hp_malloc((OPT_AHEAD + LZMA_MAX_MATCH + 1) * sizeof(int));
+    int *dec_dists = (int *)hp_malloc((OPT_AHEAD + LZMA_MAX_MATCH + 1) * sizeof(int));
+    int *dec_reps_flag = (int *)hp_malloc((OPT_AHEAD + LZMA_MAX_MATCH + 1) * sizeof(int));
 
     /* Price tables: precomputed once per DP round (4×272 = ~4KB, fits in L1 cache).
        Eliminates 2.2B repeated lzma_len_price() calls in the inner DP loops. */
@@ -4777,15 +4826,15 @@ static void *thread_groups_BDE(void *arg) {
     if ((w->allowed_mask & ((1u<<S_LZ77_O0)|(1u<<S_LZ77_O1))) && (w->hint_strat < 0 || w->hint_strat == S_LZ77_O0 || w->hint_strat == S_LZ77_O1))
     {
         int lz_cap = n + 4096;
-        uint8_t *lz_packed = (uint8_t*)malloc(lz_cap);
+        uint8_t *lz_packed = (uint8_t*)hp_malloc(lz_cap);
         if (lz_packed) {
             int lz_size = lz77_encode(data, n, lz_packed, lz_cap);
             if (lz_size > 0) {
                 int alloc_lz = lz_size + 4096;
-                uint8_t  *lz_bwt   = (uint8_t*)malloc(alloc_lz);
-                uint8_t  *lz_mtf   = (uint8_t*)malloc(alloc_lz);
-                uint16_t *lz_zrle  = (uint16_t*)malloc(alloc_lz * 2 * sizeof(uint16_t));
-                uint8_t  *lz_arith = (uint8_t*)malloc(alloc_lz + alloc_lz / 4 + 1024);
+                uint8_t  *lz_bwt   = (uint8_t*)hp_malloc(alloc_lz);
+                uint8_t  *lz_mtf   = (uint8_t*)hp_malloc(alloc_lz);
+                uint16_t *lz_zrle  = (uint16_t*)hp_malloc(alloc_lz * 2 * sizeof(uint16_t));
+                uint8_t  *lz_arith = (uint8_t*)hp_malloc(alloc_lz + alloc_lz / 4 + 1024);
                 if (lz_bwt && lz_mtf && lz_zrle && lz_arith) {
                     int lz_pidx = bwt_encode_ws(lz_packed, lz_size, lz_bwt, w->bwt_ws);
                     mtf_encode(lz_bwt, lz_size, lz_mtf);
@@ -4956,15 +5005,15 @@ static int compress_block_forced(const uint8_t *data, int n, uint8_t *out, int *
     /* ---- LZ77 + BWT strategies ---- */
     else if (fs == S_LZ77_O0 || fs == S_LZ77_O1) {
         int lz_cap = n + 4096;
-        uint8_t *lz_packed = (uint8_t*)malloc(lz_cap);
+        uint8_t *lz_packed = (uint8_t*)hp_malloc(lz_cap);
         if (lz_packed) {
             int lz_size = lz77_encode(data, n, lz_packed, lz_cap);
             if (lz_size > 0) {
                 int alloc_lz = lz_size + 4096;
-                uint8_t  *lz_bwt   = (uint8_t*)malloc(alloc_lz);
-                uint8_t  *lz_mtf   = (uint8_t*)malloc(alloc_lz);
-                uint16_t *lz_zrle  = (uint16_t*)malloc(alloc_lz * 2 * sizeof(uint16_t));
-                uint8_t  *lz_arith = (uint8_t*)malloc(alloc_lz + alloc_lz/4 + 1024);
+                uint8_t  *lz_bwt   = (uint8_t*)hp_malloc(alloc_lz);
+                uint8_t  *lz_mtf   = (uint8_t*)hp_malloc(alloc_lz);
+                uint16_t *lz_zrle  = (uint16_t*)hp_malloc(alloc_lz * 2 * sizeof(uint16_t));
+                uint8_t  *lz_arith = (uint8_t*)hp_malloc(alloc_lz + alloc_lz/4 + 1024);
                 if (lz_bwt && lz_mtf && lz_zrle && lz_arith) {
                     int lz_pidx = bwt_encode_ws(lz_packed, lz_size, lz_bwt, bwt_ws);
                     mtf_encode(lz_bwt, lz_size, lz_mtf);
@@ -5006,7 +5055,7 @@ static int compress_block_forced(const uint8_t *data, int n, uint8_t *out, int *
 
     /* ---- LZMA ---- */
     else if (fs == S_LZMA) {
-        uint8_t *lzma_out = (uint8_t*)malloc(n + n/4 + 65536);
+        uint8_t *lzma_out = (uint8_t*)hp_malloc(n + n/4 + 65536);
         if (lzma_out) {
             int lzma_sz = lzma_compress(data, n, lzma_out, best_size);
             if (lzma_sz > 0 && lzma_sz < best_size) {
@@ -5019,8 +5068,8 @@ static int compress_block_forced(const uint8_t *data, int n, uint8_t *out, int *
 
     /* ---- BCJ + LZMA ---- */
     else if (fs == S_BCJ_LZMA) {
-        uint8_t *bcj_buf = (uint8_t*)malloc(n);
-        uint8_t *bcj_lzma_out = (uint8_t*)malloc(n + n/4 + 65536);
+        uint8_t *bcj_buf = (uint8_t*)hp_malloc(n);
+        uint8_t *bcj_lzma_out = (uint8_t*)hp_malloc(n + n/4 + 65536);
         if (bcj_buf && bcj_lzma_out) {
             bcj_e8e9_encode(data, n, bcj_buf);
             int bcj_lzma_sz = lzma_compress(bcj_buf, n, bcj_lzma_out, best_size);
@@ -5107,12 +5156,12 @@ static int compress_block_forced(const uint8_t *data, int n, uint8_t *out, int *
             fprintf(stderr, "    [forced Audio] data not detected as audio, falling back to STORE\n");
         } else {
             int audio_alloc = n + 262144;
-            uint8_t *audio_buf = (uint8_t*)malloc(audio_alloc);
+            uint8_t *audio_buf = (uint8_t*)hp_malloc(audio_alloc);
             if (audio_buf) {
                 int audio_n = audio_encode(data, n, audio_buf);
                 (void)audio_n;
                 (void)0; /* nframes_audio calculated via nf_audio below */
-                uint8_t *direct_out = (uint8_t*)malloc(n + 131072);
+                uint8_t *direct_out = (uint8_t*)hp_malloc(n + 131072);
                 if (direct_out) {
                     int dp = 0;
                     int version = audio_buf[0];
@@ -5135,7 +5184,7 @@ static int compress_block_forced(const uint8_t *data, int n, uint8_t *out, int *
                     int stream_len = nf_audio;
                     int tail_audio = n - nf_audio * 4;
                     for (int s = 0; s < 4; s++) {
-                        uint16_t *s16 = (uint16_t*)malloc(stream_len * sizeof(uint16_t));
+                        uint16_t *s16 = (uint16_t*)hp_malloc(stream_len * sizeof(uint16_t));
                         for (int j = 0; j < stream_len; j++) s16[j] = stream_data[s * stream_len + j];
                         int s_enc = arith_enc_o1(s16, stream_len, arith_buf);
                         free(s16);
@@ -5166,14 +5215,14 @@ static int compress_block_forced(const uint8_t *data, int n, uint8_t *out, int *
     else if (fs == S_BASE64_V2) {
         int max_b64_runs = n / B64_MIN_RUN + 1;
         if (max_b64_runs > 1000000) max_b64_runs = 1000000;
-        B64Run *b64_runs = (B64Run*)malloc(max_b64_runs * sizeof(B64Run));
+        B64Run *b64_runs = (B64Run*)hp_malloc(max_b64_runs * sizeof(B64Run));
         int n_b64_runs = b64_find_runs(data, n, b64_runs, max_b64_runs);
         int total_b64 = 0;
         for (int i = 0; i < n_b64_runs; i++) total_b64 += b64_runs[i].len;
         if (n_b64_runs > 0 && total_b64 > 0) {
             int skeleton_size = n - total_b64;
-            uint8_t *skeleton = (uint8_t*)malloc(skeleton_size + 1);
-            uint8_t *decoded  = (uint8_t*)malloc(total_b64);
+            uint8_t *skeleton = (uint8_t*)hp_malloc(skeleton_size + 1);
+            uint8_t *decoded  = (uint8_t*)hp_malloc(total_b64);
             int sk_pos = 0, dec_pos = 0, src_pos = 0;
             int valid = 1;
             for (int r = 0; r < n_b64_runs; r++) {
@@ -5181,7 +5230,7 @@ static int compress_block_forced(const uint8_t *data, int n, uint8_t *out, int *
                 if (gap > 0) { memcpy(skeleton + sk_pos, data + src_pos, gap); sk_pos += gap; }
                 int dl = b64_decode_chunk(data + b64_runs[r].start, b64_runs[r].len, decoded + dec_pos);
                 if (dl < 0) { valid = 0; break; }
-                uint8_t *vbuf = (uint8_t*)malloc(b64_runs[r].len + 4);
+                uint8_t *vbuf = (uint8_t*)hp_malloc(b64_runs[r].len + 4);
                 int el = b64_encode_chunk(decoded + dec_pos, dl, vbuf);
                 if (el != b64_runs[r].len || memcmp(vbuf, data + b64_runs[r].start, el) != 0) {
                     free(vbuf); valid = 0; break;
@@ -5197,15 +5246,15 @@ static int compress_block_forced(const uint8_t *data, int n, uint8_t *out, int *
             }
             if (valid && sk_pos == skeleton_size) {
                 int decoded_size = dec_pos;
-                uint8_t *pos_tbl = (uint8_t*)malloc(n_b64_runs * 15 + 16);
+                uint8_t *pos_tbl = (uint8_t*)hp_malloc(n_b64_runs * 15 + 16);
                 int pos_tbl_sz = b64_encode_pos(b64_runs, n_b64_runs, pos_tbl);
-                uint8_t *sk_comp = (uint8_t*)malloc(skeleton_size + skeleton_size/4 + 1024);
+                uint8_t *sk_comp = (uint8_t*)hp_malloc(skeleton_size + skeleton_size/4 + 1024);
                 int sk_order;
                 int sk_comp_sz = compress_substream(skeleton, skeleton_size, sk_comp, &sk_order, bwt_ws);
-                uint8_t *dec_comp = (uint8_t*)malloc(decoded_size + decoded_size/4 + 1024);
+                uint8_t *dec_comp = (uint8_t*)hp_malloc(decoded_size + decoded_size/4 + 1024);
                 int dec_order;
                 int dec_comp_sz = compress_substream(decoded, decoded_size, dec_comp, &dec_order, bwt_ws);
-                uint8_t *pos_comp = (uint8_t*)malloc(pos_tbl_sz + pos_tbl_sz/4 + 1024);
+                uint8_t *pos_comp = (uint8_t*)hp_malloc(pos_tbl_sz + pos_tbl_sz/4 + 1024);
                 int pos_order;
                 int pos_comp_sz = compress_substream(pos_tbl, pos_tbl_sz, pos_comp, &pos_order, bwt_ws);
                 int b64v2_total = 31 + pos_comp_sz + sk_comp_sz + dec_comp_sz;
@@ -5300,7 +5349,7 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
     
     if (n > SAMPLE_THRESHOLD) {
         int sample_n = SAMPLE_SIZE;
-        uint8_t *sample_out = (uint8_t*)malloc(sample_n + 262144);
+        uint8_t *sample_out = (uint8_t*)hp_malloc(sample_n + 262144);
         BWTWorkspace *sample_bwt = bwt_ws_create(sample_n + 262144);
         CompressWorkspace *sample_cws = cws_create(sample_n);
         if (sample_out && sample_bwt && sample_cws) {
@@ -5341,7 +5390,7 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
     int worker_launched = 0; (void)worker_launched;
     
     if (run_ac) {
-        out_buf_ac = (uint8_t*)malloc(n + 262144);
+        out_buf_ac = (uint8_t*)hp_malloc(n + 262144);
         work_ac.hint_strat = hint_strat;
         work_ac.allowed_mask = allowed_mask;
         work_ac.data = data;
@@ -5355,7 +5404,7 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
     if (run_bde) {
         bwt_ws2 = bwt_ws_create(n + 262144);
         cws2 = cws_create(n);
-        out_buf_bde = (uint8_t*)malloc(n + 262144);
+        out_buf_bde = (uint8_t*)hp_malloc(n + 262144);
         work_bde.hint_strat = hint_strat;
         work_bde.allowed_mask = allowed_mask;
         work_bde.data = data;
@@ -5427,7 +5476,7 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
     if ((allowed_mask & (1u << S_AUDIO)) && audio_detect(data, n)) {
         /* LPC headers can add ~100KB overhead (2037 blocks * ~46 bytes each) */
         int audio_alloc = n + 262144;
-        uint8_t *audio_buf = (uint8_t*)malloc(audio_alloc);
+        uint8_t *audio_buf = (uint8_t*)hp_malloc(audio_alloc);
         audio_encode(data, n, audio_buf);
         
         /* Audio + Direct RC — 4 streams independently */
@@ -5435,7 +5484,7 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
            For LPC (version=4): header is variable-length, streams follow.
            For simple delta (version=3): header is 5 bytes, streams follow. */
         {
-            uint8_t *direct_out = (uint8_t*)malloc(n + 131072);
+            uint8_t *direct_out = (uint8_t*)hp_malloc(n + 131072);
             int dp = 0;
             
             /* Copy the entire audio header (everything before the residual streams) */
@@ -5466,7 +5515,7 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
             int direct_ok = 1;
             for (int s = 0; s < 4; s++) {
                 /* Convert each byte stream to uint16_t for RC */
-                uint16_t *s16 = (uint16_t*)malloc(stream_len * sizeof(uint16_t));
+                uint16_t *s16 = (uint16_t*)hp_malloc(stream_len * sizeof(uint16_t));
                 for (int j = 0; j < stream_len; j++) s16[j] = stream_data[s * stream_len + j];
                 
                 int s_enc = arith_enc_o1(s16, stream_len, arith_buf);
@@ -5500,7 +5549,7 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
     if (allowed_mask & (1u << S_BASE64_V2)) {
         int max_b64_runs = n / B64_MIN_RUN + 1;
         if (max_b64_runs > 1000000) max_b64_runs = 1000000;
-        B64Run *b64_runs = (B64Run*)malloc(max_b64_runs * sizeof(B64Run));
+        B64Run *b64_runs = (B64Run*)hp_malloc(max_b64_runs * sizeof(B64Run));
         int n_b64_runs = b64_find_runs(data, n, b64_runs, max_b64_runs);
 
         int total_b64 = 0;
@@ -5511,8 +5560,8 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
                     n_b64_runs, total_b64, 100.0 * total_b64 / n);
 
             int skeleton_size = n - total_b64;
-            uint8_t *skeleton = (uint8_t*)malloc(skeleton_size + 1);
-            uint8_t *decoded  = (uint8_t*)malloc(total_b64);  /* always smaller */
+            uint8_t *skeleton = (uint8_t*)hp_malloc(skeleton_size + 1);
+            uint8_t *decoded  = (uint8_t*)hp_malloc(total_b64);  /* always smaller */
 
             int sk_pos = 0, dec_pos = 0, src_pos = 0;
             int valid = 1;
@@ -5527,7 +5576,7 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
                 if (dl < 0) { valid = 0; break; }
 
                 /* Round-trip verify */
-                uint8_t *vbuf = (uint8_t*)malloc(b64_runs[r].len + 4);
+                uint8_t *vbuf = (uint8_t*)hp_malloc(b64_runs[r].len + 4);
                 int el = b64_encode_chunk(decoded + dec_pos, dl, vbuf);
                 if (el != b64_runs[r].len || memcmp(vbuf, data + b64_runs[r].start, el) != 0) {
                     free(vbuf); valid = 0; break;
@@ -5549,21 +5598,21 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
                 int decoded_size = dec_pos;
 
                 /* Position table (delta-varint) */
-                uint8_t *pos_tbl = (uint8_t*)malloc(n_b64_runs * 15 + 16);
+                uint8_t *pos_tbl = (uint8_t*)hp_malloc(n_b64_runs * 15 + 16);
                 int pos_tbl_sz = b64_encode_pos(b64_runs, n_b64_runs, pos_tbl);
 
                 /* Compress skeleton */
-                uint8_t *sk_comp = (uint8_t*)malloc(skeleton_size + skeleton_size / 4 + 1024);
+                uint8_t *sk_comp = (uint8_t*)hp_malloc(skeleton_size + skeleton_size / 4 + 1024);
                 int sk_order;
                 int sk_comp_sz = compress_substream(skeleton, skeleton_size, sk_comp, &sk_order, bwt_ws);
 
                 /* Compress decoded data */
-                uint8_t *dec_comp = (uint8_t*)malloc(decoded_size + decoded_size / 4 + 1024);
+                uint8_t *dec_comp = (uint8_t*)hp_malloc(decoded_size + decoded_size / 4 + 1024);
                 int dec_order;
                 int dec_comp_sz = compress_substream(decoded, decoded_size, dec_comp, &dec_order, bwt_ws);
 
                 /* Compress position table too */
-                uint8_t *pos_comp = (uint8_t*)malloc(pos_tbl_sz + pos_tbl_sz/4 + 1024);
+                uint8_t *pos_comp = (uint8_t*)hp_malloc(pos_tbl_sz + pos_tbl_sz/4 + 1024);
                 int pos_order;
                 int pos_comp_sz = compress_substream(pos_tbl, pos_tbl_sz, pos_comp, &pos_order, bwt_ws);
 
@@ -5723,7 +5772,7 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
         try_lzma = 1;  /* User explicitly included LZMA — skip heuristic */
     }
     if (try_lzma) {
-        uint8_t *lzma_out = (uint8_t*)malloc(n + n/4 + 65536);
+        uint8_t *lzma_out = (uint8_t*)hp_malloc(n + n/4 + 65536);
         if (lzma_out) {
             int lzma_sz = lzma_compress(data, n, lzma_out, best_size);
             if (lzma_sz > 0 && lzma_sz < best_size) {
@@ -5743,8 +5792,8 @@ static int compress_block(const uint8_t *data, int n, uint8_t *out, int *strat, 
     /* ======= Group I: BCJ+LZMA (S_BCJ_LZMA) ======= */
     /* Phase 1.3: E8/E9 transform on x86 executables, then LZMA */
     if ((allowed_mask & (1u << S_BCJ_LZMA)) && bcj_is_executable(data, n) && n >= 256) {
-        uint8_t *bcj_buf = (uint8_t*)malloc(n);
-        uint8_t *bcj_lzma_out = (uint8_t*)malloc(n + n/4 + 65536);
+        uint8_t *bcj_buf = (uint8_t*)hp_malloc(n);
+        uint8_t *bcj_lzma_out = (uint8_t*)hp_malloc(n + n/4 + 65536);
         if (bcj_buf && bcj_lzma_out) {
             bcj_e8e9_encode(data, n, bcj_buf);
             int bcj_lzma_sz = lzma_compress(bcj_buf, n, bcj_lzma_out, best_size);
@@ -5778,7 +5827,7 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
         return orig_size;
     }
     if (strat == S_BCJ_LZMA) {
-        uint8_t *tmp = (uint8_t*)malloc(orig_size);
+        uint8_t *tmp = (uint8_t*)hp_malloc(orig_size);
         lzma_decompress(cdata, tmp, orig_size);
         bcj_e8e9_decode(tmp, orig_size, out);
         free(tmp);
@@ -5792,7 +5841,7 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
 
     if (strat == S_BWT_CM) {
         int bwt_pidx = get_u32be(cdata);
-        uint8_t *bwt_tmp = (uint8_t*)malloc(orig_size);
+        uint8_t *bwt_tmp = (uint8_t*)hp_malloc(orig_size);
         cm_decode(cdata + 4, bwt_tmp, orig_size);
         bwt_decode(bwt_tmp, orig_size, bwt_pidx, out);
         free(bwt_tmp);
@@ -5801,8 +5850,8 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
 
     if (strat == S_BWT_MTF_CM) {
         int bwt_pidx = get_u32be(cdata);
-        uint8_t *mtf_tmp = (uint8_t*)malloc(orig_size);
-        uint8_t *bwt_tmp = (uint8_t*)malloc(orig_size);
+        uint8_t *mtf_tmp = (uint8_t*)hp_malloc(orig_size);
+        uint8_t *bwt_tmp = (uint8_t*)hp_malloc(orig_size);
         cm_decode(cdata + 4, mtf_tmp, orig_size);
         mtf_decode(mtf_tmp, orig_size, bwt_tmp);
         bwt_decode(bwt_tmp, orig_size, bwt_pidx, out);
@@ -5818,7 +5867,7 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
 
     if (strat == S_BWT_PPM) {
         int bwt_pidx = get_u32be(cdata);
-        uint8_t *bwt_tmp = (uint8_t*)malloc(orig_size);
+        uint8_t *bwt_tmp = (uint8_t*)hp_malloc(orig_size);
         ppm_decompress(cdata + 4, bwt_tmp, orig_size);
         bwt_decode(bwt_tmp, orig_size, bwt_pidx, out);
         free(bwt_tmp);
@@ -5827,8 +5876,8 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
 
     if (strat == S_BWT_MTF_PPM) {
         int bwt_pidx = get_u32be(cdata);
-        uint8_t *mtf_tmp = (uint8_t*)malloc(orig_size);
-        uint8_t *bwt_tmp = (uint8_t*)malloc(orig_size);
+        uint8_t *mtf_tmp = (uint8_t*)hp_malloc(orig_size);
+        uint8_t *bwt_tmp = (uint8_t*)hp_malloc(orig_size);
         ppm_decompress(cdata + 4, mtf_tmp, orig_size);
         mtf_decode(mtf_tmp, orig_size, bwt_tmp);
         bwt_decode(bwt_tmp, orig_size, bwt_pidx, out);
@@ -5860,7 +5909,7 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
                 hdr_size = 5;
             }
             
-            uint8_t *audio_buf = (uint8_t*)malloc(orig_size + 131072);
+            uint8_t *audio_buf = (uint8_t*)hp_malloc(orig_size + 131072);
             memcpy(audio_buf, cdata + 1, hdr_size);
             
             int cp = 1 + hdr_size;
@@ -5868,7 +5917,7 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
             
             for (int s = 0; s < 4; s++) {
                 int s_len = get_u32be(cdata + cp); cp += 4;
-                uint16_t *s16 = (uint16_t*)malloc(stream_len * sizeof(uint16_t));
+                uint16_t *s16 = (uint16_t*)hp_malloc(stream_len * sizeof(uint16_t));
                 arith_dec_o1(cdata + cp, stream_len, s16);
                 cp += s_len;
                 for (int j = 0; j < stream_len; j++) stream_data[s * stream_len + j] = (uint8_t)s16[j];
@@ -5887,19 +5936,19 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
             const uint8_t *arith_data = cdata + 8;
             
             int audio_n = orig_size + 5;
-            uint16_t *zrle_buf_d = (uint16_t*)malloc(nz * sizeof(uint16_t));
+            uint16_t *zrle_buf_d = (uint16_t*)hp_malloc(nz * sizeof(uint16_t));
             if (use_o1) arith_dec_o1(arith_data, nz, zrle_buf_d);
             else        arith_dec_o0(arith_data, nz, zrle_buf_d);
             
-            uint8_t *mtf_buf_d = (uint8_t*)malloc(audio_n);
+            uint8_t *mtf_buf_d = (uint8_t*)hp_malloc(audio_n);
             zrle_decode(zrle_buf_d, nz, mtf_buf_d, audio_n);
             free(zrle_buf_d);
             
-            uint8_t *bwt_buf_d = (uint8_t*)malloc(audio_n);
+            uint8_t *bwt_buf_d = (uint8_t*)hp_malloc(audio_n);
             mtf_decode(mtf_buf_d, audio_n, bwt_buf_d);
             free(mtf_buf_d);
             
-            uint8_t *audio_buf = (uint8_t*)malloc(audio_n);
+            uint8_t *audio_buf = (uint8_t*)hp_malloc(audio_n);
             bwt_decode(bwt_buf_d, audio_n, apidx, audio_buf);
             free(bwt_buf_d);
             
@@ -5921,15 +5970,15 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
         int dec_comp_sz = get_u32be(p); p += 4;
         int dec_order   = *p++;
 
-        B64Run *runs = (B64Run*)malloc(n_runs * sizeof(B64Run));
+        B64Run *runs = (B64Run*)hp_malloc(n_runs * sizeof(B64Run));
         b64_decode_pos(p, pos_tbl_sz, runs, n_runs);
         p += pos_tbl_sz;
 
         /* Decompress skeleton and decoded substreams in parallel (independent) */
         const uint8_t *sk_data  = p;
         const uint8_t *dec_data = p + sk_comp_sz;
-        uint8_t *skeleton = (uint8_t*)malloc(skel_orig > 0 ? skel_orig : 1);
-        uint8_t *decoded  = (uint8_t*)malloc(dec_orig > 0 ? dec_orig : 1);
+        uint8_t *skeleton = (uint8_t*)hp_malloc(skel_orig > 0 ? skel_orig : 1);
+        uint8_t *decoded  = (uint8_t*)hp_malloc(dec_orig > 0 ? dec_orig : 1);
         SubstreamArg sarg = {sk_data,  sk_comp_sz,  sk_order,  skel_orig, skeleton};
         SubstreamArg darg = {dec_data, dec_comp_sz, dec_order, dec_orig,  decoded};
         pthread_t sth, dth;
@@ -5971,9 +6020,9 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
         const uint8_t *pos_data = p;
         const uint8_t *sk_data  = p + pos_comp_sz;
         const uint8_t *dec_data = p + pos_comp_sz + sk_comp_sz;
-        uint8_t *pos_tbl  = (uint8_t*)malloc(pos_tbl_orig > 0 ? pos_tbl_orig : 1);
-        uint8_t *skeleton = (uint8_t*)malloc(skel_orig > 0 ? skel_orig : 1);
-        uint8_t *decoded  = (uint8_t*)malloc(dec_orig > 0 ? dec_orig : 1);
+        uint8_t *pos_tbl  = (uint8_t*)hp_malloc(pos_tbl_orig > 0 ? pos_tbl_orig : 1);
+        uint8_t *skeleton = (uint8_t*)hp_malloc(skel_orig > 0 ? skel_orig : 1);
+        uint8_t *decoded  = (uint8_t*)hp_malloc(dec_orig > 0 ? dec_orig : 1);
         SubstreamArg parg = {pos_data, pos_comp_sz, pos_order, pos_tbl_orig, pos_tbl};
         SubstreamArg sarg = {sk_data,  sk_comp_sz,  sk_order,  skel_orig,    skeleton};
         SubstreamArg darg = {dec_data, dec_comp_sz, dec_order, dec_orig,     decoded};
@@ -5985,7 +6034,7 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
         pthread_join(sth, NULL);
         pthread_join(dth, NULL);
 
-        B64Run *runs = (B64Run*)malloc(n_runs * sizeof(B64Run));
+        B64Run *runs = (B64Run*)hp_malloc(n_runs * sizeof(B64Run));
         b64_decode_pos(pos_tbl, pos_tbl_orig, runs, n_runs);
         free(pos_tbl);
 
@@ -6013,10 +6062,10 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
         int lz_nz       = get_u32be(cdata + 8);
         const uint8_t *lz_arith = cdata + 12;
 
-        uint16_t *lz_zrle = (uint16_t*)malloc(lz_nz * sizeof(uint16_t));
-        uint8_t  *lz_mtf  = (uint8_t*)malloc(lz_raw_size);
-        uint8_t  *lz_bwt  = (uint8_t*)malloc(lz_raw_size);
-        uint8_t  *lz_packed = (uint8_t*)malloc(lz_raw_size);
+        uint16_t *lz_zrle = (uint16_t*)hp_malloc(lz_nz * sizeof(uint16_t));
+        uint8_t  *lz_mtf  = (uint8_t*)hp_malloc(lz_raw_size);
+        uint8_t  *lz_bwt  = (uint8_t*)hp_malloc(lz_raw_size);
+        uint8_t  *lz_packed = (uint8_t*)hp_malloc(lz_raw_size);
 
         if (strat == S_LZ77_O1) arith_dec_o1(lz_arith, lz_nz, lz_zrle);
         else                    arith_dec_o0(lz_arith, lz_nz, lz_zrle);
@@ -6046,9 +6095,9 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
 
     int decode_size = is_lzp ? lzp_size : orig_size;
 
-    uint16_t *zrle_buf = (uint16_t*)malloc(nz * sizeof(uint16_t));
-    uint8_t  *mtf_buf  = (uint8_t*)malloc(decode_size);
-    uint8_t  *bwt_buf  = (uint8_t*)malloc(decode_size);
+    uint16_t *zrle_buf = (uint16_t*)hp_malloc(nz * sizeof(uint16_t));
+    uint8_t  *mtf_buf  = (uint8_t*)hp_malloc(decode_size);
+    uint8_t  *bwt_buf  = (uint8_t*)hp_malloc(decode_size);
 
     int is_o2 = (strat == S_BWT_O2 || strat == S_DBWT_O2 ||
                  strat == S_LZP_BWT_O2 || strat == S_DLZP_BWT_O2);
@@ -6067,7 +6116,7 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
 
     if (is_lzp) {
         /* BWT decode into temp buffer, then LZP decode to out */
-        uint8_t *lzp_dec_buf = (uint8_t*)malloc(decode_size);
+        uint8_t *lzp_dec_buf = (uint8_t*)hp_malloc(decode_size);
         bwt_decode(bwt_buf, decode_size, pidx, lzp_dec_buf);
         lzp_decode(lzp_dec_buf, lzp_size, out, orig_size);
         free(lzp_dec_buf);
@@ -6079,14 +6128,14 @@ static int decompress_block(const uint8_t *cdata, int csize, int strat, int orig
     int is_delta = (strat == S_DBWT_O0 || strat == S_DBWT_O1 || strat == S_DBWT_O2 ||
                     strat == S_DLZP_BWT_O0 || strat == S_DLZP_BWT_O1 || strat == S_DLZP_BWT_O2);
     if (is_delta) {
-        uint8_t *tmp = (uint8_t*)malloc(orig_size);
+        uint8_t *tmp = (uint8_t*)hp_malloc(orig_size);
         memcpy(tmp, out, orig_size);
         delta_decode(tmp, orig_size, out);
         free(tmp);
     }
 
     if (strat == S_F32_BWT) {
-        uint8_t *tmp = (uint8_t*)malloc(orig_size);
+        uint8_t *tmp = (uint8_t*)hp_malloc(orig_size);
         memcpy(tmp, out, orig_size);
         float_xor_decode(tmp, orig_size, out);
         free(tmp);
@@ -6178,7 +6227,7 @@ static int png_extract(FILE *fin, int64_t fsize,
                         uint8_t **meta_out, uint32_t *meta_size,
                         uint8_t **data_out, size_t *data_size)
 {
-    uint8_t *filebuf = (uint8_t*)malloc((size_t)fsize);
+    uint8_t *filebuf = (uint8_t*)hp_malloc((size_t)fsize);
     if (!filebuf) return 1;
     fseek(fin, 0, SEEK_SET);
     if ((int64_t)fread(filebuf, 1, (size_t)fsize, fin) != fsize) {
@@ -6186,8 +6235,8 @@ static int png_extract(FILE *fin, int64_t fsize,
     }
     if (fsize < 8 || memcmp(filebuf, HP_PNG_SIG, 8) != 0) { free(filebuf); return 1; }
 
-    uint8_t *meta_buf = (uint8_t*)malloc((size_t)fsize);
-    uint8_t *idat_buf = (uint8_t*)malloc((size_t)fsize);
+    uint8_t *meta_buf = (uint8_t*)hp_malloc((size_t)fsize);
+    uint8_t *idat_buf = (uint8_t*)hp_malloc((size_t)fsize);
     if (!meta_buf || !idat_buf) {
         free(filebuf); free(meta_buf); free(idat_buf); return 1;
     }
@@ -6217,7 +6266,7 @@ static int png_extract(FILE *fin, int64_t fsize,
 
     /* Inflate IDAT (zlib-wrapped deflate); retry with larger buffer if needed */
     size_t out_alloc = idat_len * 4 + (1 << 20);
-    uint8_t *out_buf = (uint8_t*)malloc(out_alloc);
+    uint8_t *out_buf = (uint8_t*)hp_malloc(out_alloc);
     if (!out_buf) { free(meta_buf); free(idat_buf); return 1; }
     for (;;) {
         z_stream zs; memset(&zs, 0, sizeof(zs));
@@ -6239,7 +6288,7 @@ static int png_extract(FILE *fin, int64_t fsize,
         } else if (ret == Z_BUF_ERROR || zs.avail_out == 0) {
             out_alloc *= 2;
             free(out_buf);
-            out_buf = (uint8_t*)malloc(out_alloc);
+            out_buf = (uint8_t*)hp_malloc(out_alloc);
             if (!out_buf) { free(meta_buf); free(idat_buf); return 1; }
         } else {
             free(meta_buf); free(idat_buf); free(out_buf); return 1;
@@ -6257,7 +6306,7 @@ static int png_reconstruct(const uint8_t *meta, uint32_t meta_size,
                              const char *outpath)
 {
     uLong deflate_bound = compressBound((uLong)inflated_size);
-    uint8_t *idat_data = (uint8_t*)malloc((size_t)deflate_bound);
+    uint8_t *idat_data = (uint8_t*)hp_malloc((size_t)deflate_bound);
     if (!idat_data) return 1;
     uLong idat_size = deflate_bound;
     int zret = compress2(idat_data, &idat_size,
@@ -6330,6 +6379,12 @@ static int file_compress_impl(const char *inpath, const char *outpath, int block
     }
 
     int nblocks = (int)((fsize + block_size - 1) / block_size);
+    /* BUG-4 fix: Initialize all lookup tables before any threading */
+    if (!crc_ready) crc_init();
+    cm_init_lut();
+    b64_init();
+    init_price_tables();
+
     fprintf(stderr, "[HP5] Compressing %s (%.2f MB, %d blocks of %d MB)\n",
             inpath, fsize / 1048576.0, nblocks, block_size >> 20);
 
@@ -6348,13 +6403,13 @@ static int file_compress_impl(const char *inpath, const char *outpath, int block
     write64(fout, (uint64_t)fsize);
     write32(fout, (uint32_t)nblocks);
 
-    uint8_t *inbuf  = (uint8_t*)malloc(block_size);
-    uint8_t *outbuf = (uint8_t*)malloc(block_size + block_size/4 + 4096);
+    uint8_t *inbuf  = (uint8_t*)hp_malloc(block_size);
+    uint8_t *outbuf = (uint8_t*)hp_malloc(block_size + block_size/4 + 4096);
 
     /* Dedup tracking */
-    uint64_t *hashes = (uint64_t*)calloc(nblocks, sizeof(uint64_t));
-    int *comp_sizes  = (int*)calloc(nblocks, sizeof(int));
-    int *strategies  = (int*)calloc(nblocks, sizeof(int));
+    uint64_t *hashes = (uint64_t*)hp_calloc(nblocks, sizeof(uint64_t));
+    int *comp_sizes  = (int*)hp_calloc(nblocks, sizeof(int));
+    int *strategies  = (int*)hp_calloc(nblocks, sizeof(int));
 
     int64_t total_comp = 0;
     clock_t start = clock();
@@ -6409,13 +6464,13 @@ static int file_compress_impl(const char *inpath, const char *outpath, int block
         int jt = nthreads;
         if (jt > nblocks) jt = nblocks;
         
-        BlockJob *jobs = (BlockJob*)calloc(jt, sizeof(BlockJob));
-        pthread_t *threads = (pthread_t*)calloc(jt, sizeof(pthread_t));
+        BlockJob *jobs = (BlockJob*)hp_calloc(jt, sizeof(BlockJob));
+        pthread_t *threads = (pthread_t*)hp_calloc(jt, sizeof(pthread_t));
         
         for (int j = 0; j < jt; j++) {
             jobs[j].bwt_ws = bwt_ws_create(block_size + 262144);
             jobs[j].cws = cws_create(block_size);
-            jobs[j].output = (uint8_t*)malloc(block_size + block_size/4 + 4096);
+            jobs[j].output = (uint8_t*)hp_malloc(block_size + block_size/4 + 4096);
         }
         
         int b = 0;
@@ -6424,12 +6479,12 @@ static int file_compress_impl(const char *inpath, const char *outpath, int block
             if (batch > jt) batch = jt;
             
             /* Read blocks and compute hashes */
-            uint8_t **block_data = (uint8_t**)calloc(batch, sizeof(uint8_t*));
-            int *block_sizes_arr = (int*)calloc(batch, sizeof(int));
-            int *dup_refs = (int*)calloc(batch, sizeof(int));
+            uint8_t **block_data = (uint8_t**)hp_calloc(batch, sizeof(uint8_t*));
+            int *block_sizes_arr = (int*)hp_calloc(batch, sizeof(int));
+            int *dup_refs = (int*)hp_calloc(batch, sizeof(int));
             
             for (int i = 0; i < batch; i++) {
-                block_data[i] = (uint8_t*)malloc(block_size);
+                block_data[i] = (uint8_t*)hp_malloc(block_size);
                 block_sizes_arr[i] = (int)fread(block_data[i], 1, block_size, fin);
                 if (block_sizes_arr[i] <= 0) { batch = i; break; }
                 
@@ -6586,15 +6641,29 @@ static int file_decompress(const char *inpath, const char *outpath) {
         pretransform = (uint8_t)fgetc(fin);
         if (pretransform == PT_PNG) {
             png_meta_size = read32(fin);
-            png_meta = (uint8_t*)malloc(png_meta_size > 0 ? png_meta_size : 1);
+            png_meta = (uint8_t*)hp_malloc(png_meta_size > 0 ? png_meta_size : 1);
             if (!png_meta) { fclose(fin); return 1; }
             fread(png_meta, 1, png_meta_size, fin);
         }
     }
 
-    (void)read32(fin);  /* block_size — stored for info but not needed during decompression */
+    uint32_t block_size_hdr = read32(fin);
     uint64_t orig_size  = read64(fin);
     uint32_t nblocks    = read32(fin);
+
+    /* BUG-1 fix: Validate header fields to prevent segfault on corrupt files */
+    if (block_size_hdr == 0 || block_size_hdr > (256u << 20)) {
+        fprintf(stderr, "Corrupt HPK5: invalid block size %u\n", block_size_hdr);
+        free(png_meta); fclose(fin); return 1;
+    }
+    if (nblocks > 1000000u) {
+        fprintf(stderr, "Corrupt HPK5: invalid block count %u\n", nblocks);
+        free(png_meta); fclose(fin); return 1;
+    }
+    if (orig_size > (uint64_t)1024 * 1024 * 1024 * 1024) {
+        fprintf(stderr, "Corrupt HPK5: suspicious original size %llu\n", (unsigned long long)orig_size);
+        free(png_meta); fclose(fin); return 1;
+    }
 
     fprintf(stderr, "[HP5] Decompressing (%.2f MB, %d blocks)%s\n",
             orig_size/1048576.0, nblocks,
@@ -6604,8 +6673,8 @@ static int file_decompress(const char *inpath, const char *outpath) {
     if (!fout) { fprintf(stderr, "Cannot create %s\n", outpath); fclose(fin); return 1; }
 
     /* Store decompressed blocks for dedup references */
-    uint8_t **block_cache = (uint8_t**)calloc(nblocks, sizeof(uint8_t*));
-    int *block_sizes = (int*)calloc(nblocks, sizeof(int));
+    uint8_t **block_cache = (uint8_t**)hp_calloc(nblocks, sizeof(uint8_t*));
+    int *block_sizes = (int*)hp_calloc(nblocks, sizeof(int));
 
     clock_t start = clock();
     int error = 0;
@@ -6632,8 +6701,13 @@ static int file_decompress(const char *inpath, const char *outpath) {
                 pb->csz    = (int)read32(fin);
                 pb->orig_b = (int)read32(fin);
                 pb->expected_crc = read32(fin);
-                pb->cdata  = (uint8_t*)malloc(pb->csz);
-                pb->outbuf = (uint8_t*)malloc(pb->orig_b > 0 ? pb->orig_b : 1);
+                /* BUG-1 fix: Validate per-block sizes */
+                if (pb->csz < 0 || pb->csz > (256 << 20) || pb->orig_b < 0 || pb->orig_b > (256 << 20)) {
+                    fprintf(stderr, "Corrupt block: csz=%d orig_b=%d\n", pb->csz, pb->orig_b);
+                    error = 1; break;
+                }
+                pb->cdata  = (uint8_t*)hp_malloc(pb->csz);
+                pb->outbuf = (uint8_t*)hp_malloc(pb->orig_b > 0 ? pb->orig_b : 1);
                 fread(pb->cdata, 1, pb->csz, fin);
             }
             bsz++;
@@ -6662,7 +6736,7 @@ static int file_decompress(const char *inpath, const char *outpath) {
             if (pb->is_dup) {
                 uint32_t ref = pb->dup_ref;
                 fwrite(block_cache[ref], 1, block_sizes[ref], fout);
-                block_cache[blk_idx] = (uint8_t*)malloc(block_sizes[ref]);
+                block_cache[blk_idx] = (uint8_t*)hp_malloc(block_sizes[ref]);
                 memcpy(block_cache[blk_idx], block_cache[ref], block_sizes[ref]);
                 block_sizes[blk_idx] = block_sizes[ref];
                 fprintf(stderr, "  Block %d/%d: DUP of %d\n", blk_idx+1, nblocks, ref+1);
@@ -6706,7 +6780,7 @@ static int file_decompress(const char *inpath, const char *outpath) {
             fseek(ftmp, 0, SEEK_END);
             size_t infl_sz = (size_t)ftell(ftmp);
             fseek(ftmp, 0, SEEK_SET);
-            uint8_t *infl_buf = (uint8_t*)malloc(infl_sz > 0 ? infl_sz : 1);
+            uint8_t *infl_buf = (uint8_t*)hp_malloc(infl_sz > 0 ? infl_sz : 1);
             if (infl_buf && fread(infl_buf, 1, infl_sz, ftmp) == infl_sz) {
                 fclose(ftmp);
                 fprintf(stderr, "[HP5] Rebuilding PNG from %.2f MB inflated scanlines...\n",
@@ -6755,20 +6829,26 @@ static uint32_t file_crc32(const char *path) {
 static int scan_path(const char *base, const char *rel,
                      HPK6Entry **entries, int *count, int *cap) {
     char fullpath[4096];
+    int spn;
     if (rel[0])
-        snprintf(fullpath, sizeof(fullpath), "%s/%s", base, rel);
+        spn = snprintf(fullpath, sizeof(fullpath), "%s/%s", base, rel);
     else
-        snprintf(fullpath, sizeof(fullpath), "%s", base);
+        spn = snprintf(fullpath, sizeof(fullpath), "%s", base);
+    /* BUG-8 fix: Detect path truncation */
+    if (spn >= (int)sizeof(fullpath)) {
+        fprintf(stderr, "Warning: path truncated (>4096 chars): %s/...\n", base);
+        return -1;
+    }
 
     struct stat st;
-    if (stat(fullpath, &st) != 0) {
+    if (lstat(fullpath, &st) != 0) {
         fprintf(stderr, "Cannot stat '%s': %s\n", fullpath, strerror(errno));
         return -1;
     }
 
     if (*count >= *cap) {
         *cap = (*cap < 64) ? 64 : (*cap * 2);
-        *entries = (HPK6Entry*)realloc(*entries, (size_t)*cap * sizeof(HPK6Entry));
+        *entries = (HPK6Entry*)hp_realloc(*entries, (size_t)*cap * sizeof(HPK6Entry));
     }
 
     HPK6Entry *e = &(*entries)[*count];
@@ -6801,10 +6881,18 @@ static int scan_path(const char *base, const char *rel,
             }
         }
         closedir(d);
+    } else if (S_ISLNK(st.st_mode)) {
+        /* BUG-12 fix: Warn about symlinks instead of silently ignoring */
+        fprintf(stderr, "Warning: skipping symlink '%s'\n", fullpath);
+        free(e->path); free(e->fullpath);
+        /* don't increment count — entry is discarded */
     } else if (S_ISREG(st.st_mode)) {
         e->type = 0;
         e->size = (uint64_t)st.st_size;
         (*count)++;
+    } else {
+        fprintf(stderr, "Warning: skipping special file '%s'\n", fullpath);
+        free(e->path); free(e->fullpath);
     }
     return 0;
 }
@@ -6816,6 +6904,27 @@ static void detect_file_duplicates(HPK6Entry *entries, int count) {
         for (int j = i + 1; j < count; j++) {
             if (entries[j].type != 0 || entries[j].is_dedup) continue;
             if (entries[j].size == entries[i].size && entries[j].crc == entries[i].crc) {
+                /* BUG-6 fix: Verify byte-by-byte to avoid CRC32 collision */
+                int confirmed = 0;
+                if (entries[i].fullpath && entries[j].fullpath) {
+                    FILE *fi = fopen(entries[i].fullpath, "rb");
+                    FILE *fj = fopen(entries[j].fullpath, "rb");
+                    if (fi && fj) {
+                        confirmed = 1;
+                        uint8_t bi[8192], bj[8192];
+                        size_t ri, rj;
+                        while ((ri = fread(bi, 1, 8192, fi)) > 0) {
+                            rj = fread(bj, 1, 8192, fj);
+                            if (ri != rj || memcmp(bi, bj, ri) != 0) { confirmed = 0; break; }
+                        }
+                        if (confirmed && fread(bj, 1, 1, fj) > 0) confirmed = 0;
+                    }
+                    if (fi) fclose(fi);
+                    if (fj) fclose(fj);
+                } else {
+                    confirmed = 1; /* fallback: trust CRC if no fullpath (should not happen) */
+                }
+                if (!confirmed) continue;
                 entries[j].is_dedup = 1;
                 entries[j].dedup_ref = (uint32_t)i;
                 entries[j].first_block = 0xFFFFFFFF;
@@ -6845,14 +6954,36 @@ static void write_catalog(FILE *f, HPK6Entry *entries, int count) {
 }
 
 static HPK6Entry *read_catalog(FILE *f, int count) {
-    HPK6Entry *entries = (HPK6Entry*)calloc(count, sizeof(HPK6Entry));
+    if (count <= 0) return NULL;
+    HPK6Entry *entries = (HPK6Entry*)hp_calloc(count, sizeof(HPK6Entry));
     for (int i = 0; i < count; i++) {
         HPK6Entry *e = &entries[i];
-        e->type = (uint8_t)fgetc(f);
+        /* BUG-5 fix: Check for premature EOF */
+        int type_byte = fgetc(f);
+        if (type_byte == EOF || feof(f)) {
+            fprintf(stderr, "Truncated catalog at entry %d/%d\n", i, count);
+            for (int j = 0; j < i; j++) free(entries[j].path);
+            free(entries);
+            return NULL;
+        }
+        e->type = (uint8_t)type_byte;
         uint16_t pathlen = read16(f);
-        e->path = (char*)malloc(pathlen + 1);
+        if (feof(f) || pathlen > 8192) {
+            fprintf(stderr, "Invalid path length %u at entry %d\n", pathlen, i);
+            for (int j = 0; j < i; j++) free(entries[j].path);
+            free(entries);
+            return NULL;
+        }
+        e->path = (char*)hp_malloc(pathlen + 1);
         fread(e->path, 1, pathlen, f);
         e->path[pathlen] = '\0';
+        /* BUG-3 fix: Reject path traversal attempts */
+        if (strstr(e->path, "..") != NULL || (pathlen > 0 && e->path[0] == '/')) {
+            fprintf(stderr, "Warning: suspicious path in archive: '%s' (skipped)\n", e->path);
+            free(e->path);
+            e->path = strdup("__sanitized__");
+            e->type = 255; /* mark as invalid — will be skipped during extraction */
+        }
         e->size = read64(f);
         e->perms = read32(f);
         e->mtime = (int64_t)read64(f);
@@ -6918,7 +7049,7 @@ static int archive_compress(int npaths, const char **paths, const char *outpath,
         } else {
             if (entry_count >= entry_cap) {
                 entry_cap = (entry_cap < 64) ? 64 : (entry_cap * 2);
-                entries = (HPK6Entry*)realloc(entries, (size_t)entry_cap * sizeof(HPK6Entry));
+                entries = (HPK6Entry*)hp_realloc(entries, (size_t)entry_cap * sizeof(HPK6Entry));
             }
             HPK6Entry *e = &entries[entry_count];
             memset(e, 0, sizeof(HPK6Entry));
@@ -6988,11 +7119,11 @@ static int archive_compress(int npaths, const char **paths, const char *outpath,
     /* Phase 4: Compress blocks for each unique file */
     BWTWorkspace *bwt_ws = bwt_ws_create(block_size);
     CompressWorkspace *cws = cws_create(block_size);
-    uint8_t *inbuf = (uint8_t*)malloc(block_size);
-    uint8_t *outbuf = (uint8_t*)malloc(block_size + block_size/4 + 4096);
+    uint8_t *inbuf = (uint8_t*)hp_malloc(block_size);
+    uint8_t *outbuf = (uint8_t*)hp_malloc(block_size + block_size/4 + 4096);
 
-    uint64_t *block_offsets = (uint64_t*)calloc(total_blocks ? total_blocks : 1, sizeof(uint64_t));
-    uint64_t *block_hashes = (uint64_t*)calloc(total_blocks ? total_blocks : 1, sizeof(uint64_t));
+    uint64_t *block_offsets = (uint64_t*)hp_calloc(total_blocks ? total_blocks : 1, sizeof(uint64_t));
+    uint64_t *block_hashes = (uint64_t*)hp_calloc(total_blocks ? total_blocks : 1, sizeof(uint64_t));
     int64_t total_compressed = 0;
     uint32_t global_block = 0;
 
@@ -7104,10 +7235,29 @@ static int archive_decompress(const char *inpath, const char *outdir,
     uint32_t total_blocks = read32(fin);
     uint64_t total_size = read64(fin);
 
+    /* BUG-1 fix: Validate archive header fields */
+    if (block_size == 0 || block_size > (256u << 20)) {
+        fprintf(stderr, "Corrupt HPK6: invalid block size %u\n", block_size);
+        fclose(fin); return 1;
+    }
+    if (nentries > 10000000u) {
+        fprintf(stderr, "Corrupt HPK6: invalid entry count %u\n", nentries);
+        fclose(fin); return 1;
+    }
+    if (total_blocks > 10000000u) {
+        fprintf(stderr, "Corrupt HPK6: invalid block count %u\n", total_blocks);
+        fclose(fin); return 1;
+    }
+
     fprintf(stderr, "[HPK6] Archive: %d entries, %d blocks, %.2f MB\n",
             nentries, total_blocks, total_size / 1048576.0);
 
     HPK6Entry *cat_entries = read_catalog(fin, (int)nentries);
+    /* BUG-5 fix: check for truncated/corrupt catalog */
+    if (!cat_entries && nentries > 0) {
+        fprintf(stderr, "Failed to read archive catalog\n");
+        fclose(fin); return 1;
+    }
 
     long block_data_start = ftell(fin);
 
@@ -7120,7 +7270,7 @@ static int archive_decompress(const char *inpath, const char *outdir,
 
     uint64_t *block_offsets = NULL;
     if (total_blocks > 0) {
-        block_offsets = (uint64_t*)malloc(total_blocks * sizeof(uint64_t));
+        block_offsets = (uint64_t*)hp_malloc(total_blocks * sizeof(uint64_t));
         fseek(fin, (long)index_offset, SEEK_SET);
         for (uint32_t b = 0; b < total_blocks; b++) {
             block_offsets[b] = read64(fin);
@@ -7129,11 +7279,11 @@ static int archive_decompress(const char *inpath, const char *outdir,
 
     mkdirs(outdir);
 
-    uint8_t *dec_outbuf = (uint8_t*)malloc(block_size);
-    uint8_t *cbuf = (uint8_t*)malloc(block_size + block_size/4 + 4096);
+    uint8_t *dec_outbuf = (uint8_t*)hp_malloc(block_size);
+    uint8_t *cbuf = (uint8_t*)hp_malloc(block_size + block_size/4 + 4096);
 
-    uint8_t **block_cache = (uint8_t**)calloc(total_blocks ? total_blocks : 1, sizeof(uint8_t*));
-    int *block_sizes = (int*)calloc(total_blocks ? total_blocks : 1, sizeof(int));
+    uint8_t **block_cache = (uint8_t**)hp_calloc(total_blocks ? total_blocks : 1, sizeof(uint8_t*));
+    int *block_sizes = (int*)hp_calloc(total_blocks ? total_blocks : 1, sizeof(int));
 
     clock_t dec_start = clock();
 
@@ -7146,7 +7296,7 @@ static int archive_decompress(const char *inpath, const char *outdir,
         if (flags & 1) {
             uint32_t ref = read32(fin);
             if (ref < total_blocks && block_cache[ref]) {
-                block_cache[b] = (uint8_t*)malloc(block_sizes[ref]);
+                block_cache[b] = (uint8_t*)hp_malloc(block_sizes[ref]);
                 memcpy(block_cache[b], block_cache[ref], block_sizes[ref]);
                 block_sizes[b] = block_sizes[ref];
             }
@@ -7165,7 +7315,7 @@ static int archive_decompress(const char *inpath, const char *outdir,
                         b+1, expected_crc, actual_crc);
             }
 
-            block_cache[b] = (uint8_t*)malloc(orig_b);
+            block_cache[b] = (uint8_t*)hp_malloc(orig_b);
             memcpy(block_cache[b], dec_outbuf, orig_b);
             block_sizes[b] = orig_b;
         }
@@ -7312,6 +7462,7 @@ static int archive_list(const char *inpath) {
 /* ===== Main ===== */
 #if !defined(HYPERPACK_WASM) && !defined(HYPERPACK_LIB)
 int main(int argc, char **argv) {
+    hp_install_signal_handlers();
     /* Handle --list-strategies before argc check */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--list-strategies") == 0) {
@@ -7337,7 +7488,7 @@ int main(int argc, char **argv) {
             "\n"
             "Options:\n"
             "  -b SIZE_MB         Block size in MB (default: 128, max: 128)\n"
-            "  -j THREADS         Number of threads (default: 1, max: 16)\n"
+            "  -j THREADS         Number of threads (default: 1, max: 256)\n"
             "  -s N, --strategy N Force compression strategy N (0..%d, -1=auto)\n"
             "  -S N,N,...         Only try listed strategies in auto mode\n"
             "  -X N,N,...         Exclude listed strategies from auto mode\n"
@@ -7369,7 +7520,7 @@ int main(int argc, char **argv) {
                 int orig_j = atoi(argv[++i]);
                 nthreads = orig_j;
                 if (nthreads < 1) { nthreads = 1; fprintf(stderr, "Warning: -j %d too small, clamped to 1\n", orig_j); }
-                if (nthreads > 16) { nthreads = 16; fprintf(stderr, "Warning: -j %d too large, clamped to 16\n", orig_j); }
+                if (nthreads > 256) { nthreads = 256; fprintf(stderr, "Warning: -j %d too large, clamped to 256\n", orig_j); }
                 i++;
             } else if ((strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--strategy") == 0) && i + 1 < argc) {
                 force_strategy = atoi(argv[++i]);

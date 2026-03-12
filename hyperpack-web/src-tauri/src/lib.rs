@@ -76,8 +76,32 @@ fn to_c(s: &str) -> Result<CString, String> {
     CString::new(s).map_err(|e| e.to_string())
 }
 
+/// BUG-9 fix: Recursively compute size for directories
 fn file_size(path: &str) -> u64 {
-    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return 0,
+    };
+    if meta.is_dir() {
+        dir_size(std::path::Path::new(path))
+    } else {
+        meta.len()
+    }
+}
+
+fn dir_size(path: &std::path::Path) -> u64 {
+    let mut total: u64 = 0;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                total += dir_size(&p);
+            } else if let Ok(m) = p.metadata() {
+                total += m.len();
+            }
+        }
+    }
+    total
 }
 
 // ── Response types ────────────────────────────────────────────────────────

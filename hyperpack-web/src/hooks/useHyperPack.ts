@@ -44,6 +44,22 @@ function createWorker(): Worker {
   return new Worker(import.meta.env.BASE_URL + 'worker.js');
 }
 
+/* ── CRC-32 for ZIP entries (BUG-10 fix) ── */
+function crc32(data: Uint8Array): number {
+  let table: number[] | null = null;
+  if (!table) {
+    table = new Array(256);
+    for (let i = 0; i < 256; i++) {
+      let c = i;
+      for (let j = 0; j < 8; j++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      table[i] = c;
+    }
+  }
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < data.length; i++) crc = (crc >>> 8) ^ table[(crc ^ data[i]) & 0xFF];
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
 /* ── Minimal ZIP builder (no external deps) ── */
 function buildZip(files: ExtractedFile[]): ArrayBuffer {
   const textEncoder = new TextEncoder();
@@ -64,7 +80,7 @@ function buildZip(files: ExtractedFile[]): ArrayBuffer {
     lv.setUint16(8, 0, true);             // compression: stored
     lv.setUint16(10, 0, true);            // mod time
     lv.setUint16(12, 0, true);            // mod date
-    lv.setUint32(14, 0, true);            // crc32 (0 for stored)
+    lv.setUint32(14, crc32(fileData), true); // crc32
     lv.setUint32(18, fileData.length, true); // compressed size
     lv.setUint32(22, fileData.length, true); // uncompressed size
     lv.setUint16(26, nameBytes.length, true); // name length
@@ -84,7 +100,7 @@ function buildZip(files: ExtractedFile[]): ArrayBuffer {
     cv.setUint16(10, 0, true);            // compression: stored
     cv.setUint16(12, 0, true);            // mod time
     cv.setUint16(14, 0, true);            // mod date
-    cv.setUint32(16, 0, true);            // crc32
+    cv.setUint32(16, crc32(fileData), true); // crc32
     cv.setUint32(20, fileData.length, true); // compressed size
     cv.setUint32(24, fileData.length, true); // uncompressed size
     cv.setUint16(28, nameBytes.length, true); // name length
