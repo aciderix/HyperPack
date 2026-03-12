@@ -87,6 +87,15 @@ function compressSingle(file, params, outName) {
   const data = new Uint8Array(file.data);
   Module.FS.writeFile(inPath, data);
 
+  /* Reset progress state and emit initial progress */
+  resetProgressState();
+  lastStrategies = {};
+  lastDedupCount = 0;
+  lastDedupSaved = 0;
+  progressState.totalBytes = data.length;
+  progressState.phase = 'init';
+  emitProgress(0);
+
   var stratArgs = computeStrategyArgs(params);
   const start = performance.now();
   const ret = Module._hp_compress(params.blockSizeMB || 8, stratArgs.forceStrategy, stratArgs.allowedMask);
@@ -149,6 +158,15 @@ function compressArchive(files, params, outName) {
     Module.FS.writeFile(fullPath, data);
     totalSize += data.length;
   }
+
+  /* Reset progress state and emit initial progress */
+  resetProgressState();
+  lastStrategies = {};
+  lastDedupCount = 0;
+  lastDedupSaved = 0;
+  progressState.totalBytes = totalSize;
+  progressState.phase = 'init';
+  emitProgress(0);
 
   var stratArgs = computeStrategyArgs(params);
   const start = performance.now();
@@ -431,26 +449,233 @@ let lastDedupCount = 0;
 let lastDedupSaved = 0;
 let listEntries = [];
 
+/* ── Live progress state ── */
+var progressState = {
+  totalBlocks: 1,
+  currentBlock: 0,
+  totalBytes: 0,
+  bytesProcessed: 0,
+  phase: 'init',               /* init | scanning | analyzing | testing | block-done | done */
+  currentStrategy: '',         /* strategy currently being tested */
+  bestStrategy: '',            /* best strategy found so far for current block */
+  bestRatio: 0,                /* best compression ratio for current block */
+  blockInputSize: 0,           /* current block input size */
+  blockOutputSize: 0,          /* current block best output size */
+  testedStrategies: [],        /* list of {name, ratio} tested in current block */
+  currentFile: ''              /* current file name (HPK6) */
+};
+
+function resetProgressState() {
+  progressState.currentBlock = 0;
+  progressState.bytesProcessed = 0;
+  progressState.phase = 'init';
+  progressState.currentStrategy = '';
+  progressState.bestStrategy = '';
+  progressState.bestRatio = 0;
+  progressState.blockInputSize = 0;
+  progressState.blockOutputSize = 0;
+  progressState.testedStrategies = [];
+  progressState.currentFile = '';
+}
+
+function emitProgress(percent) {
+  var pct = typeof percent === 'number' ? percent : null;
+  /* Auto-compute percent from blocks if not given */
+  if (pct === null && progressState.totalBlocks > 0) {
+    pct = Math.round((progressState.currentBlock / progressState.totalBlocks) * 100);
+  }
+  if (pct === null) pct = 0;
+  self.postMessage({
+    type: 'progress',
+    percent: pct,
+    detail: progressState.currentStrategy || progressState.phase,
+    phase: progressState.phase,
+    currentStrategy: progressState.currentStrategy,
+    bestStrategy: progressState.bestStrategy,
+    bestRatio: progressState.bestRatio,
+    totalBlocks: progressState.totalBlocks,
+    currentBlock: progressState.currentBlock,
+    totalBytes: progressState.totalBytes,
+    bytesProcessed: progressState.bytesProcessed,
+    blockInputSize: progressState.blockInputSize,
+    blockOutputSize: progressState.blockOutputSize,
+    testedStrategies: progressState.testedStrategies,
+    currentFile: progressState.currentFile
+  });
+}
+
 function parseProgress(text) {
+  /* ── Strategy tracking for final result ── */
   const stratMatch = text.match(/\[([A-Za-z0-9+_]+)\]$/);
   if (stratMatch) {
     const name = stratMatch[1];
     lastStrategies[name] = (lastStrategies[name] || 0) + 1;
   }
 
-  const blockMatch = text.match(/Block (\d+).*?(\d+)\/(\d+)/);
-  if (blockMatch) {
-    const current = parseInt(blockMatch[1]);
-    const total = parseInt(blockMatch[3]);
-    if (total > 0) {
-      self.postMessage({
-        type: 'progress',
-        percent: Math.round((current / total) * 100),
-        detail: text.trim()
-      });
-    }
+  /* ── HPK5 init: "[HP5] Compressing file (170.07 MB, 2 blocks of 128 MB)" ── */
+  var hp5Init = text.match(/\[HP5\] Compressing .* \(([\d.]+) MB, (\d+) blocks? of (\d+) MB\)/);
+  if (hp5Init) {
+    progressState.totalBytes = Math.round(parseFloat(hp5Init[1]) * 1048576);
+    progressState.totalBlocks = parseInt(hp5Init[2]);
+    progressState.phase = 'analyzing';
+    emitProgress(0);
+    return;
   }
 
+  /* ── HPK6 scan: "[HPK6] Scanned N entries" ── */
+  if (text.match(/\[HPK6\] Scanned (\d+) entries/)) {
+    progressState.phase = 'scanning';
+    emitProgress(0);
+    return;
+  }
+
+  /* ── HPK6 init: "[HPK6] N files, M dirs, X.XX MB total, B blocks" ── */
+  var hpk6Init = text.match(/\[HPK6\] (\d+) files, (\d+) dirs, ([\d.]+) MB total, (\d+) blocks/);
+  if (hpk6Init) {
+    progressState.totalBytes = Math.round(parseFloat(hpk6Init[3]) * 1048576);
+    progressState.totalBlocks = parseInt(hpk6Init[4]);
+    progressState.phase = 'analyzing';
+    emitProgress(0);
+    return;
+  }
+
+  /* ── PNG detection ── */
+  if (text.match(/\[HP5\] PNG detected/)) {
+    progressState.phase = 'analyzing';
+    progressState.currentStrategy = 'PNG pre-transform';
+    emitProgress(0);
+    return;
+  }
+
+  /* ── Entropy analysis: "[Entropy 5.432 ...]" ── */
+  if (text.match(/\[Entropy/)) {
+    progressState.phase = 'analyzing';
+    progressState.currentStrategy = 'Entropy analysis';
+    emitProgress();
+    return;
+  }
+
+  /* ── Strategy testing messages (intra-block): "[BWT+O0]", "[LZMA]", "[Audio]" etc. ── */
+  /* These are emitted DURING block compression, showing which strategy is being tried */
+
+  /* Strategy result: "[LZMA] 8388608 -> 2345678 (3.58x) *** NEW BEST ***" */
+  var stratResult = text.match(/\[([A-Za-z0-9+_]+)\]\s+(\d+)\s*->\s*(\d+)\s*\(([\d.]+)x\)(.*)/);
+  if (stratResult) {
+    var sName = stratResult[1];
+    var sIn = parseInt(stratResult[2]);
+    var sOut = parseInt(stratResult[3]);
+    var sRatio = parseFloat(stratResult[4]);
+    var isNewBest = text.indexOf('NEW BEST') !== -1;
+
+    progressState.phase = 'testing';
+    progressState.currentStrategy = sName;
+    progressState.blockInputSize = sIn;
+
+    /* Track tested strategy */
+    progressState.testedStrategies.push({ name: sName, ratio: sRatio, size: sOut });
+
+    if (isNewBest || sRatio > progressState.bestRatio) {
+      progressState.bestRatio = sRatio;
+      progressState.bestStrategy = sName;
+      progressState.blockOutputSize = sOut;
+    }
+    emitProgress();
+    return;
+  }
+
+  /* Sub-stream strategy results: "[Sub PPM] N -> M (Xx)" */
+  var subResult = text.match(/\[Sub ([A-Za-z0-9+_]+)\]\s+(\d+)\s*->\s*(\d+)\s*\(([\d.]+)x/);
+  if (subResult) {
+    progressState.phase = 'testing';
+    progressState.currentStrategy = subResult[1];
+    emitProgress();
+    return;
+  }
+
+  /* Strategy skipped: "[Audio] not detected, skipping" */
+  var skipMatch = text.match(/\[([A-Za-z0-9+_]+)\]\s+(not detected|skipped)/);
+  if (skipMatch) {
+    progressState.phase = 'testing';
+    progressState.currentStrategy = skipMatch[1] + ' (skip)';
+    emitProgress();
+    return;
+  }
+
+  /* Strategy being forced: "[forced BWT+O1] ..." */
+  var forcedMatch = text.match(/\[forced ([A-Za-z0-9+_]+)\]/);
+  if (forcedMatch) {
+    progressState.phase = 'testing';
+    progressState.currentStrategy = forcedMatch[1];
+    emitProgress();
+    return;
+  }
+
+  /* LZMA heuristic: "[LZMA] skipped by heuristic..." or "[LZMA] forced for small block..." */
+  var lzmaHeur = text.match(/\[LZMA\]\s+(skipped|forced)/);
+  if (lzmaHeur) {
+    progressState.phase = 'testing';
+    progressState.currentStrategy = 'LZMA (' + lzmaHeur[1] + ')';
+    emitProgress();
+    return;
+  }
+
+  /* LZMA early-exit: "[LZMA] early-exit at X%..." */
+  if (text.match(/\[LZMA\] early-exit/)) {
+    progressState.phase = 'testing';
+    progressState.currentStrategy = 'LZMA (early-exit)';
+    emitProgress();
+    return;
+  }
+
+  /* ── Block completion ── */
+  /* HP5: "  Block 1/2: 134217728 -> 41234567 (3.25x) [LZP+BWT+O1]" */
+  var blockDone = text.match(/Block (\d+)\/(\d+):\s+(\d+)\s*->\s*(\d+)\s*\(([\d.]+)x\)\s*\[([^\]]+)\]/);
+  if (blockDone) {
+    var cur = parseInt(blockDone[1]);
+    var tot = parseInt(blockDone[2]);
+    var bIn = parseInt(blockDone[3]);
+    progressState.currentBlock = cur;
+    progressState.totalBlocks = tot;
+    progressState.bytesProcessed += bIn;
+    progressState.phase = 'block-done';
+    progressState.currentStrategy = blockDone[6];
+    progressState.bestStrategy = blockDone[6];
+    progressState.bestRatio = parseFloat(blockDone[5]);
+    /* Reset per-block state for next block */
+    progressState.testedStrategies = [];
+    emitProgress(Math.round((cur / tot) * 100));
+    return;
+  }
+
+  /* Block DUP: "Block 1/2: DUP of 3" */
+  var blockDup = text.match(/Block (\d+)\/(\d+): DUP/);
+  if (!blockDup) blockDup = text.match(/Block (\d+) \[.*?:(\d+)\/(\d+)\]: DUP/);
+  if (blockDup) {
+    var curD = parseInt(blockDup[1]);
+    progressState.currentBlock = curD;
+    progressState.phase = 'block-done';
+    progressState.currentStrategy = 'DUP (dedup)';
+    progressState.testedStrategies = [];
+    emitProgress();
+    return;
+  }
+
+  /* HPK6 block with file info: "Block 5 [file.txt:1/3]: 8388608 -> 2345678 (3.57x) [BWT+O1]" */
+  var hpk6Block = text.match(/Block (\d+) \[([^\]]+):(\d+)\/(\d+)\]:\s+(\d+)\s*->\s*(\d+)\s*\(([\d.]+)x\)\s*\[([^\]]+)\]/);
+  if (hpk6Block) {
+    progressState.currentBlock = parseInt(hpk6Block[1]);
+    progressState.currentFile = hpk6Block[2];
+    progressState.bytesProcessed += parseInt(hpk6Block[5]);
+    progressState.phase = 'block-done';
+    progressState.currentStrategy = hpk6Block[8];
+    progressState.bestStrategy = hpk6Block[8];
+    progressState.bestRatio = parseFloat(hpk6Block[7]);
+    progressState.testedStrategies = [];
+    emitProgress();
+    return;
+  }
+
+  /* ── Dedup tracking ── */
   if (text.includes('[DEDUP]')) {
     lastDedupCount++;
   }
@@ -458,7 +683,8 @@ function parseProgress(text) {
     lastDedupSaved = parseInt(text.match(/Dedup saved: (\d+)/)[1]);
   }
 
-  const listMatch = text.match(/^(FILE|DIR|DEDUP)\s+(\S+)\s+(\d+)\s+([0-9A-Fa-f]+)\s+(.+)$/);
+  /* ── Archive list entries ── */
+  var listMatch = text.match(/^(FILE|DIR|DEDUP)\s+(\S+)\s+(\d+)\s+([0-9A-Fa-f]+)\s+(.+)$/);
   if (listMatch) {
     listEntries.push({
       type: listMatch[1],
@@ -470,14 +696,19 @@ function parseProgress(text) {
     });
   }
 
-  const doneMatch = text.match(/\[HPK6\] Done:.*?\((\d+\.?\d*)x\)/);
+  /* ── Done messages ── */
+  var doneMatch = text.match(/\[HPK6\] Done:.*?\((\d+\.?\d*)x\)/);
   if (doneMatch) {
-    self.postMessage({ type: 'progress', percent: 100, detail: text.trim() });
+    progressState.phase = 'done';
+    emitProgress(100);
+    return;
   }
 
-  const done5Match = text.match(/\[HP5\] Done:.*?\((\d+\.?\d*)x\)/);
+  var done5Match = text.match(/\[HP5\] Done:.*?\((\d+\.?\d*)x\)/);
   if (done5Match) {
-    self.postMessage({ type: 'progress', percent: 100, detail: text.trim() });
+    progressState.phase = 'done';
+    emitProgress(100);
+    return;
   }
 }
 

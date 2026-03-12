@@ -2,9 +2,29 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { CompressParams, FileEntry, ExtractedFile, WorkerResponse, computeStrategyArgs } from '../workers/bridge';
 import * as native from '../lib/native';
 
+/** Dynamic import for Tauri event listener (only available in native builds) */
+let _listen: ((event: string, handler: (e: { payload: any }) => void) => Promise<() => void>) | null = null;
+async function getTauriListen() {
+  if (!_listen) {
+    try {
+      const m = await import('@tauri-apps/api/event');
+      _listen = m.listen as typeof _listen;
+    } catch {
+      return null;
+    }
+  }
+  return _listen;
+}
+
 export type { ExtractedFile } from '../workers/bridge';
 
 export type HyperPackStatus = 'idle' | 'processing' | 'complete' | 'error';
+
+export type TestedStrategy = {
+  name: string;
+  ratio: number;
+  size: number;
+};
 
 export type HyperPackProgress = {
   percent: number;
@@ -15,6 +35,26 @@ export type HyperPackProgress = {
   eta: number;
   currentRatio?: number;
   detail?: string;
+  /** Processing phase: init, scanning, analyzing, testing, block-done, done */
+  phase?: string;
+  /** Strategy currently being tested (e.g. "BWT+O1", "LZMA") */
+  currentStrategy?: string;
+  /** Best strategy found so far for current block */
+  bestStrategy?: string;
+  /** Best compression ratio for current block */
+  bestRatio?: number;
+  /** Total bytes to process */
+  totalBytes?: number;
+  /** Bytes processed so far */
+  bytesProcessed?: number;
+  /** Current block input size in bytes */
+  blockInputSize?: number;
+  /** Current block best output size in bytes */
+  blockOutputSize?: number;
+  /** Strategies tested in current block with their results */
+  testedStrategies?: TestedStrategy[];
+  /** Current file name (HPK6 archives) */
+  currentFile?: string;
 };
 
 export type HyperPackResult = {
@@ -167,17 +207,39 @@ export function useHyperPack() {
       if (msg.type === 'progress') {
         const elapsedMs = Date.now() - startTimeRef.current;
         const percent = msg.percent || 0;
-        const speed = elapsedMs > 0 && percent > 0 ? (percent / elapsedMs) * 1000 : 0;
-        const eta = speed > 0 ? (100 - percent) / speed : 0;
+        /* Compute speed from bytes processed if available, otherwise from percent */
+        const bytesProcessed = msg.bytesProcessed || 0;
+        const speed = elapsedMs > 500 && bytesProcessed > 0
+          ? (bytesProcessed / elapsedMs) * 1000   /* bytes/sec */
+          : elapsedMs > 500 && percent > 0
+            ? (percent / elapsedMs) * 1000         /* percent/sec for ETA fallback */
+            : 0;
+        const totalBytes = msg.totalBytes || 0;
+        const eta = speed > 0 && totalBytes > 0 && bytesProcessed > 0
+          ? (totalBytes - bytesProcessed) / speed  /* seconds remaining */
+          : speed > 0 && percent > 0
+            ? (100 - percent) / speed
+            : 0;
 
         setProgress((prev) => ({
           percent,
-          currentBlock: prev?.currentBlock ?? 0,
-          totalBlocks: prev?.totalBlocks ?? 1,
-          strategy: msg.detail || prev?.strategy || '',
-          speed,
+          currentBlock: msg.currentBlock ?? prev?.currentBlock ?? 0,
+          totalBlocks: msg.totalBlocks ?? prev?.totalBlocks ?? 1,
+          strategy: msg.currentStrategy || msg.detail || prev?.strategy || '',
+          speed: bytesProcessed > 0 ? speed : 0,
           eta,
           detail: msg.detail,
+          phase: msg.phase || prev?.phase || 'init',
+          currentStrategy: msg.currentStrategy || prev?.currentStrategy || '',
+          bestStrategy: msg.bestStrategy || prev?.bestStrategy || '',
+          bestRatio: msg.bestRatio || prev?.bestRatio || 0,
+          currentRatio: msg.bestRatio || prev?.currentRatio || 0,
+          totalBytes: totalBytes || prev?.totalBytes || 0,
+          bytesProcessed: bytesProcessed || prev?.bytesProcessed || 0,
+          blockInputSize: msg.blockInputSize || prev?.blockInputSize || 0,
+          blockOutputSize: msg.blockOutputSize || prev?.blockOutputSize || 0,
+          testedStrategies: msg.testedStrategies || prev?.testedStrategies || [],
+          currentFile: msg.currentFile || prev?.currentFile || '',
         }));
       } else if (msg.type === 'done') {
         setStatus('complete');
@@ -256,7 +318,42 @@ export function useHyperPack() {
     startTimeRef.current = Date.now();
 
     if (native.isNative()) {
+      let unlisten: (() => void) | null = null;
       try {
+        /* Subscribe to native progress events from Tauri backend */
+        const listen = await getTauriListen();
+        if (listen) {
+          unlisten = await listen('hp-progress', (e: { payload: any }) => {
+            const p = e.payload;
+            const elapsedMs = Date.now() - startTimeRef.current;
+            const bytesProcessed = p.bytesProcessed || 0;
+            const totalBytes = p.totalBytes || 0;
+            const speed = elapsedMs > 500 && bytesProcessed > 0
+              ? (bytesProcessed / elapsedMs) * 1000
+              : 0;
+            const eta = speed > 0 && totalBytes > 0 && bytesProcessed > 0
+              ? (totalBytes - bytesProcessed) / speed
+              : 0;
+            setProgress({
+              percent: p.percent || 0,
+              currentBlock: p.currentBlock || 0,
+              totalBlocks: p.totalBlocks || 1,
+              strategy: p.currentStrategy || p.detail || '',
+              speed,
+              eta,
+              detail: p.detail || '',
+              phase: p.phase || 'init',
+              currentStrategy: p.currentStrategy || '',
+              bestStrategy: p.bestStrategy || '',
+              bestRatio: p.bestRatio || 0,
+              currentRatio: p.bestRatio || 0,
+              totalBytes,
+              bytesProcessed,
+              currentFile: p.currentFile || '',
+            });
+          });
+        }
+
         const isArchive = params.archiveMode || files.length > 1;
         const inputPath = files[0]?.path ?? '';
         const outputPath = inputPath
@@ -288,6 +385,8 @@ export function useHyperPack() {
         setStatus('error');
         setError(String(err));
         setProgress(null);
+      } finally {
+        if (unlisten) unlisten();
       }
       return;
     }
@@ -315,7 +414,42 @@ export function useHyperPack() {
     startTimeRef.current = Date.now();
 
     if (native.isNative()) {
+      let unlisten: (() => void) | null = null;
       try {
+        /* Subscribe to native progress events from Tauri backend */
+        const listen = await getTauriListen();
+        if (listen) {
+          unlisten = await listen('hp-progress', (e: { payload: any }) => {
+            const p = e.payload;
+            const elapsedMs = Date.now() - startTimeRef.current;
+            const bytesProcessed = p.bytesProcessed || 0;
+            const totalBytes = p.totalBytes || 0;
+            const speed = elapsedMs > 500 && bytesProcessed > 0
+              ? (bytesProcessed / elapsedMs) * 1000
+              : 0;
+            const eta = speed > 0 && totalBytes > 0 && bytesProcessed > 0
+              ? (totalBytes - bytesProcessed) / speed
+              : 0;
+            setProgress({
+              percent: p.percent || 0,
+              currentBlock: p.currentBlock || 0,
+              totalBlocks: p.totalBlocks || 1,
+              strategy: p.currentStrategy || p.detail || '',
+              speed,
+              eta,
+              detail: p.detail || '',
+              phase: p.phase || 'init',
+              currentStrategy: p.currentStrategy || '',
+              bestStrategy: p.bestStrategy || '',
+              bestRatio: p.bestRatio || 0,
+              currentRatio: p.bestRatio || 0,
+              totalBytes,
+              bytesProcessed,
+              currentFile: p.currentFile || '',
+            });
+          });
+        }
+
         const inputPath = (file as File & { nativePath?: string }).nativePath ?? '';
         const fmt = await native.detectFormat(inputPath);
         let res: native.NativeDecompressResult;
@@ -344,6 +478,8 @@ export function useHyperPack() {
         setStatus('error');
         setError(String(err));
         setProgress(null);
+      } finally {
+        if (unlisten) unlisten();
       }
       return;
     }

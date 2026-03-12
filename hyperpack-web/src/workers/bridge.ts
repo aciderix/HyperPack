@@ -37,7 +37,12 @@ export type WorkerRequest =
 
 export type WorkerResponse =
   | { type: 'ready' }
-  | { type: 'progress'; percent: number; speed?: string; eta?: string; detail?: string }
+  | { type: 'progress'; percent: number; speed?: string; eta?: string; detail?: string;
+      phase?: string; currentStrategy?: string; bestStrategy?: string; bestRatio?: number;
+      totalBlocks?: number; currentBlock?: number; totalBytes?: number; bytesProcessed?: number;
+      blockInputSize?: number; blockOutputSize?: number;
+      testedStrategies?: Array<{ name: string; ratio: number; size: number }>;
+      currentFile?: string }
   | { type: 'done'; data: ArrayBuffer; name: string; originalSize: number; compressedSize: number;
       ratio: number; elapsed: number; strategies?: Record<string, number>;
       fileCount?: number; dedupCount?: number; dedupSaved?: number;
