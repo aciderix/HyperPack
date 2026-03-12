@@ -6841,7 +6841,11 @@ static int scan_path(const char *base, const char *rel,
     }
 
     struct stat st;
+#ifdef _WIN32
+    if (stat(fullpath, &st) != 0) {
+#else
     if (lstat(fullpath, &st) != 0) {
+#endif
         fprintf(stderr, "Cannot stat '%s': %s\n", fullpath, strerror(errno));
         return -1;
     }
@@ -6881,11 +6885,13 @@ static int scan_path(const char *base, const char *rel,
             }
         }
         closedir(d);
+#ifndef _WIN32
     } else if (S_ISLNK(st.st_mode)) {
         /* BUG-12 fix: Warn about symlinks instead of silently ignoring */
         fprintf(stderr, "Warning: skipping symlink '%s'\n", fullpath);
         free(e->path); free(e->fullpath);
         /* don't increment count — entry is discarded */
+#endif
     } else if (S_ISREG(st.st_mode)) {
         e->type = 0;
         e->size = (uint64_t)st.st_size;
